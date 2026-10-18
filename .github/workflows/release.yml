@@ -116,7 +116,7 @@ jobs:
           python3 test/cli_usability_test.py build/cescan
 
       - name: Build .deb and .rpm packages
-        run: (cd build && cpack -G DEB -G RPM)
+        run: (cd build && cpack -G DEB && cpack -G RPM)
 
       - name: Download required Wine compatibility evidence
         uses: actions/download-artifact@v4
