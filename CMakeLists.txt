@@ -390,6 +390,7 @@ if(Qt6_FOUND)
         gui/memoryregions.cpp
         gui/modulelist.cpp
         gui/overlay.cpp
+        gui/patterneditor.cpp
         gui/stackview.cpp
         gui/threadlist.cpp
         gui/settingsdialog.cpp
@@ -511,6 +512,15 @@ if(Qt6_FOUND)
         )
         target_include_directories(gui_pointerscan_smoke PRIVATE ${CMAKE_SOURCE_DIR} ${LUA_DIR})
         target_link_libraries(gui_pointerscan_smoke PRIVATE cecore Qt6::Widgets)
+
+        # Offscreen smoke test for the pattern editor's bounded AOB scan.
+        qt_add_executable(gui_patterneditor_smoke
+            test/gui_patterneditor_smoke.cpp
+            gui/patterneditor.cpp
+            gui/theme.cpp
+        )
+        target_include_directories(gui_patterneditor_smoke PRIVATE ${CMAKE_SOURCE_DIR} ${LUA_DIR})
+        target_link_libraries(gui_patterneditor_smoke PRIVATE cecore Qt6::Widgets)
 
         # Offscreen smoke test for the hex pane's changed-byte highlight.
         qt_add_executable(gui_hexview_smoke

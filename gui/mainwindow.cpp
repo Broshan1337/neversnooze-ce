@@ -37,6 +37,7 @@
 #include "gui/settingsdialog.hpp"
 #include "gui/tracerwindow.hpp"
 #include "gui/filepatcher.hpp"
+#include "gui/patterneditor.hpp"
 #include "gui/branchmapper.hpp"
 #include "gui/elfinspector.hpp"
 #include "gui/formdesigner.hpp"
@@ -556,6 +557,12 @@ void MainWindow::setupMenus() {
     }, QKeySequence("Ctrl+A"));
     tools->addAction("File Patcher...", this, [this]() {
         auto* dlg = new FilePatcher(this);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+    });
+    tools->addAction("Pattern editor...", this, [this]() {
+        auto* dlg = new PatternEditorDialog(process_.get(),
+            [this](uintptr_t addr) { openMemoryView(addr); }, this);
         dlg->setAttribute(Qt::WA_DeleteOnClose);
         dlg->show();
     });

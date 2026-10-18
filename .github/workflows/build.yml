@@ -142,6 +142,9 @@ jobs:
       - name: Run GUI pointer-scan smoke test (scan off the GUI thread, offscreen Qt)
         run: ./build/gui_pointerscan_smoke
 
+      - name: Run GUI pattern-editor smoke test (bounded AOB scan, offscreen Qt)
+        run: ./build/gui_patterneditor_smoke
+
       - name: Run GUI hex-view smoke test (changed-byte highlight, offscreen Qt)
         run: ./build/gui_hexview_smoke
 

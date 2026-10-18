@@ -3418,4 +3418,40 @@ ScanResult MemoryScanner::nextScan(ProcessHandle& proc, const ScanConfig& reques
     return merged;
 }
 
+bool parseAobPattern(const std::string& pattern,
+                     std::vector<uint8_t>& bytes, std::vector<uint8_t>& mask) {
+    ScanConfig config;
+    if (!config.parseAOB(pattern)) return false;
+    bytes = std::move(config.byteArray);
+    mask = std::move(config.byteArrayMask);
+    return true;
+}
+
+std::vector<uintptr_t> scanPatternRange(ProcessHandle& proc, const std::string& pattern,
+                                        uintptr_t start, uintptr_t stop, size_t cap,
+                                        std::string* error) {
+    std::vector<uintptr_t> hits;
+    if (!cap) return hits;
+    ScanConfig config;
+    config.valueType = ValueType::ByteArray;
+    if (!config.parseAOB(pattern)) {
+        if (error) *error = "invalid AOB pattern";
+        return hits;
+    }
+    config.alignment = 1;
+    config.startAddress = start;
+    config.stopAddress = stop;
+    MemoryScanner scanner(1);
+    ScanResult result = scanner.firstScan(proc, config);
+    if (result.hasWriteError()) {
+        if (error) *error = "the scan could not write its results";
+        return hits;
+    }
+    const size_t patternSize = config.byteArray.size();
+    result.forEach([&](uintptr_t addr, const void*, size_t) {
+        if (hits.size() < cap) hits.push_back(addr);
+    }, patternSize);
+    return hits;
+}
+
 } // namespace ce

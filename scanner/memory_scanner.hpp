@@ -288,11 +288,25 @@ private:
 
 /// Build a new ScanResult (in a fresh scan directory) holding only the source rows
 /// whose index is NOT flagged in `remove` (indices past remove.size() are kept). Each
-/// survivor's current value and first-scan value are preserved, so a subsequent Next
+/// survivor's current value and first-scan value is preserved, so a subsequent Next
 /// Scan narrows the pruned set consistently. Backs CE's "remove selected addresses from
 /// the list". Reads only the on-disk result (independent of the live process);
 /// unit-tested. `valueSize` is the result's per-record value stride.
 std::unique_ptr<ScanResult> pruneScanResult(const ScanResult& src, size_t valueSize,
                                              const std::vector<bool>& remove);
+
+/// Scan [start, stop] (inclusive, stop = last byte) for an AOB pattern and return
+/// at most `cap` match addresses in ascending order. A null/empty `error` is
+/// fine; on a bad pattern or a failed scan the vector is empty and `error`
+/// (when given) says why.
+std::vector<uintptr_t> scanPatternRange(ProcessHandle& proc, const std::string& pattern,
+                                        uintptr_t start, uintptr_t stop, size_t cap,
+                                        std::string* error = nullptr);
+
+/// Parse `pattern` and expose the bytes + per-byte AND-mask it scans with
+/// (0xFF full byte, 0xF0/0x0F nibble, 0x00 wildcard). Returns false on an
+/// invalid pattern.
+bool parseAobPattern(const std::string& pattern,
+                     std::vector<uint8_t>& bytes, std::vector<uint8_t>& mask);
 
 } // namespace ce

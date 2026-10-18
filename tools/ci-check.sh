@@ -197,7 +197,7 @@ if [ "$MODE" != "--config" ]; then
     for test in gui_debugger_smoke gui_theme_smoke gui_guest_scan_smoke \
                 gui_structdissect_smoke gui_hexview_smoke gui_disasm_smoke \
                 gui_search_smoke gui_changeaddr_smoke gui_luaconsole_smoke \
-                gui_codefinder_smoke gui_lifecycle_smoke; do
+                gui_patterneditor_smoke gui_codefinder_smoke gui_lifecycle_smoke; do
         QT_QPA_PLATFORM=offscreen run_check "$test" "./build/$test"
         ok "$test"
     done
