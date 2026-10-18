@@ -1368,6 +1368,38 @@ static void test_parser_fuzz() {
 }
 static volatile uint32_t g_resolverSeed = 0xBEEF5A17u;
 
+static volatile uint64_t g_pagediff_target[8192];
+
+static void test_snapshot_pagediff() {
+    printf("\n── Test: Snapshot pageDiff ──\n");
+    const pid_t child = fork();
+    if (child == 0) {
+        prctl(PR_SET_PDEATHSIG, SIGKILL);
+        for (;;) {
+            g_pagediff_target[5000] = g_pagediff_target[5000] + 1;
+            usleep(2000);
+        }
+    }
+    if (child < 0) { printf("  pageDiff: FAILED\n"); return; }
+    usleep(200000);
+    LinuxProcessHandle proc(child);
+    const auto baseline = ce::Snapshot::capture(proc);
+    usleep(400000);
+    const auto later = baseline.recapture(proc);
+    auto pages = baseline.pageDiff(later);
+    const uintptr_t writtenPage = reinterpret_cast<uintptr_t>(&g_pagediff_target[5000]) & ~uintptr_t{4095};
+    const uintptr_t quietPage = reinterpret_cast<uintptr_t>(&g_pagediff_target[100]) & ~uintptr_t{4095};
+    bool sawWritten = false, sawQuiet = false;
+    for (const auto& page : pages) {
+        if (page.base == writtenPage && page.changedBytes) sawWritten = true;
+        if (page.base == quietPage) sawQuiet = true;
+    }
+    kill(child, SIGKILL);
+    waitpid(child, nullptr, 0);
+    printf("  pageDiff names the written page and not the quiet one: %s (%zu pages)\n",
+           (sawWritten && !sawQuiet) ? "OK" : "FAILED", pages.size());
+}
+
 static void test_resolver() {
     printf("\n── Test: Pattern resolver ──\n");
     // A resolver runs against the attached target; scanning our own process would
@@ -14257,6 +14289,7 @@ int main(int argc, char* argv[]) {
     }
 
     test_target_profile();
+    test_snapshot_pagediff();
     test_resolver();
     test_dolphin_guest_ram();
     test_yuzu_guest_ram();

@@ -58,6 +58,13 @@ public:
     std::vector<ByteDiff> diff(const Snapshot& later, size_t maxDiffs = SIZE_MAX,
                                uint64_t* changedBytes = nullptr) const;
 
+    /// Page-granular change map against `later`: one entry per 4-KiB (by
+    /// default) page that differs anywhere in the overlap, with the page base
+    /// and how many bytes in it changed. Cheaper than diff() for big snapshots
+    /// and the raw material for a write-activity heatmap.
+    struct PageDiff { uint64_t base; uint32_t changedBytes; };
+    std::vector<PageDiff> pageDiff(const Snapshot& later, uint32_t pageSize = 4096) const;
+
     /// Write the snapshot's bytes back into the process, but only where the
     /// process currently has a writable, non-executable mapping: a loaded or
     /// stale snapshot may name ranges that were since unmapped, remapped or

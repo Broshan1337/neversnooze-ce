@@ -391,6 +391,7 @@ if(Qt6_FOUND)
         gui/modulelist.cpp
         gui/overlay.cpp
         gui/guidedpanel.cpp
+        gui/heatmap.cpp
         gui/patterneditor.cpp
         gui/profiles.cpp
         gui/stackview.cpp
@@ -487,6 +488,14 @@ if(Qt6_FOUND)
         qt_add_executable(gui_overlay_smoke test/gui_overlay_smoke.cpp ${CE_GUI_TEST_SOURCES})
         target_include_directories(gui_overlay_smoke PRIVATE ${CMAKE_SOURCE_DIR} ${LUA_DIR})
         target_link_libraries(gui_overlay_smoke PRIVATE cecore Qt6::Widgets Qt6::Network Qt6::DBus)
+
+        # Offscreen smoke test: the heatmap accumulates changed pages live.
+        qt_add_executable(gui_heatmap_smoke test/gui_heatmap_smoke.cpp
+            gui/heatmap.cpp
+            gui/theme.cpp
+        )
+        target_include_directories(gui_heatmap_smoke PRIVATE ${CMAKE_SOURCE_DIR} ${LUA_DIR})
+        target_link_libraries(gui_heatmap_smoke PRIVATE cecore Qt6::Widgets)
 
         # The AI Assistant panel with a scripted model, and its keyring client
         # against a mock Secret Service (test/secret_store_gate.py).

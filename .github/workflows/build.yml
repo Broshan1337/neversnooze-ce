@@ -157,6 +157,9 @@ jobs:
       - name: Run GUI overlay smoke test (pinned records in the HUD, offscreen Qt)
         run: ./build/gui_overlay_smoke
 
+      - name: Run GUI heatmap smoke test (changed pages accumulate live, offscreen Qt)
+        run: ./build/gui_heatmap_smoke
+
       - name: Run GUI hex-view smoke test (changed-byte highlight, offscreen Qt)
         run: ./build/gui_hexview_smoke
 

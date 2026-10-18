@@ -34,6 +34,10 @@ First Neversnooze CE release.
 
 ## Unreleased
 
+- Memory heatmap (Tools > Memory heatmap...): repeated snapshots build a
+  page-granular write-activity map; the busiest regions get a row of
+  periwinkle intensity cells, hover shows the address, and a click opens the
+  Memory Viewer there. Core: Snapshot::pageDiff.
 - Overlay HUD: address-list records can be pinned (right-click > Pin to
   overlay) and their live values are shown in the always-on-top overlay panel,
   refreshed on the same 500 ms tick as the status; the overlay brand label is

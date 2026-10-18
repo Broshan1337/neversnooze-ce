@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <unordered_map>
 
 namespace ce {
 
@@ -115,6 +116,32 @@ std::vector<Snapshot::ByteDiff> Snapshot::diff(const Snapshot& later, size_t max
         return x.address < y.address;
     });
     if (changedBytes) *changedBytes = changed;
+    return out;
+}
+
+std::vector<Snapshot::PageDiff> Snapshot::pageDiff(const Snapshot& later, uint32_t pageSize) const {
+    std::vector<PageDiff> out;
+    if (!pageSize) return out;
+    const uint64_t page = pageSize;
+    std::unordered_map<uint64_t, const SnapshotRegion*> byBase;
+    byBase.reserve(later.regions_.size());
+    for (const auto& r : later.regions_) byBase[r.base] = &r;
+    for (const auto& r : regions_) {
+        auto it = byBase.find(r.base);
+        if (it == byBase.end() || it->second->bytes.size() != r.bytes.size()) continue;
+        const uint8_t* after = it->second->bytes.data();
+        for (uint64_t off = 0; off < r.bytes.size(); off += page) {
+            const uint64_t n = std::min(page, uint64_t(r.bytes.size() - off));
+            const uint8_t* before = r.bytes.data() + off;
+            uint32_t changed = 0;
+            for (uint64_t k = 0; k < n; ++k)
+                if (before[k] != after[off + k]) ++changed;
+            if (changed) out.push_back({r.base + off, changed});
+        }
+    }
+    std::sort(out.begin(), out.end(), [](const PageDiff& a, const PageDiff& b) {
+        return a.base < b.base;
+    });
     return out;
 }
 
