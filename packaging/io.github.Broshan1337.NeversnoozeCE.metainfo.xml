@@ -35,6 +35,17 @@
   <url type="bugtracker">https://github.com/Broshan1337/neversnooze-ce/issues</url>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.2.0" date="2026-10-18">
+      <description>
+        <p>Eight new reverse-engineering workflows: a pattern editor with
+        bounded AOB scans and Lua/C export, pattern-resolver records that
+        rebase tables across game updates, a value provenance timeline for
+        find-what-writes, game profiles that auto-attach with a table when a
+        watched game starts, a guided tour of the core workflows, an overlay
+        HUD with pinned live values, and a memory heatmap of write activity
+        over time.</p>
+      </description>
+    </release>
     <release version="1.1.0" date="2026-10-18">
       <description>
         <p>Neversnooze CE: the engine rebranded as a Neversnooze project with

@@ -15,24 +15,12 @@ the upstream project.
 
 ---
 
-## v1.1.0 - 2026-10-18
+## v1.2.0 - 2026-10-18
 
-First Neversnooze CE release.
+The first Neversnooze CE feature release: seven new reverse-engineering
+workflows on top of the 1.1.0 rebrand, plus the engine work this tree
+carried over from upstream (below the feature list).
 
-- Rebrand: the app is now Neversnooze CE (binary `neversnooze-ce`), with the
-  Neversnooze logo as the application icon, a periwinkle accent theme
-  (`#967fee` dark, `#6f55c1` light) and Neversnooze naming throughout the GUI,
-  the About dialog and the desktop integration (new AppStream id
-  `io.github.Broshan1337.NeversnoozeCE`).
-- Packaging: .rpm packages (via CPack RPM, with the same setcap grant as the
-  .deb), alongside the existing .deb and AppImage. AppImage artifact renamed
-  to `NeversnoozeCE-<version>-x86_64.AppImage`.
-- Tutorial games renamed to Neversnooze CE Tutorial / Neversnooze CE
-  Graphical Tutorial (binaries `cetutorial` / `cegtutorial` unchanged).
-- Internal names unchanged: library `cecore`, CLI `cescan`, Lua API
-  (`getCheatEngineDir`, .CT/.CETRAINER support) fully script compatible.
-
-## Unreleased
 
 - Memory heatmap (Tools > Memory heatmap...): repeated snapshots build a
   page-granular write-activity map; the busiest regions get a row of
@@ -847,6 +835,23 @@ First Neversnooze CE release.
   emits, which injection templates relocate) as a NOP count and failed; a
   `nop` with an operand (including a register, `nop eax`) now assembles as an
   instruction.
+
+## v1.1.0 - 2026-10-18
+
+First Neversnooze CE release.
+
+- Rebrand: the app is now Neversnooze CE (binary `neversnooze-ce`), with the
+  Neversnooze logo as the application icon, a periwinkle accent theme
+  (`#967fee` dark, `#6f55c1` light) and Neversnooze naming throughout the GUI,
+  the About dialog and the desktop integration (new AppStream id
+  `io.github.Broshan1337.NeversnoozeCE`).
+- Packaging: .rpm packages (via CPack RPM, with the same setcap grant as the
+  .deb), alongside the existing .deb and AppImage. AppImage artifact renamed
+  to `NeversnoozeCE-<version>-x86_64.AppImage`.
+- Tutorial games renamed to Neversnooze CE Tutorial / Neversnooze CE
+  Graphical Tutorial (binaries `cetutorial` / `cegtutorial` unchanged).
+- Internal names unchanged: library `cecore`, CLI `cescan`, Lua API
+  (`getCheatEngineDir`, .CT/.CETRAINER support) fully script compatible.
 
 ## v1.0.0: first stable release (2026-10-13)
 
