@@ -390,6 +390,7 @@ if(Qt6_FOUND)
         gui/memoryregions.cpp
         gui/modulelist.cpp
         gui/overlay.cpp
+        gui/guidedpanel.cpp
         gui/patterneditor.cpp
         gui/profiles.cpp
         gui/stackview.cpp
@@ -476,6 +477,11 @@ if(Qt6_FOUND)
         qt_add_executable(gui_profiles_smoke test/gui_profiles_smoke.cpp ${CE_GUI_TEST_SOURCES})
         target_include_directories(gui_profiles_smoke PRIVATE ${CMAKE_SOURCE_DIR} ${LUA_DIR})
         target_link_libraries(gui_profiles_smoke PRIVATE cecore Qt6::Widgets Qt6::Network Qt6::DBus)
+
+        # Offscreen smoke test: guided-tour steps complete from real app state.
+        qt_add_executable(gui_guided_smoke test/gui_guided_smoke.cpp ${CE_GUI_TEST_SOURCES})
+        target_include_directories(gui_guided_smoke PRIVATE ${CMAKE_SOURCE_DIR} ${LUA_DIR})
+        target_link_libraries(gui_guided_smoke PRIVATE cecore Qt6::Widgets Qt6::Network Qt6::DBus)
 
         # The AI Assistant panel with a scripted model, and its keyring client
         # against a mock Secret Service (test/secret_store_gate.py).

@@ -39,6 +39,7 @@
 #include "gui/filepatcher.hpp"
 #include "gui/patterneditor.hpp"
 #include "gui/profiles.hpp"
+#include "gui/guidedpanel.hpp"
 #include "gui/branchmapper.hpp"
 #include "gui/elfinspector.hpp"
 #include "gui/formdesigner.hpp"
@@ -1134,6 +1135,18 @@ void MainWindow::setupMenus() {
 
     // ── Help ──
     auto* help = menuBar()->addMenu("&Help");
+    help->addAction("Guided tour", this, [this]() {
+        if (!guidedPanel_) {
+            guidedPanel_ = new GuidedTourPanel(this, this);
+            addDockWidget(Qt::RightDockWidgetArea, guidedPanel_);
+        } else if (guidedPanel_->isVisible()) {
+            guidedPanel_->hide();
+            return;
+        }
+        guidedPanel_->show();
+        guidedPanel_->raise();
+    });
+    help->addSeparator();
     help->addAction("Neversnooze CE Help", this, [this]() {
         openHelpDoc("README.md", "Neversnooze CE: Help",
                     "https://github.com/Broshan1337/neversnooze-ce#readme");
@@ -3450,6 +3463,7 @@ std::unique_ptr<ScanResult> MainWindow::runScanWithProgress(
     if (valueRefreshTimer_)
         valueRefreshTimer_->start(kValueRefreshMs);
 
+    if (!err) ++scanCount_;
     if (err) std::rethrow_exception(err);
     return result;
 }
@@ -4491,6 +4505,7 @@ bool MainWindow::saveTableToPath(const QString& path) {
         if (!file.flush()) {const auto error=file.errorString();file.cancelWriting();return fail(error);}
         if (!file.commit()) return fail(file.errorString());
         addRecentTable(path);
+        tableSaved_ = true;
         statusBar()->showMessage(QString("Saved table to %1").arg(QFileInfo(path).fileName()),4000);
         return true;
     } catch (const std::exception& ex) {return fail(QString::fromUtf8(ex.what()));}
@@ -4647,6 +4662,22 @@ bool MainWindow::loadCheatTableModel(const ce::CheatTable& table,const QJsonArra
     disasmAnnotations_ = table.disassemblerComments;
     rebaseResolvedEntries();
     return true;
+}
+
+MainWindow::GuidedState MainWindow::guidedState() const {
+    GuidedState state;
+    state.processAttached = currentPid_ != 0;
+    state.scanCount = scanCount_;
+    if (resultsModel_) state.resultCount = resultsModel_->rowCount();
+    if (addressListModel_) {
+        state.entryCount = addressListModel_->rowCount();
+        for (const auto& entry : addressListModel_->entries())
+            if (entry.freezeMode != ce::FreezeMode::Normal || entry.active) ++state.frozenCount;
+    }
+    state.memoryViewCount = int(memoryViewers_.size());
+    state.codeFinderCount = int(codeFinders_.size());
+    state.tableSaved = tableSaved_;
+    return state;
 }
 
 void MainWindow::rebaseResolvedEntries() {

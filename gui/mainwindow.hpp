@@ -49,6 +49,7 @@ namespace ce::gui {
 class ScanResultsModel;
 class AddressListModel;
 class OverlayWindow;
+class GuidedTourPanel;
 class MemoryBrowser;
 class AdvancedOptionsWindow;
 class DebuggerWindow;
@@ -93,6 +94,18 @@ public:
     /// Test hooks: the attached pid, and the stored profile list.
     pid_t currentPidForTest() const { return currentPid_; }
     const std::vector<GameProfile>& gameProfilesForTest() const { return gameProfiles_; }
+    /// Guided-tour state: what the user has done in this session so far.
+    struct GuidedState {
+        bool processAttached = false;
+        int scanCount = 0;
+        int resultCount = 0;
+        int entryCount = 0;
+        int frozenCount = 0;
+        int memoryViewCount = 0;
+        int codeFinderCount = 0;
+        bool tableSaved = false;
+    };
+    GuidedState guidedState() const;
     void autoAttach(pid_t pid, const QString& name, quint64 watch);   // "Wait for process" hit
     // Ends a pending "Wait for process": hits it already queued are dropped.
     void stopProcessWatch();
@@ -249,6 +262,7 @@ private:
     // Captured baseline for diff/restore; shared so a worker reading it keeps it alive.
     std::shared_ptr<ce::Snapshot> snapshot_;
     std::vector<QPair<qulonglong, qulonglong>> allocations_;  // (address,size) blocks we allocated.
+    QPointer<class GuidedTourPanel> guidedPanel_;
     std::unique_ptr<ce::os::ProcessWatcher> processWatcher_;
     std::vector<std::unique_ptr<ce::os::ProcessWatcher>> profileWatchers_;
     std::vector<GameProfile> gameProfiles_;
@@ -261,6 +275,8 @@ private:
     // Rebuilt when Settings changes the worker thread count (scan/threads).
     std::unique_ptr<MemoryScanner> scanner_;
     QString currentTablePath_;   // file the open table was loaded from or saved to
+    int scanCount_ = 0;          // completed scans (guided-tour state)
+    bool tableSaved_ = false;
     QString currentProcessName_; // the attached process's display name
     AgentPanel* agentPanel_ = nullptr;
     QDockWidget* agentDock_ = nullptr;

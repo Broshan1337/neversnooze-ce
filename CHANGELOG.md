@@ -34,6 +34,10 @@ First Neversnooze CE release.
 
 ## Unreleased
 
+- Guided tour (Help > Guided tour): a docked checklist of the eight core
+  workflows (attach, first scan, next scan, keep an address, freeze, memory
+  viewer, find what writes, save the table) that ticks itself off live from
+  real app state and restarts on demand.
 - Game profiles (File > Game profiles...): per-game profiles with a process
   name and a cheat table; one click watches for those processes and attaches
   with the table loaded the moment a game starts, and pattern-resolver
