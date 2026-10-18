@@ -6085,6 +6085,13 @@ static void test_multithread_watchpoint() {
         usleep(10000);                    // up to ~1s to accumulate hits
 
     auto results = finder.results();
+    auto events = finder.events();
+    uint64_t hitTotal = 0;
+    for (const auto& r : results) hitTotal += r.hitCount;
+    const bool eventsOk = events.size() == hitTotal &&
+                          (events.empty() ||
+                           (events.front().timestampMs <= events.back().timestampMs &&
+                            events.back().accessedAddress == reinterpret_cast<uintptr_t>(&g_cf_watched)));
     finder.stop();
 
     // The target must survive detach: if the hardware watchpoint is left armed
@@ -6099,6 +6106,8 @@ static void test_multithread_watchpoint() {
     bool ok = started && !results.empty() && survived;
     printf("  sibling-thread watchpoint: %s (%zu instr sites, target %s)\n",
            ok ? "OK" : "FAILED", results.size(), survived ? "survived" : "KILLED");
+    printf("  access events match the hit tally: %s (%zu events)\n",
+           eventsOk ? "OK" : "FAILED", events.size());
 }
 
 // Interactive-debugger multithread verification. bp_child_hot is called ONLY by

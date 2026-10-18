@@ -14,6 +14,7 @@
 #include <QFileDialog>
 #include <QHBoxLayout>
 #include <QMenu>
+#include <QTabWidget>
 #include <QItemSelection>
 #include <optional>
 #include <set>
@@ -94,6 +95,8 @@ CodeFinderWindow::CodeFinderWindow(CodeFinder* finder, const QString& title,
     statusLabel_ = new QLabel("Monitoring...");
     layout->addWidget(statusLabel_);
 
+    auto* tabs = new QTabWidget;
+
     table_ = new QTableWidget;
     table_->setColumnCount(9);
     table_->setHorizontalHeaderLabels({"Address", "Instruction", "Hits", "Pointer path",
@@ -146,7 +149,41 @@ CodeFinderWindow::CodeFinderWindow(CodeFinder* finder, const QString& title,
     table_->setContextMenuPolicy(Qt::CustomContextMenu);
     connect(table_, &QTableWidget::customContextMenuRequested,
             this, &CodeFinderWindow::onContextMenu);
-    layout->addWidget(table_);
+    tabs->addTab(table_, "Instructions");
+
+    timeline_ = new QTableWidget;
+    timeline_->setColumnCount(7);
+    timeline_->setHorizontalHeaderLabels({"Time (ms)", "Accessed", "Instruction", "Text", "RAX", "RBX", "RIP"});
+    timeline_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+    timeline_->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Stretch);
+    timeline_->setSelectionBehavior(QAbstractItemView::SelectRows);
+    timeline_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    timeline_->setProperty("monospace", true);
+    styleDataTable(timeline_);
+    setEmptyHint(timeline_, "Every access lands here with its register state.");
+    connect(timeline_, &QTableWidget::itemDoubleClicked, this, [this](QTableWidgetItem* item) {
+        if (!item) return;
+        const int row = item->row();
+        auto events = finder_->events();
+        if (row < 0 || row >= int(events.size())) return;
+        auto& ev = events[size_t(events.size() - 1 - size_t(row))];
+        auto* dlg = new QDialog(this);
+        dlg->setWindowTitle(QString("Access at %1 ms @ 0x%2").arg(ev.timestampMs).arg(ev.accessedAddress, 0, 16));
+        dlg->resize(520, 360);
+        auto* dlgLayout = new QVBoxLayout(dlg);
+        dlgLayout->addWidget(new QLabel(QString("<b>%1</b>").arg(QString::fromStdString(ev.instructionText))));
+        auto* dump = new QPlainTextEdit(fullRegisterDump(ev.context));
+        dump->setReadOnly(true);
+        dump->setFont(monospaceFont(-1));
+        dlgLayout->addWidget(dump);
+        auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close);
+        connect(buttons, &QDialogButtonBox::rejected, dlg, &QDialog::accept);
+        dlgLayout->addWidget(buttons);
+        dlg->exec();
+        dlg->deleteLater();
+    });
+    tabs->addTab(timeline_, "Timeline");
+    layout->addWidget(tabs);
 
     auto* btnRow = new QHBoxLayout;
     stopBtn_ = new QPushButton("Stop");
@@ -161,6 +198,10 @@ CodeFinderWindow::CodeFinderWindow(CodeFinder* finder, const QString& title,
     saveBtn_->setToolTip("Export the found instructions, hit counts, and registers to a text file.");
     connect(saveBtn_, &QPushButton::clicked, this, &CodeFinderWindow::onExportToFile);
     btnRow->addWidget(saveBtn_);
+    auto* csvBtn = new QPushButton("Export Timeline CSV...");
+    csvBtn->setToolTip("Write every recorded access event with its timestamp and registers to a CSV file.");
+    connect(csvBtn, &QPushButton::clicked, this, &CodeFinderWindow::onExportTimeline);
+    btnRow->addWidget(csvBtn);
     layout->addLayout(btnRow);
 
     setCentralWidget(central);
@@ -240,6 +281,21 @@ void CodeFinderWindow::refresh() {
             selection.select(model->index(row, 0), model->index(row, model->columnCount() - 1));
     }
     table_->selectionModel()->select(selection, QItemSelectionModel::ClearAndSelect);
+
+    auto events = finder_->events();
+    timeline_->setRowCount(int(events.size()));
+    for (size_t i = 0; i < events.size(); ++i) {
+        const auto& ev = events[events.size() - 1 - i];
+        const auto& c = ev.context;
+        timeline_->setItem(int(i), 0, new QTableWidgetItem(QString::number(ev.timestampMs)));
+        timeline_->setItem(int(i), 1, new QTableWidgetItem(hexQ(ev.accessedAddress)));
+        timeline_->setItem(int(i), 2, new QTableWidgetItem(hexQ(ev.instructionAddress)));
+        timeline_->setItem(int(i), 3, new QTableWidgetItem(QString::fromStdString(ev.instructionText)));
+        const bool arm = c.architecture == ce::CpuArchitecture::Arm64;
+        timeline_->setItem(int(i), 4, new QTableWidgetItem(hexQ(arm ? c.x[0] : c.rax)));
+        timeline_->setItem(int(i), 5, new QTableWidgetItem(hexQ(arm ? c.x[1] : c.rbx)));
+        timeline_->setItem(int(i), 6, new QTableWidgetItem(hexQ(c.instructionPointer())));
+    }
 }
 
 void CodeFinderWindow::onStop() {
@@ -294,6 +350,30 @@ void CodeFinderWindow::onExportToFile() {
             << "Last hit:\n" << fullRegisterDump(r.lastContext) << '\n';
     }
     statusLabel_->setText(QString("Saved %1 instruction(s) to %2").arg(results.size()).arg(path));
+}
+
+void CodeFinderWindow::onExportTimeline() {
+    auto events = finder_->events();
+    QString path = QFileDialog::getSaveFileName(this, "Export timeline",
+        "access-timeline.csv", "CSV files (*.csv);;All files (*)");
+    if (path.isEmpty()) return;
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        QMessageBox::warning(this, "Export failed", f.errorString());
+        return;
+    }
+    QTextStream out(&f);
+    out << "time_ms,accessed,instruction,text,rax,rbx,rcx,rdx,rip\n";
+    for (const auto& ev : events) {
+        const auto& c = ev.context;
+        const bool arm = c.architecture == ce::CpuArchitecture::Arm64;
+        out << ev.timestampMs << ',' << hexQ(ev.accessedAddress) << ',' << hexQ(ev.instructionAddress)
+            << ",\"" << QString::fromStdString(ev.instructionText).replace('"', "\"\"") << '"'
+            << ',' << hexQ(arm ? c.x[0] : c.rax) << ',' << hexQ(arm ? c.x[1] : c.rbx)
+            << ',' << hexQ(arm ? c.x[2] : c.rcx) << ',' << hexQ(arm ? c.x[3] : c.rdx)
+            << ',' << hexQ(c.instructionPointer()) << '\n';
+    }
+    statusLabel_->setText(QString("Exported %1 event(s) to %2").arg(events.size()).arg(path));
 }
 
 int CodeFinderWindow::resultIndexOfRow(int row, const std::vector<ce::CodeFinderResult>& results) const {

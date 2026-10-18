@@ -7,6 +7,7 @@
 #include "platform/linux/target_syscall.hpp"
 
 #include <cstdlib>
+#include <chrono>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
 #include <signal.h>
@@ -54,6 +55,7 @@ bool CodeFinder::start(ProcessHandle& proc, Debugger& dbg, uintptr_t address, bo
     }
     setError({});
     recoveryPending_=false;
+    startedAt_ = std::chrono::steady_clock::now();
     if (monitorThread_.joinable()) monitorThread_.join();
 
     proc_ = &proc;
@@ -115,6 +117,23 @@ std::vector<CodeFinderResult> CodeFinder::results() const {
 void CodeFinder::clearResults() {
     std::lock_guard lock(resultsMutex_);
     resultsMap_.clear();
+    events_.clear();
+}
+
+std::vector<CodeFinderEvent> CodeFinder::events() const {
+    std::lock_guard lock(resultsMutex_);
+    return {events_.begin(), events_.end()};
+}
+
+void CodeFinder::setEventCapacity(size_t cap) {
+    std::lock_guard lock(resultsMutex_);
+    eventCapacity_ = cap;
+    while (events_.size() > eventCapacity_) events_.pop_front();
+}
+
+size_t CodeFinder::eventCapacity() const {
+    std::lock_guard lock(resultsMutex_);
+    return eventCapacity_;
 }
 
 void CodeFinder::monitorLoop() {
@@ -788,6 +807,17 @@ bool CodeFinder::recordHit(pid_t tid, bool afterInstruction) {
     }
     entry.lastContext = ctx;
     entry.hitCount++;
+    if (eventCapacity_ > 0) {
+        if (events_.size() >= eventCapacity_) events_.pop_front();
+        CodeFinderEvent event;
+        event.timestampMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - startedAt_).count());
+        event.accessedAddress = targetAddress_;
+        event.instructionAddress = instrAddr;
+        event.instructionText = instrText;
+        event.context = ctx;
+        events_.push_back(std::move(event));
+    }
     return true;
 }
 

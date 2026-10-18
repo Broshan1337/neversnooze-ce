@@ -34,6 +34,11 @@ First Neversnooze CE release.
 
 ## Unreleased
 
+- Value provenance timeline: "Find what writes/accesses" now records every
+  access event (timestamp, accessed address, full register state) in a capped
+  history; a Timeline tab next to the instruction list shows the events
+  newest-first, double-click replays the register dump, and "Export Timeline
+  CSV..." writes the whole history for offline analysis.
 - Pattern editor (Tools menu): bounded AOB scan of all readable regions or one
   module, match preview and module attribution, uniqueness verdict, and copies
   the pattern as a Lua `AOBScan` call or as C bytes + mask.

@@ -45,6 +45,7 @@ private slots:
 private:
     void onAddToList();       // add selected (or all) rows to the address list
     void onExportToFile();    // write the findings to a text report
+    void onExportTimeline();  // write the event history to a CSV file
     void onContextMenu(const QPoint& pos);   // per-result right-click actions
     uintptr_t addressOfRow(int row) const;   // the (recovered) address shown in column 0
     bool nopInstructionAt(uintptr_t addr);
@@ -55,6 +56,7 @@ private:
     ce::ProcessHandle* proc_ = nullptr;   // for exact-store recovery (may be null)
     ce::SymbolResolver symbols_;          // enclosing-function anchor for recovery
     QTableWidget* table_;
+    QTableWidget* timeline_;
     QLabel* statusLabel_;
     QPushButton* stopBtn_;
     QPushButton* saveBtn_;

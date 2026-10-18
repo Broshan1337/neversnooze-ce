@@ -8,6 +8,8 @@
 #include "platform/linux/target_syscall.hpp"
 #include <string>
 #include <vector>
+#include <deque>
+#include <chrono>
 #include <unordered_map>
 #include <mutex>
 #include <atomic>
@@ -26,6 +28,16 @@ struct CodeFinderResult {
     uint64_t hitCount = 0;
     CpuContext firstContext{}; // Register state at the first time this instruction hit
     CpuContext lastContext{};  // Register state at the most recent hit
+};
+
+/// One chronological access event (the raw material of the timeline view):
+/// when the watch fired, which address it touched, and the register state then.
+struct CodeFinderEvent {
+    uint64_t timestampMs = 0;       // since monitoring started
+    uintptr_t accessedAddress = 0;  // the watched address
+    uintptr_t instructionAddress = 0;
+    std::string instructionText;
+    CpuContext context{};
 };
 
 struct RecoveredInstruction {
@@ -107,6 +119,14 @@ public:
     /// Clear results.
     void clearResults();
 
+    /// Chronological access events (oldest first), capped by setEventCapacity.
+    std::vector<CodeFinderEvent> events() const;
+
+    /// Event history cap (default 512; 0 disables recording). The oldest event
+    /// is dropped once the cap is reached.
+    void setEventCapacity(size_t cap);
+    size_t eventCapacity() const;
+
 private:
     void monitorLoop();          // native hardware and page-guard event loop
     // x86 hardware stops after the instruction. ARM64 hardware and software page
@@ -140,6 +160,9 @@ private:
 
     mutable std::mutex resultsMutex_;
     std::unordered_map<uintptr_t, CodeFinderResult> resultsMap_;
+    std::deque<CodeFinderEvent> events_;
+    size_t eventCapacity_ = 512;
+    std::chrono::steady_clock::time_point startedAt_{};
 };
 
 } // namespace ce
