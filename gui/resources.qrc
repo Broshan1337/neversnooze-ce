@@ -1,0 +1,5 @@
+<RCC>
+  <qresource prefix="/">
+    <file alias="icon.png">../packaging/neversnooze-ce.png</file>
+  </qresource>
+</RCC>

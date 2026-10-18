@@ -1,0 +1,2682 @@
+# Changelog
+
+All notable releases of Neversnooze CE, a Linux-native C++/Qt6 memory scanner,
+debugger and trainer toolkit. Rebranded from cheat-engine-linux (a Linux-native
+reimplementation of Cheat Engine); history below the rebrand is inherited from
+the upstream project.
+
+> **Repository note (2026-07-11):** the repository was consolidated into a
+> single top-level repo with a fresh git history (the earlier upstream-CE
+> Pascal fork and the separate project history were collapsed). The
+> per-version notes below are preserved here because that rewrite dropped the
+> original release tags. Build instructions in old release notes that referred
+> to a `cecore/` subdirectory or an `../Cheat Engine` Pascal checkout no longer
+> apply; the project now builds from the repository root.
+
+---
+
+## v1.1.0 - 2026-10-18
+
+First Neversnooze CE release.
+
+- Rebrand: the app is now Neversnooze CE (binary `neversnooze-ce`), with the
+  Neversnooze logo as the application icon, a periwinkle accent theme
+  (`#967fee` dark, `#6f55c1` light) and Neversnooze naming throughout the GUI,
+  the About dialog and the desktop integration (new AppStream id
+  `io.github.Broshan1337.NeversnoozeCE`).
+- Packaging: .rpm packages (via CPack RPM, with the same setcap grant as the
+  .deb), alongside the existing .deb and AppImage. AppImage artifact renamed
+  to `NeversnoozeCE-<version>-x86_64.AppImage`.
+- Tutorial games renamed to Neversnooze CE Tutorial / Neversnooze CE
+  Graphical Tutorial (binaries `cetutorial` / `cegtutorial` unchanged).
+- Internal names unchanged: library `cecore`, CLI `cescan`, Lua API
+  (`getCheatEngineDir`, .CT/.CETRAINER support) fully script compatible.
+
+## Unreleased
+
+- Snapshots and memory analysis: the Snapshot menu runs off the UI thread with
+  a 1 GiB budget (and says when it cut the snapshot short); a diff compares
+  regions by overlap, so a grown heap is still diffed, and keeps a count past
+  the entries it shows. Restore writes only into memory that is still writable
+  data, never into code a stale or loaded snapshot happens to cover. Emulator
+  guest scans cap their snapshot (512 MB) and hit lists and read past
+  unreadable pages. GDB targets read and write more than 16 MiB in chunks and
+  answer pointer width and byte order without a round trip. Signatures are
+  checked for uniqueness across every mapping of their module (and are not
+  reported unique after a short read); assembly-pattern search matches
+  relative branches by target; 32-bit references above 2 GB are kept; C++
+  struct export is packed with `static_assert` offset checks and types chosen
+  by field size, and pointer following uses the target's width and byte order.
+- AI Assistant (Tools > AI Assistant, Ctrl+Shift+I): a chat panel where a
+  model of your choice finds and changes values with the agent tools, on the
+  process you have open. Anthropic or any OpenAI-compatible API (OpenAI,
+  Ollama, LM Studio), configured in Settings > AI Assistant. API keys go to the
+  system keyring over the Secret Service API, never to the settings file; a
+  key from the environment is only sent to that provider's own API.
+  Writing, freezing, enabling scripts, saving files and opening any process
+  but yours wait for your Allow; Stop ends a turn;
+  results can be added to the address list. The conversation loop is Qt-free
+  (`core/agent_chat`) and tested with a scripted model; the panel with
+  `gui_agent_smoke`, and the keyring client against a mock Secret Service
+  (`test/secret_store_gate.py`).
+- `cescan mcp`: a Model Context Protocol server that lets AI agents drive
+  Cheat Engine (list and attach to processes, scan and narrow values, read,
+  write, disassemble, find what writes an address, generate, check, enable
+  and disable Auto Assembler scripts, and build, freeze and save cheat tables
+  with values and scripts). Writes to the game need `--allow-writes`. Scripts
+  are dry-run against the live code before they are applied, cannot run
+  embedded Lua, load files or libraries, or start threads, and are undone when
+  the session ends (also on SIGINT or SIGTERM). Works with clients that give
+  the server sockets for stdio, as Node-based clients do. The tools live in cecore (`core/agent_tools`) so
+  a GUI agent panel can share them; a shared JSON module replaces the table
+  loader's private parser. See [docs/MCP.md](docs/MCP.md).
+- Tutorial games replace `sample_game.c`: `cetutorial` (nine steps, from an
+  exact value to pointers, code injection and shared code, with step
+  passwords) and `cegtutorial` (three game levels). Both open from the Help
+  menu and run in a terminal with `--text`. `test/tutorial_gate.py` finishes
+  every step and level twice in CI, once with the `cescan` commands and once
+  through the agent tools.
+- New agent tools found missing while playing the tutorials:
+  `pointer_scan` and `pointer_rescan`, `find_accessed_addresses`,
+  `compare_structures`, `next_scan` increased and decreased by an amount,
+  table records that follow a pointer path (also when frozen, saved as base
+  and offsets), and `find_what_writes` reporting the pointer each instruction
+  followed. An enabled script can now be saved to the table.
+- `cescan`: `scan --compare increasedby|decreasedby`, `accessed` (the
+  addresses one instruction touches), and `freeze` follows a `[pointer]+offset`
+  path on every write instead of resolving it once.
+- Fixed: cheat tables from Cheat Engine. Hotkey actions are text in CE
+  ("Set Value"), so every set, increase and decrease hotkey loaded as a toggle
+  and all but the first were lost; they load and save in CE's form now, and
+  hotkeys this program cannot bind are kept. Dropdown lists with attributes,
+  `<AssemblerScript Async="1">` scripts, `<ByteLength>` of byte arrays,
+  `<CustomType>`, group addresses with `+offset` children (now resolved
+  against the parent, as in CE), record colors (BGR in CE), numeric character
+  references and CDATA now load and save correctly. A symbolic pointer offset
+  no longer destroys the record on save, a GUI save keeps pointer chains as
+  base and offsets and keeps each record's own Lua, record settings this
+  program does not model (BitStart, ShowAsBinary and others) are kept, and a
+  large table loads in linear time instead of quadratic.
+- Fixed: saving a table wrote over the old file in place, so a failed write
+  left it truncated; saves now go to a temporary file that replaces the old one
+  only when complete. Lua `saveTable("x.CT")` wrote JSON; it now writes CE XML.
+- Security: AI agent tools. A script could hide `loadlibrary`, `include` or
+  `createthread` from the agent's check behind an empty `{}` comment, and its
+  dry run then loaded the library or started the thread in the real game, or
+  read a local file into the reply; the assembler now refuses these commands
+  (and `{$ccode}`) for the agent. Disabling a script and
+  `find_accessed_addresses` (a breakpoint in game code) now need
+  `--allow-writes`, freezes stop when writes are turned off, and MCP input
+  lines are capped at 4 MiB.
+- Fixed: AI agent tools. Unfreezing a record whose pointer path no longer
+  resolves failed and left it frozen; freezes stopped holding during long
+  scans; a script using a symbol another enabled script registered failed its
+  check; `find_what_writes` re-decoded 32-bit Wine code as 64-bit; and a
+  failed attach in `find_accessed_addresses` was reported as "the instruction
+  did not run". `cescan pointerscan` with depth 0 now fails instead of
+  reporting zero paths.
+- Fixed: debugger and Memory Viewer. Removing a breakpoint while a step was
+  still running froze Cheat Engine for good; it is now refused until the step
+  ends. Typing, pasting, filling or loading bytes in the hex view over a
+  breakpoint jammed the debug session; those writes are refused. A Memory
+  Viewer left open after its game exited still set breakpoints and ran tools
+  on the next game opened; its debug actions are now disabled. With two
+  viewers open, disassembler comments from one were lost, and editing a
+  breakpoint condition while the target called exec could write past the end
+  of the list.
+- Fixed: Code Finder "Add to the address list" from the context menu could
+  add a different instruction after the list re-sorted. Structure Dissect and
+  the Change Address preview read 8-byte pointers on 32-bit targets, and
+  double-clicking "Pointer?" without compare addresses opened rename instead
+  of following it. Mono Dissect could be re-entered during a long dissect,
+  PageDown in a collapsed disassembler read before its buffer, and pointer
+  scan results that no longer resolve kept an old value.
+- Fixed: addresses and values. Module names in addresses now match without
+  regard to case, as in Cheat Engine (a Windows table's "KERNEL32.DLL"+10
+  under Wine), and `*` works (`game.exe+10*4`). In a WoW64 game, addresses of
+  64-bit modules and stacks above 4 GiB were cut to 32 bits. A UTF-16 string with one bad character showed
+  every following character garbled, and a float typed as "+-5" was accepted.
+- Security: Lua. A table could open Cheat Engine's own process with
+  `openProcess`, write its environment and so turn on the unsafe opt-in
+  (`shellExecute`); Lua now refuses its own process, and the opt-in is read
+  once when the engine starts. `pointerScan` and `breakAndTrace` could use a
+  freed process handle when their options table disconnected the process.
+  Breakpoint conditions and scan formulas could escape their instruction
+  limit with `pcall` or long-running string functions; their sandbox now has
+  a memory cap, a budget that stays spent, and no `pcall` or pattern
+  functions.
+- Fixed: Lua compatibility with Cheat Engine. `AOBScan` returns nil when
+  nothing matches, AddressList, MemoryRecord, Stream and StringList methods
+  work when called with a dot, `read*`/`write*` accept address strings such as
+  `"game.exe+1234"`, `readString(a, n, true)` reads UTF-16, OnActivate and
+  OnDeactivate are separate and get `(sender, before, currentstate)`, and the
+  `debug_getRegisters` family no longer attaches the debugger as a side
+  effect.
+- Changed: Lua `readByte`, `readSmallInteger` and `readInteger` return
+  unsigned values unless the second argument is true, as in Cheat Engine, and
+  `readShortInteger`/`writeShortInteger` are one byte as in CE.
+- Removed: Lua `setProcessName`, which existed to disguise the process name
+  from anti-tamper checks (detection evasion).
+- Fixed: injection and native calls. Picking a thread to run a call in
+  interrupted threads blocked in system calls, so a game waiting in
+  `epoll_wait` saw EINTR, and while a call's private memory waited to be freed
+  this repeated ten times a second in an idle game; only running threads are
+  borrowed now and the background retry backs off. A call (dlopen,
+  pthread_create) could run on a thread stopped inside libc or the loader and
+  deadlock it, or inside an rseq critical section; such threads are skipped.
+  The 32-bit thread wrapper crashed when a CREATETHREAD procedure returned
+  with `ret 4` (stdcall). LOADLIBRARY, Lua `injectLibrary` and the speedhack
+  now pass an absolute path as the target sees it (Proton's container).
+- Fixed: 32-bit injection templates moved a stolen `call` into the code cave,
+  so position-independent code computed its GOT from the cave address and
+  crashed; thunk calls and `call $+5` are rewritten to load the original
+  address.
+- Fixed: trainers. Building a trainer named `game` overwrote and then deleted
+  a `game.c` next to it; the source now goes to a private temporary directory.
+  The trainer's key loop lagged on fast or multi-byte keys and spun at full CPU
+  once its input closed.
+- Fixed: find what writes/accesses and break and trace. On ARM64 a wide
+  store covering the watched value (str, stp) was taken for a foreign trap
+  and killed the game. Threads started while the watch or trace attached were
+  never covered (in software mode they died on the guarded page). A hit made
+  by `call [mem]`, `jmp [GOT]` or `ret` was attributed to the wrong
+  instruction; it is now traced back to the call or labelled. The software
+  page guard is refused on a thread's stack page, where it killed the game at
+  the next signal, and its cleanup could hang forever if the game was killed
+  mid-stop. A queued start trap could kill the game when a trace detached, and
+  "step over calls" stopped early in recursive code. "Find what addresses
+  this instruction accesses" decoded ARM64 and WoW64 code as x86-64 and
+  reported `fs:[28h]` as address 0x28; segment-relative operands are refused.
+- Fixed: main window. Every refresh and freeze tick rebuilt the game's module
+  list from `/proc` once per pointer or module-based record, which made large
+  tables stutter on Proton games; it is now read once per pass. A queued
+  "Wait for process" hit could replace a process the user had just opened.
+  Toggle hotkeys and Space did nothing on group headers. Holding a toggle
+  hotkey flipped the record (and enabled and disabled its script) many times
+  a second. Wayland portal shortcuts were named by row position, so deleting a
+  record moved its key to another one. Changing codec, byte order or pointer
+  size on a frozen record rewrote the game's value; the freeze now ends, as it
+  does for a type change. Adding or deleting many records rebuilt every
+  hotkey once per row, and indenting a record into a collapsed group left it
+  visible.
+- Changed: frozen records show the value memory holds (an Increase Only floor
+  or a broken pointer is visible), Space sets every selected record to one
+  state as in Cheat Engine, and the address and results lists follow the
+  Uppercase hexadecimal and Address width display settings.
+- Fixed: ceserver. Memory region lists had their fields in the wrong order on
+  both the client and the server (so they only worked with each other):
+  against an upstream ceserver every region came back scrambled and scans
+  found nothing. Remote module paths were opened on this machine for symbols,
+  so symbol names resolved to wrong addresses in the remote game. The server
+  kept a game stopped and traced if its client died during a debug-event wait,
+  a continue for a thread-exit notice resumed a newer breakpoint stop, a
+  compressed read got an uncompressed reply, and any command it did not know
+  closed the connection; the common ones Cheat Engine sends are answered now.
+  The GUI no longer makes a network round trip per refresh to check the link,
+  and says why a connection was refused while the current target is busy.
+- Fixed: Auto Assembler. Disabling a script never ran its [DISABLE] assembly,
+  only its Lua, after the memory was already freed; the [DISABLE] section now
+  runs first as in Cheat Engine, so a thread stop flag (`stop: dd 1`) works and
+  `db` restores land exactly. Disabling one script zeroed `globalalloc` code
+  another script still used, `UpdateHealth:` on a target function patched the
+  code cave instead of the function, `reassemble` copied the script's own jump
+  when the hook came first, two scripts patching the same data restored stale
+  bytes, `{$lua}` inside a `//` comment ran, and `dealloc`/`unregistersymbol`
+  took effect even when a later line failed. Scripts from the AI agent may not
+  carry `{$lua}`, `{$ccode}` or `{$if}` in either section.
+- Security: AI Assistant. Disabling a script and watching an instruction's
+  accesses (a breakpoint in game code) ran without asking; both now ask.
+  "Allow for this chat" also approved opening any other process, whose memory
+  would then go to the provider, and stayed in force after switching games; it
+  now covers only the process it was given for and never opening a process or
+  overwriting a file. A key saved for one API address was sent to any address
+  entered later, even over plain http; a key now belongs to its address.
+  A key saved before this version for a custom API address must be entered
+  again: it is treated as belonging to the provider's own API.
+  Replies are capped at 16 MiB and tool calls at 16 per reply.
+- Fixed: AI Assistant. With no process open in the main window, every turn
+  ended by detaching from the process the model had opened, undoing the
+  scripts and freezes just approved. Write and freeze prompts now show the
+  resolved address (and the record's type and pointer path) instead of the
+  raw text the model sent.
+- Fixed: tutorials. A freeze from the graphical tutorial's first level
+  finished the second at once, editing the team field won step 9 of the text
+  tutorial without any injection, and a NaN health bar could crash the text
+  mode.
+- Security: the `.deb` gives `cheatengine` and `cescan` the ptrace capability
+  for every user on the computer. Qt, GTK, GIO, Mesa and the Vulkan loader
+  still load plugins from paths in the environment in such a process, and the
+  Lua unsafe opt-in opened `package.loadlib`, so any local user could run
+  their own code with the capability and read or write any process, root's
+  included. A capability-holding process now drops those variables first
+  thing and ignores the Lua opt-in.
+- Fixed: packaging. "Grant access" treated `/usr/local/lib` as a system
+  library directory, so on a `/usr/local` install the capability made the
+  program unable to find libcecore and it no longer started. The AppImage
+  lacked the tutorials (Help > Tutorial failed) and the offline help, the
+  installed `cecore.pc` pointed at the configure-time prefix instead of the
+  install prefix, and a release tag no longer publishes files under a version
+  the sources do not build. The AppStream metadata lists every release.
+- Fixed: process memory. Under Wine, a stack trace taken while another thread
+  refreshed the module cache could deadlock Cheat Engine and leave a game
+  thread stopped (a regression in this release cycle). Auto Assembler patches
+  and hooks failed with "I/O error" on .NET 7+ JIT code mapped twice for W^X,
+  because the fallback for that memory never ran; it now does, also on ARM64
+  and for pinned images. Writes could reach any read-only shared memory the
+  game kept a writable handle to, not just JIT code. A process that exited and
+  whose pid was reused could receive an allocation or code write meant for the
+  old one. 32-bit games under FEX or box64 on ARM64 got memory above 4 GiB, and
+  Lua `deAlloc(addr)` without a size never freed anything.
+- Fixed: pointer scanner. Deep or wide scans kept every partial path of a
+  level in memory and could use gigabytes before finding anything; the search
+  now goes one depth at a time with the same results and order, under a work
+  limit. On 32-bit Wine games almost every value, every positive float
+  included, counted as a pointer because unreadable reservations were taken
+  as targets; only readable memory counts now, the map has an entry cap, and
+  building it is much faster with working cancel and progress. Structure
+  Spider ran a whole scan on the GUI thread and closed Cheat Engine on a scan
+  error; it now runs in the background with Cancel. Showing results and
+  rescanning rebuilt the module list per row (rescans now run in the
+  background too). With two modules of the same name (WoW64 ntdll.dll) paths
+  resolved against the wrong one, and rescan by value ignored a big-endian
+  target's byte order. `cescan pointerscan` and Lua `pointerScan` accept depth
+  up to 7 and offsets up to 1 MiB.
+- Fixed: debugger. A stop of a third thread while all threads were being
+  stopped was reported from inside that stop, so the debugger could show one
+  thread's registers under another's id, and editing them wrote them into the
+  wrong thread; breakpoint, watchpoint and exception hits of other threads
+  during a stop were lost or delivered to the game. Detaching looped forever,
+  freezing the game and Cheat Engine, when a breakpoint's code was unloaded or
+  overwritten. Step Over and Step Out stopped in a deeper recursive frame and
+  disabled the breakpoint at the current line for the whole run; a SIGTRAP
+  exception breakpoint reported the debugger's own stops; Ctrl-Z and
+  `kill -STOP` were undone at once; error paths left the game stopped with
+  the window still saying "Running"; an exec during a breakpoint change could
+  plant the breakpoint in the new program; and detaching during a single step
+  dropped a signal.
+- Fixed: Auto Assembler. An undeclared `name:` line now patches the target's
+  function when that symbol lives in the game or its own libraries (also for
+  mangled C++ names), and stays a local label for C library names and names
+  the script jumps to, so patching two functions in a row works again. A table
+  saved in place (shared, hard-linked or read-only directories) is no longer
+  lost when the write fails, and Activate, Deactivate and differing-step
+  hotkeys from CE tables keep their meaning when saved.
+- Fixed: debugger. Step Over and Step Out of a call that returns with a lower
+  stack pointer (`_chkstk`, `__SEH_prolog4` and similar helpers in 32-bit
+  Windows code under Wine, or `call $+5; pop`) let the game run on instead of
+  stopping (a regression in this release cycle).
+- Fixed: under Wine, an undeclared Auto Assembler label such as `exit:` could
+  be assembled over the Windows C runtime's function of that name; the
+  Windows runtimes (msvcrt, ucrtbase, vcruntime, msvcp, ntdll) now count as C
+  runtime too. Clearing or changing a hotkey that came from a CE Activate or
+  Deactivate key no longer brings the old key back on reload, scan folders of
+  another live Cheat Engine on a shared home are not removed, and pointer scans
+  over ceserver no longer ask the server about every memory region.
+- Fixed: scanner. A first scan with Changed, Unchanged, Increased, Decreased,
+  Increased/Decreased by or Same as first ran as an Exact scan on whatever the
+  value box held; it now says a first scan is needed. "Increased by -5" never
+  matched (it now means decreased by 5), a 4-byte pointer search value wider
+  than 32 bits was cut to its low half, an All-type exact search for an 8-byte
+  value above 9223372036854775807 found nothing, and text, byte array and
+  binary next scans with bigger/smaller/between or changed-by compares emptied
+  the list or acted as another compare; they are now refused.
+- Changed: scan results are stored in `~/.cache/cheatengine/scans` instead of
+  `/tmp`, which is RAM-backed on many desktops (an Unknown initial value scan
+  writes several times the scanned memory). `CE_SCAN_DIR` or an explicit
+  `TMPDIR` still choose the place. Directories left by a crashed session are
+  removed on the next scan; ones `cescan` keeps for `--previous` stay a week.
+- Fixed: symbols. A library linked at a non-zero base (prelinked, or a PIE
+  with an image base) had every symbol and source line shifted by that base.
+  A name with several versions (glibc's `pthread_cond_wait`, `realpath`)
+  resolved to the old compat version instead of the default one. Fonts such as
+  DejaVuSansMono.ttf made Mono Dissect treat any game as a Mono game and
+  inject its agent. Under Wine, every value refresh rebuilt the module list
+  from `/proc` (now cached for a second), and PE and IL2CPP binaries were
+  copied into memory byte by byte (they are now mapped). A mapped path ending
+  in a space lost the space.
+- Security: a game could make Cheat Engine hang or run out of memory through
+  the files it maps: a module file swapped for a FIFO after the check blocked
+  the open forever, and a crafted ELF (one huge name shared by many symbols,
+  or thousands of overlapping symbol table headers) or IL2CPP metadata file
+  (a region of NUL bytes) grew to tens of gigabytes in memory. Files are now
+  opened without blocking and checked after opening, and names, tables and
+  totals are bounded.
+- Fixed: closing the Pointer Scan window right after pressing Scan could
+  freeze Cheat Engine until the whole scan finished: a cancel that arrived
+  before the scan started was cleared when it began.
+- Fixed: Disassembler Preferences. Register color, symbol color, call color,
+  jumpline thickness and spacing, and space above and below lines were saved
+  but never used; the disassembler now draws with them (calls get a jumpline
+  when their target is on screen).
+- Removed: the kernel module's process hiding ioctls. Hiding a process from
+  `/proc` is detection evasion, which the project does not ship.
+- Changed: the optional kernel module only reads physical System RAM. It used
+  `ioremap`, which refuses RAM with a kernel warning (so RAM reads never
+  worked) and mapped MMIO uncached. It now reads online System RAM pages
+  through the kernel mapping, rejects everything else, needs
+  `CAP_SYS_RAWIO` as well as `CAP_SYS_ADMIN`, is refused under kernel
+  lockdown, stops on a fatal signal, checks ranges on 32-bit kernels and
+  handles 32-bit callers. Physical writes are refused: a translated frame can
+  be freed or shared by the time it is written. The process read/write and
+  translation ioctls are retired because a module cannot apply ptrace, Yama
+  and LSM checks; `KernelDriverClient` now does them through
+  `/proc/<pid>/mem` (which also patches read-only code) and
+  `/proc/<pid>/pagemap`.
+- Fixed: Lua Engine opened a new console window each time; it now raises the
+  one already open.
+- Fixed: Auto Assembler. A `jmp`/`call`/`jcc` to a target more than 2 GiB away
+  assembled a branch that landed somewhere else; it now fails with an error.
+  `{$lua}` blocks in the `[DISABLE]` section now run when the script is
+  disabled.
+- Fixed: speedhack. A long sleep at a slow speed overflowed and slept the
+  wrong time, a malformed `nanosleep` no longer turns into a valid one,
+  `sleep(1)` at 2x slept a whole second, and `select` reports the time left in
+  game time. The monotonic clock could step back when the speed changed while
+  another thread read it, and a fork during a speed change hung the child's
+  clock reads. A second game loading the plugin no longer resets the speed the
+  first runs at.
+- Security: speedhack injection left the game's read-only GOT pages writable.
+- Fixed: ceserver. Setting a breakpoint resumed a target stopped at a debug
+  event, and hardware watchpoints from the client were refused or armed with
+  the wrong length (a 2-byte watch covered 1 byte). The mono agent removes its socket
+  when the game exits, and audiohack waits on a full non-blocking device
+  instead of dropping audio.
+- Fixed: every scan left its result files in the temporary directory (RAM on
+  most desktops) until reboot; results now delete their files when discarded
+  (`cescan scan` keeps the ones it prints for `--previous`).
+- Fixed: pointer scans stopped at 10,000 paths and kept the short ones, so
+  with the default maximum offset a four-level path could be missing. The limit
+  is now 100,000, and the pointer scan window and the agent tool say when it
+  was reached.
+- Lua `getAddressFromName` accepts module+offset and pointer paths, like
+  `getAddress` and Cheat Engine.
+- Security: a process the user owns could exec a setuid program and keep
+  its PID; with the .deb's `cap_sys_ptrace`, memory access and the debugger
+  then reached the now-privileged process. Ownership is checked on every
+  memory access, and the debugger and tracer let go of a process whose exec
+  made it someone else's.
+- Fixed: Memory Viewer. F3, Shift+F3, Ctrl+F and F5 did nothing (each key was
+  bound twice); right-click actions and Paste used the end of a drag
+  selection instead of its start; typing hex digits in Word, Dword, Float or
+  Double display changed the wrong bytes (editing is now Byte display only);
+  the arrow and page keys wrapped around the address space; a bytes-per-row
+  setting that is not 8, 16, 32 or 64 broke grouped display; "Find
+  references" left Back/Forward and the current address behind; "Label this
+  address" pre-filled display text and saved it as a label; assembling a
+  longer instruction left the rest of the next one as garbage (it is now
+  padded with NOPs to the next boundary).
+- Security: Lua `snapshot:save()` wrote files without the file-write opt-in
+  (`CECORE_LUA_ALLOW_UNSAFE=1`) that other file writers need, and followed a
+  symlink at the path.
+- Fixed: Lua. A memory record handle or an OnActivate handler kept working
+  after another table was loaded, on the new record with the same ID; forms
+  and timers had no `destroy` (so `createTimer(nil)` ran forever); a bad
+  argument to a font, colour or `Lines` property leaked memory, and
+  `Stream.loadFromFile` of a too-large file leaked a file descriptor.
+- Fixed: the debugger. "Replace with NOPs" on a line with a breakpoint wrote
+  one NOP over the trap, and removing the breakpoint then put the original
+  byte back over it; it now refuses. Step Out planted a breakpoint at the
+  value on top of the stack even when that was data. Breakpoints set from the
+  Memory Viewer were only drawn, never armed; they now go to the debugger.
+  Run to Cursor's temporary breakpoint stayed armed after a stop elsewhere.
+  Advanced Options let one entry be replaced with NOPs twice, after which
+  Restore put back NOPs.
+- Security: Lua `writeFile` (an alias of `writeToFile`) wrote files without
+  the `CECORE_LUA_ALLOW_UNSAFE=1` opt-in, so any table could overwrite the
+  user's files.
+- Fixed: a pointer record whose path stopped resolving (the game freed the
+  object, or a loading screen) kept its last address, and freezing, hotkeys
+  and edits wrote there, into memory that may belong to something else. It
+  now shows `??` and nothing is written until the path resolves again.
+- Fixed: generated trainers wrote pointer-path and module+offset records to
+  the address they had in this session; only plain absolute addresses are
+  written now. Toggling "Show as hex" on a frozen record changed the frozen
+  value (100 became 0x100), and freezing an unreadable String record wrote
+  the text `??` into the game.
+- Fixed: Lua. An error in `debugger_onBreakpoint` left the game stopped at the
+  breakpoint; `copyMemory` wrote zeros after a short read and had no size
+  limit; `debug_setBreakpoint` returned an id for a breakpoint that was not
+  set; `dissectStructure` presented unread bytes as fields; `playSound` left
+  a zombie process per call and read a path starting with `-` as an option;
+  `readString` and `readBytesLocal` truncated large sizes; several bindings
+  leaked memory when given a bad argument.
+- Fixed: a module whose file is also mapped as data (a game reading its own
+  binary) took the data view's extent, so module+offset addresses and
+  symbols could be wrong; the view with code is now the module.
+- Fixed: windows of a target that exits were deleted while a dialog or menu
+  of theirs was open, which could crash; this now waits for it to close. An
+  Auto Assemble window opened before attaching was closed (losing its
+  script) on attach; it now takes the new target. The color, dropdown and
+  hotkey dialogs could apply to another record if a script changed the list
+  meanwhile. Debug > Breakpoint list showed a list nothing used; it opens the
+  debugger's. A tracer Cancel right at the start could be lost. Form
+  Designer: edits after a delete went nowhere, names could repeat, and names
+  or captions could produce invalid Lua.
+- Fixed: pointer scans dropped every path through an ELF program's
+  zero-initialised globals (`.bss`, the commonest static base), which were
+  not counted as part of the module; the module now extends to the end of
+  its last loaded segment. Code analysis (Find Statics, string references)
+  found nothing on 32-bit x86, which addresses globals absolutely. An "All"
+  scan missed 2- and 4-byte values above the signed maximum and negative
+  bytes, and a From address off the alignment grid shifted it. Untouched
+  pages of private memfd and device mappings were skipped as empty.
+- Fixed: address list. Actions from its context menu (Change address, Set
+  value, codec, data order, pointer size, groups, move) could apply to
+  another record when a table script changed the list meanwhile. Changing
+  the type of a frozen record kept writing the old frozen text in the new
+  type; the Type cell editor opened empty and committing it made the record
+  4 Bytes; editing the Address cell turned `game.exe+1C` into a fixed
+  address; freezing right after an edit froze "?" or nothing. Cut lost a
+  group's children; dropping a record on the group right above it did
+  nothing, and dragging a record left its children behind.
+- Fixed: `cescan`. Closing the terminal (SIGHUP) or Ctrl-\ during `accessed`,
+  `watch --mode sw`, `freeze`, `mcp` or `ceserver` killed it with a
+  breakpoint or page guard left in the game; they now clean up like on
+  Ctrl-C. `watch` waited out its full duration after the monitor had died
+  and reported "nothing observed" with exit 0; `freeze` spun forever after
+  the target exited; a first `scan` with `--compare increased` (or another
+  relative comparison) compared against 0; `pointerscan` and `analyze`
+  reported empty results for an unreadable target and `pointerscan` showed
+  an unsorted 50 without the path-limit note; `watch --regs` showed x86
+  registers on ARM; unknown or incomplete options of `disasm`, `il2cpp` and
+  `analyze` were ignored. MCP watches end on shutdown instead of holding it
+  for up to 30 seconds.
+- Fixed: closing Cheat Engine, loading a table or picking a recent one
+  discarded unsaved changes to the cheat table without asking; it now offers
+  Save, Discard or Cancel. File > Save over a password-protected
+  `.CETRAINER`, or a Cheat Engine XML table without the `.ct` name, replaced
+  it with plain JSON; it now asks where to save.
+- Fixed: a pending "Wait for process" kept watching after you opened another
+  process yourself and later switched to the next match; the Open Process
+  dialog could attach to a different process that reused an exited one's
+  PID. The AI Assistant's approval prompts named the process open when the
+  turn began, not the one the model had attached to, and Stop could not end
+  a running watch. A second Settings dialog could revert values on OK; there
+  is one now. The overlay redrew a full-screen window 60 times a second and
+  showed that as the game's FPS.
+- Fixed: Auto Assembler. `readmem` and `assert` read memory after the
+  script's own earlier writes, so the common "hook, then copy the original
+  instruction into the cave" copied the hook's jump and the game crashed;
+  they now see the code as it was before the script. A record whose hooked
+  code had been unloaded (a library, a JIT method) could never be disabled
+  and kept its cave allocated; those patches are skipped and the rest is
+  cleaned up.
+- Fixed: Auto Assembler. `aobscan`, `aobscanmodule`, `aobscanregion` and
+  `aobscanall` with a missing argument were skipped silently, so the name
+  could resolve to a label another enabled script registered and the hook
+  went there. A section header with a trailing comment (`[DISABLE] // x`) was
+  not recognised, merging the disable code into enable; an empty `[ENABLE]`
+  ran the whole script. A `{$lua}` block that runs to the end of its section
+  (Cheat Engine's pure-Lua records) was rejected. A `globalalloc` shared by
+  several scripts got a fresh block after one of them was toggled, and could
+  reuse a same-named plain `alloc` of another script that frees it. An
+  `alloc` near-address that does not resolve allocated anywhere; a missing
+  `include()` file was skipped. Simple hooks copied `bnd jmp`/`bnd call`
+  instructions into the trampoline unrelocated.
+- Fixed: debugger. A breakpoint trap another thread had already taken when
+  the debugger stopped it stayed queued; once that breakpoint was removed
+  (Run to Cursor's, or all of them on detach) the trap reached the game and
+  killed it. A breakpoint on a `rep` string instruction stopped again on
+  every iteration. Detach while a Step Over or Run to Cursor hit its
+  breakpoint resumed the thread one byte into the instruction; attaching
+  missed threads created while it ran (a breakpoint they hit killed the
+  game) and dropped a signal that was in flight. The Memory Viewer could
+  assemble over a planted breakpoint, after which the debugger could not
+  remove it or detach cleanly; it now refuses.
+- Fixed: `cescan scan --previous` accepted results of another value type (a
+  float scan narrowed as integers) or another process; scans now record
+  both and refuse a mismatch. The MCP `compare_structures` tool read
+  big-endian targets in host order. Connecting to ceserver froze the window
+  for up to 20 seconds (longer for a host name that does not resolve); it
+  now runs in the background and Cancel works.
+- Fixed: ceserver targets. A dropped connection made a scan return partial
+  or empty results without an error, and the window kept showing `??`
+  values; scans now fail and the window reports the lost connection. Reads
+  and writes are sent in 1 MiB pieces (one 64 MiB transfer timed out on a
+  slow link and closed the connection), the module list had no overall size
+  limit, and the thread list (which also asked the server twice per row),
+  speedhack and target info looked up the remote PID in this machine's
+  /proc.
+- Fixed: Indent, Outdent and Move Up/Down moved a group header without its
+  records (and Move could move a record into or out of a group); they now
+  move the whole subtree past its sibling. An empty or invalid percentage in
+  a next scan scanned for 0%. Open Memory Viewers kept the previous table's
+  comments and labels after another table was loaded and saved them into
+  it. The pointer scan window showed byte-swapped values for big-endian
+  targets.
+- Fixed: input during a scan was replayed after it (a second First Scan
+  click wiped the new results); Ctrl+C did nothing in either list, and
+  Delete in the scan results deleted cheat-table records. "Wait for process"
+  could attach under an open menu or dialog and reported success when the
+  attach was refused. A GDB session's scan range and type carried over to
+  later processes. An open Comments or Lua Script window wrote the previous
+  table's text over a newly loaded one. Saving Settings slowed the address
+  list refresh and exit detection to 2 seconds.
+- Fixed: a value edit or freeze on memory a game maps read-only from a file
+  (an asset pack, an SQLite database) could be written into that file on
+  disk, every freeze tick. Writing through a mapping's file is now limited
+  to a JIT's own shared-memory code view.
+- Fixed: modules of binaries linked with lld (Rust's default) or loaded on
+  64K-page kernels were split, which moved their base, after the module
+  change in this release; adjacent segments stay one module.
+- Security: the scanner's batched reads, the region list and the resident
+  page map did not re-check that the target still belongs to the user, so a
+  target that exec'd a setuid program stayed readable there. Your own
+  processes that make themselves non-dumpable (some games do) are no longer
+  refused.
+- Fixed: the tracer could leave a breakpoint trap queued when cancelled, which
+  killed the target after detaching, and its table built a widget item for
+  every cell (eight million for a million-step trace); it now reads the
+  trace directly. Code caves allocated near an address on kernels before
+  4.17 could land out of jump range. Form Designer fields stopped at 4000
+  and moved items placed further out.
+- Fixed: Lua `wideStringToByteTable` turned a cut-off UTF-8 sequence into a
+  wrong character instead of U+FFFD; `print`, the Mono, IL2CPP and DWARF
+  lookups, `disassembleBytes` and the custom-type helpers leaked memory when
+  given a bad argument.
+- Fixed: the Code Finder's page-protection mode missed accesses that start
+  before the watched value and cover it (a 16-byte copy over a struct), and
+  hits inside `rep movs`/`rep stos` were credited to the instruction before.
+- Fixed: Lua `loadTable` wrote every record's saved value into the game and
+  activated the records marked active (running their scripts) without
+  asking; records now load inactive with their length, signedness, byte
+  order and pointer width. Lua `saveTable` and the Lua trainer functions
+  saved pointer records as this session's address and lost groups.
+- Fixed: generated trainers wrote 8 bytes for a 32-bit pointer, wrote
+  big-endian records in the wrong byte order, and froze directional records
+  ("allow increase") unconditionally.
+- Fixed: the tracer stopped without saying so when the traced thread got an
+  ordinary signal (a timer, SIGCHLD, a runtime's GC signal); it delivers it
+  and keeps tracing. On 32-bit targets, address arithmetic such as
+  `[p]+FFFFFFFC` now wraps at 32 bits. Resolving an address read the
+  target's memory map for every number in it; once per expression now, and
+  not at all for plain numbers (the freezer does this ten times a second).
+- Fixed: value hotkeys did Int64 arithmetic in floating point, so +1 on a
+  value above 2^53 wrote the wrong number. Two records with the same global
+  hotkey: only one fired, and removing one released the key for the other;
+  a combination another program already owned was reported as registered.
+  The Code Finder stopped monitoring at the first instruction it could not
+  read or decode; it now lists it as `??`. The graphical memory view rebuilt
+  its whole image on every paint, and the ELF inspector ran readelf on the
+  GUI thread (up to a minute) and passed a file name starting with `-` as an
+  option.
+- Fixed: the debugger window froze while a step ran, for good when Step
+  Over entered a call that never returned (or waited on a thread the step
+  keeps paused); steps now run in the background and Detach ends one. The
+  changed-register highlight was cleared by a second redraw of the same stop;
+  data breakpoint hits were never counted; right-clicking below the last
+  line acted on RIP.
+- Fixed: the Code Finder's details and "Add to the address list" could take
+  another instruction than the one clicked (rows re-sort by hit count), and
+  added the trap address instead of the recovered instruction shown.
+- Fixed: the Structure Dissector kept showing old values after a read failed
+  and stale bytes past a partial read; with four compare addresses the
+  column headers never switched; Copy as C++ ignored declared field types.
+- Fixed: the Mono dissector added `System.String` fields as inline text (they
+  hold a reference), Unity vectors and colours as pointers, and asked for an
+  object address for static fields.
+- Fixed: on Wayland, removing the last hotkey left the old shortcuts bound
+  and firing; the portal session is now closed when nothing is bound, and
+  activations of unregistered hotkeys are ignored.
+- Fixed: "Grant access" said access was granted when `setcap` failed, and
+  on an install outside the system library directories (`~/.local`, `/opt`)
+  the capability made Cheat Engine unable to find `libcecore` on the next
+  start (the loader ignores `$ORIGIN` for capable binaries). Such installs
+  now get the session-only `ptrace_scope` route.
+- Fixed: Memory Viewer. Word, Dword, Qword, Float and Double display used the
+  host byte order on big-endian targets; the scrollbar did not follow Go,
+  Back/Forward or the keyboard and used the memory map from when the window
+  opened; "Save region" silently wrote fewer bytes than asked and did not
+  check the write.
+- Fixed: the speedhack library was not found in the .deb (it is installed in
+  the multiarch library directory) and was missing from the AppImage; the
+  128x128 icon was installed as 256x256.
+- Fixed: symbols. Absolute ELF symbols (glibc's `GLIBC_2.x` version nodes are
+  0) named small numbers in the disassembler; a user label up to 4 KiB before
+  a function hid that function's name; DWARF multi-dimensional arrays had the
+  size of their first dimension, and DWARF 4 bitfields and DWARF 2 member
+  offsets were read as offset 0.
+- Fixed: dialogs. The file patcher read an offset with a leading zero as
+  octal (010 patched offset 8) and accepted negative offsets; the emulator
+  guest scan treated an empty or invalid value as 0 and a next scan with one
+  emptied the results; ticking Pointer in Change Address dropped the typed
+  address; a negative or junk Length became a huge byte count; pressing OK in
+  Settings stopped the theme following the desktop; `--panel`,
+  `--settings-page`, `--memview` and `--find-writes` values were opened as
+  table files when a file of that name existed.
+- Fixed: the script editor's syntax check never said why a script failed,
+  and Find Statics could scan a different module than the one picked.
+- Fixed: Auto Assembler `globalalloc` behaved like `alloc`: each script got
+  its own block, freed when that script was disabled even if another
+  script's hook still used it. As in Cheat Engine, a `globalalloc` of a name
+  that exists reuses it, and a disable never frees it.
+- Fixed: signatures for code more than 128 MB into a mapping failed, and
+  uniqueness was checked only within that first 128 MB; the printed pattern
+  (trailing wildcards trimmed) is now the one checked, and its byte count
+  matches it.
+- Fixed: a crafted `global-metadata.dat` could make the il2cpp reader
+  allocate tens of gigabytes (overlapping field slices, long identifiers,
+  string literals sharing bytes) and end Cheat Engine from the structure
+  windows; copies are bounded by the file's own tables and the file size is
+  capped.
+- Fixed: Auto Assembler `reassemble()` copied a RIP-relative instruction
+  with its operand unchanged, so the copy no longer reached the original
+  data; it is re-encoded relative to its new address. The largest float, as
+  the address list shows it (3.4028235e+38), could not be written back.
+- Fixed: "Wait for process" never matched a program name longer than 15
+  characters (the kernel's truncated process name); the full program name is
+  matched too. Signatures of 32-bit code kept absolute addresses, so they
+  stopped matching after a rebase. A generic type that names itself could make
+  il2cpp field names grow without limit, and a crafted PE could make its
+  import list do the same.
+- Fixed: `cescan`. A zero-padded address such as the ones its listings print
+  was read as octal (`010` too); `watch`, `accessed`, `guest-scan` and
+  `guest-write` silently ignored unknown options or turned bad numbers into
+  defaults, and a huge `--duration` overflowed into no wait; integer scans
+  without `--value` scanned for 0; a dead PID, or another user's, printed an
+  empty table and exit code 0; the Lua REPL ran a line twice when it raised an
+  error; `analyze xrefs` did not accept module+offset; `deref` split
+  `libstdc++.so.6` at its first `+`; `write --verify --find-writer` lost a
+  failed verify. Guest scans keep their state in a private directory instead
+  of a predictable `/tmp` file another user could plant, report a snapshot
+  that could not be saved, refuse values that do not fit the type, and
+  `guest-write` accepts the guest addresses `guest-scan` prints.
+- Fixed: the tutorials. Text-mode passwords were case-sensitive, `next` on
+  the finished tutorial said "Finish this step first", and the graphical
+  tutorial said the gun jams after five shots (it is six).
+- Fixed: Auto Assembler scripts in Cheat Engine's own style. Lines above
+  `[ENABLE]` (the `define`s of the standard injection templates) were dropped;
+  `{ }` comments were read as code; `assert(address,bytes)` did not use the
+  `bytes` define and ignored half-byte wildcards (`4?`); an `aobscan` that
+  found nothing was only logged, so the hook could land on another script's
+  registered symbol; malformed patterns were accepted; `dd -1` and `dw #-5`
+  were refused while `dq bad_target` was written as 0xBAD; `fillmem` needed
+  an unrelated active address; `nop A` failed. `aobscanregion` and the like
+  read whole regions at once, `include` and `loadbinary` accepted devices,
+  and nested `define`s could grow a line without limit.
+- Fixed: code analysis (Find Statics, string and code references) stopped
+  at the first byte it could not decode, so data inside code (headers, jump
+  tables) cut results short, and it decoded whole regions at once (tens of GB
+  for a large GameAssembly). It now steps over data and decodes in chunks.
+  Find Statics decoded 32-bit games as x86-64, and an architecture that
+  cannot be disassembled terminated Cheat Engine from the references windows.
+- Fixed: injected libraries. The Mono agent could deadlock a game that was
+  loading a library at the same moment; the in-process exception shim
+  replaced handlers that run on an alternate signal stack (Wine, Mono, JVM)
+  with one that does not, which kills the game on a guard-page fault, and made
+  an ignored signal fatal. The speedhack crashed on `gettimeofday(NULL, tz)`,
+  ran dynamically linked SDL games at the square of the speed (SDL's own
+  clock was scaled twice), returned the remaining time of an interrupted
+  sleep in real time, and could spin forever if a signal handler read the
+  clock during a speed change. The shared speed file is only used when it
+  belongs to the user and nobody else can write it (another user could crash
+  the game with SIGBUS); the audio hack applies the speedhack's speed range.
+- Fixed: the pointer scan window scanned on the GUI thread, freezing Cheat
+  Engine (and pausing frozen values) for the whole scan. It now scans in the
+  background with progress and a Cancel button.
+- Fixed: a scan value that is not a number (an empty box, "12a", a pointer
+  without "0x" while Hex is off) quietly scanned for 0; it is now refused.
+  Pointer values follow the Hex box.
+- Fixed: a toggle hotkey set from the address list's menu did nothing until
+  some unrelated change; keypad hotkeys grabbed the top-row digit in every
+  application (X11) or bound the wrong key (Wayland).
+- Fixed: Enter and "Add selected" kept scan-only types (All, Grouped, Custom,
+  Binary), adding records that could never show or edit a value; the "Add
+  Address" button ignored Length, Hex and Signed; right-click Paste used a
+  separate parser that dropped most fields; a custom-type Next Scan failed
+  after a First Scan without Fast Scan; disabled script records showed "??".
+- Fixed: "Pause the process" left the old process stopped after opening
+  another one, and a process started with Create Process was never reaped,
+  so its exit went unnoticed.
+- Fixed: Lua `read*Local` on a bad address crashed Cheat Engine (they now
+  return nil), `StringList.loadFromFile` and `writeRegionFromFile` on a device
+  grew without limit, scan and value options that ran Lua could free the
+  scan or the process in use, and an Auto Assembler disable handle could be
+  destroyed twice.
+- Fixed: Unicode String records became 4 Bytes integers whenever a table was
+  loaded, pasted or reloaded, so edits wrote integers over the text.
+- Fixed: crashes when the target changed or exited at the wrong moment: while
+  the "memory not readable" warning was open after opening another process,
+  while a dialog (Save Memory Region, Save Disassembly, Structure Spider,
+  Restore baseline, the memory view's save, load and assemble, the address
+  editor) was open, or when "Wait for process" attached during a scan.
+- Fixed: a record's indent and length from a table or the clipboard were not
+  bounded (a huge indent hung the list; a huge length was read every refresh),
+  and removing results from an incomplete scan could terminate Cheat Engine.
+- Security: Lua's default-deny gate covered only `shellExecute` and
+  `write*Local`, while scripts still had `os.execute`, `io.popen`,
+  `package.loadlib`, the `debug` library and every file-writing binding.
+  Without `CECORE_LUA_ALLOW_UNSAFE=1` those are now gone or refuse (see
+  SECURITY.md). Opening a table also switched its saved active records on,
+  running their Auto Assembler scripts and `{$lua}` blocks before the Lua
+  prompt; records now load switched off, and the script editor's Check no
+  longer evaluates `{$lua}`.
+- Security: the `.deb` gives the binaries `cap_sys_ptrace`, which let any
+  local user who ran them read and write every user's processes, root's
+  included, and `cescan ceserver` accepted any local connection, handing that
+  access to other users. Processes of another user are now refused (unless
+  running as root), every ptrace seize and `/proc/<pid>/mem` open is checked,
+  and the server only serves programs of the user who started it.
+- Fixed: the GDB client rejected run-length counts `+` and `-`, which
+  `gdbserver` sends for runs of 14 and 16 more characters, and dropped the
+  connection; ceserver module sizes above 2 GiB became negative.
+- Fixed: speedhack clocks jumped when the speed changed while the game ran
+  (from 2x back to 1x the monotonic clock ran backwards), and
+  `gettimeofday` was scaled against the monotonic clock's origin, so at any
+  speed but 1x it returned a date years away. Each clock now keeps its own
+  base and continues smoothly from a speed change.
+- Fixed: pointer paths through a module whose name has a `+` or a space
+  (`libstdc++.so.6`, "Game Name.exe") were written unquoted and did not
+  resolve when added to the address list; the name is now quoted as Cheat
+  Engine does.
+- Fixed: a custom formula scan whose formula never ended hung the scan;
+  each evaluation now has an instruction limit, and formulas can no longer
+  load files or code (`dofile`, `loadfile`, `load`, `require`).
+- Fixed: re-saving a Cheat Engine table dropped its user-defined symbols,
+  embedded files and Cheat Engine-format structures; they are now kept as
+  they were. Hotkeys on the keypad, punctuation keys, the plus key and F13 to
+  F24 were dropped or turned into main-keyboard digits.
+- Fixed: cheat tables. A set-value hotkey's `<Value>` became the record's
+  value (and the trainer's freeze value); a disassembler comment became the
+  table comment; records without an `<ID>` could hang under the wrong group;
+  an offset that was not plain hex was dropped or cut short, following a
+  shorter pointer chain to another address (such a record now keeps no
+  address); `<Length>` and `<freezeMode>` were not checked; markup in an
+  address or color was written unescaped. Deeply nested groups are refused at
+  64 levels instead of recursing without bound, and children are parsed in
+  place instead of copying the rest of the file at every level.
+- Fixed: crafted symbol files could exhaust memory or time: an ELF whose
+  section headers all name the same symbol table read it once per header,
+  PE export names were located one byte at a time across up to 65,535
+  sections (now 96, the Windows limit), and a huge structure size from DWARF
+  or il2cpp overflowed the structure dissector's size.
+- Fixed: generated trainers froze pointer records at their base address,
+  writing into the pointer itself; they now leave out pointer and symbolic
+  records. A table with 44 or more cheats produced a trainer that did not
+  compile; default keys now stop at 9. A backslash in the game name or
+  author could swallow the next source line.
+- Fixed: integer search values were cut to the type's width, so Byte 300
+  found every 44 and 2 Bytes "bigger than 40000" compared against -25536. A
+  value that does not fit is now refused with the type's range.
+- Fixed: "Increased by" on Float missed ordinary steps on larger values
+  (100.0 to 100.1), a From address off the alignment grid shifted every
+  candidate in its region off the grid, pointer scans reported "truncated"
+  when the result count only reached the limit, and `cescan --previous` with
+  a wrong directory quietly scanned zero results instead of failing.
+- Fixed: listing a process's modules read every mapped file, devices
+  included; a game that maps GPU memory through `/dev/dri/renderD128` (Mesa
+  on AMD and Intel) made the read wait forever, hanging the attach. Devices,
+  memfd and SysV shared memory are no longer modules, only regular files are
+  opened, shared mappings count as Mapped rather than Image, and a library
+  replaced on disk keeps its name without " (deleted)". The JIT perf map in
+  `/tmp`, which anyone can create, is read without blocking on a FIFO and
+  with a size limit.
+- Fixed: Auto Assembler read `nop dword ptr [rax+rax]` (the padding GCC
+  emits, which injection templates relocate) as a NOP count and failed; a
+  `nop` with an operand (including a register, `nop eax`) now assembles as an
+  instruction.
+
+## v1.0.0: first stable release (2026-10-13)
+
+The first stable release: a polished, consistent GUI in both themes that follows
+the desktop (theme, fonts, GNOME text scaling), installs that run from any
+prefix, and broad live-verified target compatibility with explicit errors where
+a feature is unsupported. Details below.
+
+- GUI polish pass, driven by a screenshot review of every window, menu and
+  dialog in both themes. Settings is rebuilt as titled pages with sized fields,
+  and every option on it now does something (worker threads, float tolerance,
+  data breakpoint size and hotkey step were stored but never read; options
+  with no effect and placeholder pages are gone). The process picker is a
+  sortable table with full names (the kernel cuts them to 15 characters),
+  memory sizes and an "Only my processes" filter. Module, region, thread and
+  heap lists share one data-table style with readable sizes and a filter box;
+  empty tables say what to do next. Menus no longer show disabled "not yet
+  implemented" items, and the overlay is reachable from Tools. File > Save
+  writes back to the open table and the title names it. The Auto Assembler and
+  table Lua editors gain a line-number gutter, and `db` bytes are coloured
+  consistently. Data breakpoints take one dialog instead of three prompts.
+  Process Info, Speedhack, ceserver and Memory Allocations dialogs are
+  redesigned, and tables keep the chosen monospace font after reparenting.
+  The native GTK file chooser now shows `.CT` tables (its filters are
+  case-sensitive), Save As adds the chosen type's extension, and C++ symbols
+  with a version suffix (`QAction::staticMetaObject@Qt_6`) are demangled.
+  Before a Theme is chosen, the app follows the desktop's light/dark
+  preference from the portal, the same setting Qt's GNOME title bar uses.
+  Until a font is chosen in Settings, tables, code and hex views use the
+  desktop's monospace font (Adwaita Mono on GNOME) at the interface font's
+  size, instead of a fixed 10 pt "Monospace".
+  On GNOME Wayland the window now follows the desktop's text scaling
+  ("Large text", `text-scaling-factor`), which Qt ignores there, so it no
+  longer comes out smaller than every other app on a scaled desktop.
+
+- CI cross-builds the CLI for RISC-V64, s390x, PowerPC64LE and ARM32 and runs
+  it inside each full-system guest, so every target row now has live
+  frontend evidence.
+
+- Classify ARM64EC and ARM64X images by their load-config CHPE metadata instead
+  of taking ARM64EC programs for x86-64, and refuse their disassembly with the
+  reason. CI drives a real ARM64EC program under Wine on ARM64, and the CLI and
+  Lua frontends inside an x32 guest.
+
+- Stop a scan with the reason (and a `ptrace_scope` hint) when the target's
+  memory cannot be read, instead of reporting zero results (`cescan scan`,
+  `guest-scan`, GUI First Scan). Decode .NET ReadyToRun PE machines and keep PE
+  modules to their image extent, which fixes code caves and hooks in CoreCLR
+  JIT code that failed depending on address layout. CI now drives a real mGBA
+  running a generated ROM through every frontend.
+
+- Add a detailed compatibility progress checkpoint with completed work, remaining
+  requirements and final local verification. Preserve the newly reproduced
+  mixed-ABI timed-restart failure and diagnostic restoration prototypes; product
+  integration and recovery tests for that issue remain pending.
+
+- Protect the preceding x86 syscall instruction when Linux restarts an interrupted
+  read from a saved PC on the following page. Reject destructive operations before
+  mutation while permitting unused-page release after real syscall completion or
+  from ordinary user code. Require 50 live assertions each for x86-64, i386 and
+  x32, with host ASan/UBSan coverage and strict release gates.
+
+- Protect both pages of a saved x86 or Thumb instruction before unmapping,
+  removing execute permission or replacing memory with MAP_FIXED. Decode the
+  saved instruction only when its next page is affected; retain support for short
+  instructions beside unmapped pages. Require actual instruction execution and
+  restoration checks for x86-64, i386, x32, native ARMv7 and ARM64 compat, including
+  aborting sanitizer runs. The expanded ARM gate requires 345 assertions per variant.
+
+- Execute private ARM32/Thumb mmap2, mprotect and munmap on native ARMv7 and
+  ARM64 compat controllers. Restore and verify GP, VFP and code, clear live Thumb
+  conditional state only during private execution, preserve application signals
+  and retain completed values with failed recovery. Verify sparse-file offsets
+  above four GiB. Protect original return-code pages when using separate scratch,
+  and verify private instruction writes before execution on all supported ISAs.
+  The private-syscall checkpoint passed 301 real-kernel assertions per normal/UBSan variant. Full ARM32
+  allocation/call/session and parked-syscall adapters remain pending.
+
+- Capture ARM32 VFP state using the actual stopped-task register ABI on native
+  ARMv7 and ARM64 compat kernels. Verify and restore D0-D31/FPSCR and exposed
+  compat TLS, retain recovery after failures, and reject failed required VFP
+  capture. Preserve legacy FPA read-only: its write path panics the pinned native
+  hardened-usercopy kernel. Add native ARM64 extension regressions and required
+  normal/UBSan gate assertions. General ARM32 syscall/call injection is still pending.
+
+- Read and edit actual ARM32 general registers on native ARMv7 and ARM64 compat
+  kernels. Preserve syscall-restart state, reject oversized and misaligned edits,
+  verify the complete bank and roll back failed writes. Add ARM/Thumb software
+  traps with exact PC and instruction restoration, native register views and Lua
+  condition aliases. The context checkpoint passed 181 kernel checks per normal/UBSan run before release
+  packaging; full ARM32 sessions, injection and BE8 execution remain pending.
+
+- Resolve Auto Assembler module names from the current target snapshot. Retire
+  removed modules across target changes, exec, syntax-only checking and failed
+  capture; preserve explicitly registered symbols and their cleanup ownership
+  when their names match modules. Require live x86-64/i386 module lifecycle
+  evidence before native release packaging.
+
+- Clean standalone Auto Assembler editor injections before close, disconnect,
+  process replacement and destruction. Keep failed cleanup available for retry
+  and prevent repeated Execute from replacing its saved undo. Coordinate shared
+  GUI assembler operations across editors and records, and unwind overlapping
+  patches in reverse activation order. Keep CodeFinder dependencies alive through
+  window destruction. Extend required native/release GUI gates to editor ownership.
+
+- Retain GUI script undo across active imports and paste. Restore patches and
+  release allocations before deleting/editing scripts, replacing tables,
+  disconnecting/switching processes or closing the window. Preserve records and
+  the original target when cleanup fails. Handle Lua callbacks that grow or
+  replace the address list. Recognize bare hexadecimal assembly targets beginning
+  with A–F. Require real x86-64/i386 GUI injection lifecycle checks in native CI
+  and release validation.
+
+- Preserve complete integer JSON addresses, sizes and offsets, escaped Unicode,
+  control characters and group flags. Reject malformed record data before
+  replacing the table. Load one captured JSON payload through both GUI parsers,
+  retaining exact common values and GUI codecs. Normalize imported record IDs
+  and allocate unused IDs safely after `INT_MAX`. Require an independent decimal
+  round-trip gate. Fix the GUI test's focused-filename automation stall.
+
+- Report flushed/closed table write failures; stage GUI XML/JSON saves so a
+  failed write preserves the previous file. Preserve stable IDs, imported table
+  metadata and JSON forms; read GUI JSON records through the core and retain
+  GUI JSON codecs. Handle uppercase `.CT`, group ID zero, failed-load titles and
+  consent for table Lua in either JSON schema. Require filesystem-failure and
+  persistence checks in native, sanitizer and release testing.
+
+- Serve independent CEServer connections concurrently with isolated process and
+  debug ownership. Serialize complete start/stop transitions, wake debug waiters
+  during shutdown, reap finished workers without another connection, and recover
+  from descriptor pressure without dropping existing clients. Require simultaneous
+  real x86-64/i386 target and lifecycle/resource recovery checks.
+
+- Serialize complete CEServer transactions, revalidate persistent owners after
+  acquiring connection ownership, and cancel active socket I/O before reconnect.
+  Add configurable whole-message deadlines and an optional Lua connection timeout;
+  validate port/PID/timeout without truncation. Require independent delayed,
+  concurrent and reconnect peer checks alongside actual 32/64-bit TCP fixtures.
+
+- Retain CEServer process identities and TCP connection ownership; refresh target
+  architecture across exec, translate region flags, honor allocation protection,
+  implement region/protection queries and propagate server operation failures.
+  Retire malformed/disconnected streams, remove real remote breakpoints and detach
+  disconnected debug sessions. Require real 32/64-bit TCP recovery gates.
+
+- Support Mono runtimes embedded with private loader visibility. Borrow the
+  loaded provider during each request, clear retired API pointers, and reject
+  requests after real runtime cleanup or library unload. Reject invalidated
+  process handles before Mono request dispatch. Require real embedding and
+  cleanup profiles in native, sanitizer and release gates; preserve the original
+  application's native loop and normal exit.
+
+- Distinguish native Mono assemblies from Wine by checking the Unix loader,
+  rather than treating every `.exe` argument as Windows execution. Replace Mono
+  agent temporary-file requests with separate framed socket connections, fresh
+  metadata dumps, exact long names and namespace-aware paths. End and join each
+  runtime request thread before responding so Mono GC and application exit keep
+  working. Use Mono's allocator for runtime names. Add required real Mono
+  C++/CLI/Lua and sanitizer gates, including pinned object edits, late assembly
+  loading, concurrent lookups and actual garbage collection. Bound metadata
+  buffers during generation and verify overflow/recovery with a small test cap.
+  Install and bundle the agent library, discover it beside the loaded engine
+  in custom layouts, and verify a staged CLI launch. AppImage builds default to
+  one compiler job, configurable with `CECORE_BUILD_JOBS`.
+
+- Enable Linux x32 native library/pthread calls with an ABI-specific worker,
+  four-byte control pointers and 64-bit stack/syscall layouts. Preserve 64-bit
+  integer call arguments and mmap file offsets instead of rejecting them because
+  pointers are four bytes. Add real x32 guest fixtures and a required release
+  gate using a prebuilt kernel, 128 MiB and sequential single-job builds.
+  Synchronize call fixtures after their output syscall before borrowing user
+  contexts.
+
+- Require 551 real x32 debugger/session, stepping, tracing, hardware/software
+  watchpoint and recovery checks under KVM and software emulation. Use genuine
+  x32 fixture syscall numbers and choose the instruction set independently of
+  pointer width. Verify older-kernel syscall dispatch allow/deny restoration
+  separately from configuration introspection. Let sibling-progress assertions
+  wait for a real counter change. The debugger race guest uses two CPUs; other
+  x32 guests keep one.
+
+- Keep independently released pthread leases while their cleanup owns a native
+  stop, recovery ticket, private frame or affinity cleanup. Share maintenance
+  across process/global recovery, report pending ownership after release, retain
+  failed-detach retries and preserve exec cancellation. Verify real target-side
+  detach, interrupted cleanup returns and replacement liveness in required gates.
+
+- Retire wrapped-worker startup when its pthread-handle cleanup callee executes
+  exec, including kernel TID replacement. Share bounded signal forwarding across
+  primary and cleanup calls. Let explicit resume reach retained function stops
+  in abandoned pthread leases. Extend required leader/nonleader regressions to
+  exec, retry failures and real signal-interrupted returning detachers.
+
+- Recover native callees that exec from a nonleader pthread. Follow the actual
+  group EXEC stop through Linux TID replacement, retain failed event-message
+  inspection for retry and pass the replacement task's TID and birth to borrowed
+  owners. Adopt that stop before native call cleanup detaches it. Extend required
+  callee-exec gates across leader/nonleader signal, detach and inspection recovery.
+
+- Retire native calls when their callee actually executes exec. Propagate the
+  kernel EXEC event and remember permanent image retirement independently of
+  completed recovery. Immediate calls, explicit signal resume, automatic signal
+  forwarding and failed detach stop replaying cleanup into a replacement whose
+  original mm remains alive through CLONE_VM. Expose retirement to borrowed
+  recovery callers and reject later image checks or function resume. Add required
+  native, sanitizer and ARM64 kernel callee-exec regressions.
+- Keep the original memory descriptor for retained native calls. Verify its
+  address-space affinity before worker-frame cleanup or abandoned pthread-handle
+  detachment; retire stale records after same-file exec even when a CLONE_VM
+  peer keeps old memory alive and replacement storage has identical bytes.
+  Repeat the check after failed proof recovery. Add required native and ARM64
+  kernel regression cases with real pthreads, cleanup failures and target
+  liveness checks. Avoid repeatedly writing control fields while a worker exits.
+- Drain owned hardware-watchpoint signals queued behind CodeFinder interrupt
+  stops before restoring debug registers and detaching. Prevent a residual
+  SIGTRAP from reaching the application; preserve genuine application signals
+  and stopped state. Require real-kernel queued-trap regression checks.
+- Verify saved-image syscall and native-call affinity under the selected thread's
+  ptrace stop using a fresh private mapping. Reject same-file replacements even
+  when CLONE_VM keeps the original image alive and replacement bytes match.
+  Reclaim proof storage before caller mutation; retain incomplete nested recovery
+  without reporting private probe allocations as caller completion. Add required
+  shared-memory regression gates for host, sanitizer and ARM64 kernel builds.
+  Verify 42 affinity checks per host/sanitizer/kernel profile, including distinct
+  private mappings with identical bytes, real nested signals, seccomp denial and
+  unreaped target exit. Retain the original intermittent GUI teardown failure
+  in the evidence; follow-up CodeFinder checks reproduce and fix a matching
+  queued hardware-trap cleanup failure.
+- Bind saved native Auto Assembler and simple-hook byte undo to the original
+  address space. Ordinary same-file exec discards retired undo without patching,
+  protecting or freeing replacement mappings. Share completion and allocation
+  release state across copies and scripts; prevent repeated cleanup, stale cave
+  restoration after DEALLOC and removal of newly owned symbols. Reject conflicting
+  instruction changes before undo while allowing mutable typed storage. Preserve
+  native simple-hook RX permissions and roll back adapter exceptions.
+- Resolve symbols registered by earlier scripts instead of shadowing them with
+  automatically declared labels. Carry script ownership into native loader and
+  pthread calls, rejecting retired requests before target execution.
+- Add a native executable-memory write adapter that pins the original address
+  space, verifies complete transfers and retains original bytes for failed
+  restoration. Writes preserve RX page permissions and do not borrow target
+  registers. Native ARM64 writes use kernel instruction-cache maintenance;
+  same-file exec recovery retires the old image without replaying its bytes.
+- Share architecture-specific NOP/undo and verified instruction edits across
+  Auto Assembler, Memory Viewer and Lua. ARM64 uses aligned four-byte NOPs;
+  unsupported code adapters fail explicitly. Fix the Auto Assembler NOP directive
+  emitting x86 bytes for ARM64; count and size whole target instructions, and
+  reject malformed counts/alignment before mutation. Route LOADBINARY through
+  the same code-aware patch path. Display backend failure and recovery
+  details in the GUI. Reject reentrant native mutators during thread inspection.
+- Require live code/recovery checks on the host (40 backend plus five CLI/Lua
+  checks) and both pinned ARM64 kernels (27 each), including short, dropped,
+  post-mutation and blocked-restoration writes. Native hook coordination, hardware
+  cache validation and other ISA adapters remain pending.
+
+- Add a shared byte-level ARM64 relocator for ADR/ADRP, literal loads and
+  branches/calls. Preserve live literal addresses, remap internal branches and
+  require explicit scratch-register and indirect-landing permissions for far
+  veneers. Auto Assembler REASSEMBLE uses exact expanded sizes and reports
+  source failures with rollback. Reject output-size changes after label sizing
+  on ARM64 and x86 before they corrupt following labels. Require 1,119 actual GNU-assembled code
+  executions per 4 KiB/64 KiB Linux profile before release packaging. Native
+  ARM64 hook coordination, hardware caches and other ISA adapters remain
+  pending.
+- Support GDB stubs that provide only whole-register packets through the shared
+  GUI/CLI/Lua client. Resolve sparse XML fields in numeric register order and
+  reread the bank before edits to preserve fresh unrelated values. Reject unsafe
+  writes involving unavailable neighbors or oversized packets; retain unavailable
+  trailing registers and ordinary packet errors instead of inventing values.
+- Add GUI scan data-order and pointer-size overrides for encoded data on native
+  and remote targets. Preserve captured formats when adding scan results to the
+  address list, including pointer-width-aware edits/freezing and XML/JSON/protected
+  table persistence. Add per-record Auto/Little/Big and pointer-size choices;
+  reject malformed format metadata and keep scan-only result types as raw bytes.
+  Shared typed I/O accepts explicit pointer widths independently of the CPU ABI.
+- Report scanner worker exceptions to the caller after joining every worker.
+  Fix first scans silently returning partial success and parallel next scans
+  terminating the application on allocation/backend exceptions. Keep previous
+  results available for retry, remove failed scans' partial files and avoid an
+  extra descriptor leak if result finalization cannot allocate its frame buffer.
+- Preserve the original floating search value in rounded, truncated, tolerance
+  and relational comparisons, including All/grouped scans and SIMD filtering.
+  Share strict floating parsing and exponent-aware precision across GUI, CLI
+  and Lua; reject malformed values, missing bounds and invalid rounding options.
+  Expose Lua rounding/tolerance options and upper bounds for ordinary numeric
+  Between scans. Remove the GUI tolerance's fixed magnitude/decimal limits,
+  explain rounding controls and refresh the status after successful scans.
+- Preserve matching numeric types in All scans through narrowing, reloads and
+  pruning. Compare floating candidates numerically, retain readable narrow fields
+  when wider reads fail, and allow selection of a surviving concrete type.
+  Fix GUI All-result record strides and exclude padding from GUI/CLI/Lua display.
+  Expose surviving candidate types and selected-value decoding in Lua.
+  Enable concrete numeric selection in the GUI and apply floating upper bounds,
+  rounding and tolerance controls to All scans.
+- Share strict All-number parsing across GUI, CLI and Lua. Preserve fractional
+  integer boundaries and exact 64-bit/scientific values; reject malformed tokens
+  without replacing results. Support decimal-comma and hexadecimal values,
+  exponent-aware GUI rounding and explicit Lua Between upper bounds. Compare
+  floating All bounds without narrowing them to the candidate width. Match
+  actual infinity while rejecting finite values that overflow the float width.
+  Keep percentage thresholds independent of ordinary All bounds and reject
+  malformed CLI percentage flags.
+- Remove the scanner's 47-bit address ceiling across GUI, CLI and Lua. Handle
+  inclusive ranges through the final representable byte without wraparound,
+  apply narrower ranges to next scans before memory reads, and reject reversed
+  ranges and overflowing memory maps.
+- Size hardware tracing rings with the actual kernel page size and metadata.
+  Preserve wrapped branch/AUX records and counters, validate record byte bounds,
+  remove the fixed 256-entry branch limit, release AUX notifications and serialize
+  tracer lifecycle calls. Reject thread ID zero and invalid Lua durations;
+  show the actual perf start failure rather than a guessed permission rule.
+- Require separate ARM64 full-system kernel checks for 4 KiB and 64 KiB pages,
+  sharing cached cross-builds and running guests sequentially. Verify actual page
+  sizes and explicitly record absent SME support on the additional kernel;
+  retain all positive SME/deferred-state requirements on the original kernel.
+- Exercise SVE deferred vector lengths, native calls, seccomp and alternate-stack
+  safety independently of SME support. A kernel lacking SME retains required SVE
+  checks and cannot silently skip them because a combined fixture needs SME.
+- Add a shared GDB process adapter and `cescan gdb` memory, register, disassembly
+  and byte-scan commands using the stub's XML CPU/register description. Preserve
+  guest byte order and pointer width without fabricating host PIDs or ABIs.
+  Bound socket/XML transfers, handle packet retransmissions and escaped data,
+  accept valid hexadecimal replies beginning with E, and reject oversized reads.
+  Preserve confirmed partial writes and close failed setup without resuming the
+  guest. Require a small real ARM64 QEMU CPU/RAM fixture before release packaging;
+  guest process/MMU integration remains pending.
+- Add a cancellable GUI GDB connection dialog and Lua endpoint/register APIs.
+  The ordinary Memory Viewer, byte scanner and shared Lua console operate on
+  the guest; the register editor uses XML names and complete scalar/vector widths.
+  Reject invalid edit sets before their first write and preserve unedited live
+  registers. Failed connections preserve the old target; disconnect freezes
+  old views and rejects stale accesses. Gate the actual GUI and CLI Lua flows
+  against independent stubs and real ARM64 QEMU RAM/registers, with exact
+  restoration and saved screenshots.
+- Read GUI pointers using the program's width and byte order, including narrow
+  pointers on ARM64 and valid zero addresses. Clear loaded symbol caches when
+  changing targets. Preserve ARM and Thumb instruction boundaries after invalid
+  encodings instead of decoding from the middle of an instruction word. Reject
+  numeric scans with unknown byte order instead of silently guessing;
+  raw byte scans remain available.
+- Scan integers, floats, Unicode and grouped values in the selected data byte
+  order, and use the program's four- or eight-byte pointer width. Retain raw
+  samples and persist their format through saved results, pruning and subsequent
+  scans; GUI and CLI displays decode that format. Include complete matches at
+  the To address and avoid signed overflow in integer delta comparisons.
+  Add native CLI range/format options and typed GDB scans, including subnormal
+  doubles. Lua scans accept explicit format options and expose original/current
+  captured values with `getValue`. Validate malformed values and preserve prior
+  results on failure; custom pointer formulas follow the chosen width. Show the
+  guest data format beside its CPU architecture in the GUI target label.
+- Guard host-only pause, process-directory and branch-sampling operations using
+  the target's transport and liveness. Remote identifiers, including a real
+  host-PID collision, cannot select host signals, `/proc` paths or perf sampling.
+  Disable the GUI Branch Mapper for remote targets with a clear explanation.
+- Recover a nonleader exec whose renamed process-TID notification was consumed
+  by another parent thread. Verify the kernel's EXEC siginfo and recorded former
+  TID before adopting the replacement image. Cover running and all-stop stepping,
+  retire old-image breakpoint records without code writes, and clear stale
+  register snapshots if replacement-context capture fails. Publish image retirement
+  with an explicitly unavailable context, then permit rereading the real bank on
+  the existing owner.
+- Handle irreversible thread exits during debugger stepping without waiting for
+  a leader's deferred final notification. Select a real surviving register bank,
+  publish final-process exit, and retain failed EXIT-stop detach for retry.
+  Drain sibling exit events during a nonleader exec and adopt the renamed task
+  without replaying old-image traps. Recognize native syscall-return step traps
+  in debugging and tracing while preserving genuine program breakpoint signals.
+  Exclude irreversibly exiting tasks from memory and frontend thread selection.
+  Recover an owned EXIT stop even when a launcher thread consumes its wait
+  notification, preventing debugger destruction from hanging.
+- Recover real signal, CLONE, EXEC and EXIT stops when a launcher thread consumes
+  their wait notifications. Retire running workers and final-process exits
+  automatically, retain failed detach on its actual owner for retry, and observe
+  target death while the debugger is paused. Probe one owned task per idle poll;
+  verify original signal delivery, replacement-image liveness and disabled GUI
+  register edits after actual process death.
+- Start the full debugger on a surviving stopped thread after the process leader
+  exits, while retaining the original process PID. Native single-thread hardware
+  monitoring also selects a live member; Wine retains its main-thread policy.
+  Verify real breakpoint stepping, instruction tracing and watchpoint cleanup,
+  plus frontend workflows against a pthread target with an exited leader.
+- Keep local memory reads, batched scanning, writes, mapping queries, module and
+  symbol loading, selected-thread inspection and native memory/call operations
+  usable after the main thread exits while siblings remain alive. Select a live
+  member while retaining the original process PID and birth for ownership.
+  Exclude exited tasks from thread selectors and verify actual glibc
+  `pthread_exit`, loader constructors and pthread execution in live fixtures.
+- Retain native cleanup ownership when executable metadata becomes temporarily
+  unavailable. Verify task lifetime independently, bind cleanup to the task
+  actually seized, and preserve completed-but-unreturned allocations for retry.
+  Query the shared owner before locking handle metadata to prevent concurrent
+  frontend inspection from deadlocking.
+- Read standalone register and stack windows through one selected-thread native
+  inspection stop. Support actual i386/x86-64/ARM64 register banks, base SIMD and
+  target-width stack words. Apply only changed registers to a fresh kernel
+  context, preserve unedited PC/SP, and retain failed cleanup on its owner across
+  frontend destruction. Refresh thread lists and snapshots on selection changes;
+  reject invalid edits and disable Apply when a snapshot is unavailable.
+  Verify this inspection path with real Wine PE32/PE32+ CPU loops as well.
+- Keep Wine test prefixes with the build instead of using RAM-backed `/tmp` by
+  default; provide `--work-dir` for an alternate scratch directory.
+
+- Display and edit the stopped thread's actual i386, x86-64 or ARM64 registers
+  in the interactive debugger. Show ARM64 PC/SP, X0-X30, NZCV, V0-V31 and FP
+  controls, refresh navigation after edits, and preserve complete BRK bytes in
+  instruction display and detach. Use native decoder defaults and code-address
+  ISA for disassembly export. Real Qt debugger, application startup, CLI and Lua
+  paths now pass under an ARM64 kernel; native ARM64 frontend checks gate releases.
+- Load verified separate debug symbols for ELF32 as well as ELF64. Validate
+  complete-file GNU debuglink checksums, matching build IDs and ELF architecture,
+  reject malformed links, and search container debug directories through the
+  target root, including when the module inode is shared with the host. A wrong
+  adjacent sidecar no longer hides a valid `.debug` copy.
+- Synchronize the timed-wait injection fixture after symbol loading, so slow
+  initialization cannot consume the interval being tested under emulation.
+  Allow time for rejected calls and final inspection before the fixture exits,
+  while keeping its real relative wait and completion deadline bounded.
+- Resolve mapped module files through the target's filesystem view when a host
+  pathname refers to a different inode. Preserve unknown metadata when target
+  backing files are unavailable, and make resolved target-root paths reusable.
+  Real host-to-container checks verify a 32-bit library shadowed by a 64-bit host
+  library, execution through its correct symbols, and deletion while mapped.
+- Track injected native pthreads by actual Linux thread exit using x86-64,
+  i386 and ARM64 entry wrappers. Retain worker storage across timeouts and
+  frontend destruction, handle self-detachment and `pthread_exit`, and cancel
+  abandoned late-created workers before entering user code. Auto-assembler
+  rollback and disable preserve allocations, original bytes and protection
+  records while a worker remains alive, allowing cleanup to be retried safely.
+- Add a shared native debug backend with explicit x86/i386 and ARM64 register
+  banks, SIMD reads, hardware/software breakpoint primitives and verified
+  recovery, exercised under real native and ARM64 full-system guest kernels.
+  Port the actual session event loop, stepping, software traps and data watchpoints
+  to these backends, including early child stops, ARM64 pre-access watchpoint
+  continuation, exec transitions and genuine signal delivery. Additional ARM64
+  panels, extended-vector UI and general unwinding remain incomplete.
+- Port instruction tracing to the shared native execution-breakpoint and register
+  backends, with target-ISA decoding and native call step-over. Verify clone,
+  exec, cancellation, genuine signals, overlapping requests, failed cleanup and
+  exit during recovery on native x86/i386 and a real ARM64 kernel. Require trace
+  success in architecture gates. Trace views and exports show native registers
+  and operation errors, and reject invalid addresses/ranges before attachment.
+- Port CodeFinder hardware and software monitoring to the shared native backend.
+  Preserve independently occupied slots, job-control stops and genuine signals;
+  retain failed restoration on its owner through cleanup. Software guards restore
+  permissions and release scratch mappings while the target remains stopped.
+  Verify actual stores, cloned writers, exec, interrupted syscalls and recovery on
+  native x86/i386 and ARM64. Require these checks in architecture gates. Native
+  register views and exports show operation/recovery errors.
+- Restore partially applied x86 kernel register writes on rejection, retain failed
+  session cleanup through caller destruction, and report/retry cleanup in GUI/Lua.
+  Retire old-image breakpoint lists on exec and reject stale Lua event register edits.
+- Fix native debugger software breakpoints at the final byte of a mapped page
+  by reading and patching the aligned containing word.
+- Decode stack frame records with target byte order and instruction-register
+  width, including ARM64 frame chains and x32 saved-register slots.
+- Require native-debug success markers in architecture release gates and retain
+  local CI suite output so failing checks include diagnostic evidence.
+- Distinguish the Unix loader and program ISA, pointer width, ABI, instruction
+  mode, and byte order, including real WoW64 and native exec transitions.
+- Use target formats for typed memory, pointer scans, Lua scalar operations, and
+  module-specific assembly/disassembly. Unknown formats produce explicit errors.
+- Preserve numeric x64 memory destinations in labeled assembly blocks. The CLI
+  assembler accepts an execution origin.
+- Verify auto-assembler restoration, retain failed cleanup state, restore
+  FULLACCESS permissions, and retry already-restored read-only pages safely.
+- Arm watchpoints before startup reports success and enforce Wine main-thread
+  monitoring in the backend. Reject unsafe native loader/thread helpers on Wine
+  until their dedicated backend is implemented.
+- Add native 32/64-bit and real Windows PE32/PE32+ operation fixtures, isolated Wine
+  tests, and required legacy Wine32/WoW64 release gates with JSON evidence.
+- Integrate an architecture-specific memory-syscall owner service into the native
+  process API, shared by GUI/CLI/Lua callers. Retain recovery across handle
+  destruction, clean completed-but-unreturned allocations, and drain pending
+  restoration before owner-thread shutdown. Preserve kernel errno, use the actual
+  page size, and reject overflowing requests and stale same-file exec cleanup.
+- Execute transient memory syscalls through existing non-writable Unix ELF
+  instructions, preserving shared program code while sibling threads run.
+  Exclude Wine's Windows syscall sites. Restore previously configured disabled
+  ARM64 watchpoint attributes, and consume queued step traps after a denied
+  synthetic syscall so the original target continues under its unchanged policy.
+  Verify concurrency and real seccomp trap denial in required architecture gates.
+- Migrate native library/pthread injection to a shared call owner on x86-64,
+  i386 and ARM64. Retain private frames and interrupted calls through frontend
+  destruction; clean orphan pthread handles. Verify real libc constructors,
+  symlink/cached library loading, joins, timeout detachment and application
+  liveness in required gates. Reject non-executable entries, embedded NUL paths
+  and overflowing Lua timeouts; report timeout without claiming thread completion.
+  The complete ARM64 core/Qt GUI cross-build now succeeds. Parked-thread adapters,
+  full ARM64 frontend/runtime validation and broader libc variants remain pending.
+- Support memory syscalls while real WoW64 targets execute busy Windows i386
+  code under a 64-bit Unix loader. Restore Windows registers and execution mode,
+  keep default allocations within the program pointer range, and retain the wider
+  range for allocations near a 64-bit loader module. Search the full 32-bit address
+  space when the kernel's preferred low-address window is exhausted; verify this
+  without allocating physical pages. Reject overflowing rounded
+  sizes before mutation. Require busy PE32/PE32+ operation markers in Wine gates.
+- Select native syscall-user-dispatch sites using the kernel's exact range and
+  selector state without changing either. Verify real exclusive dispatch on x86-64
+  and i386, unchanged configuration, blocked/invalid selectors, actual memory
+  operations, CPU progress and safe rejection when no native site exists.
+- Default local CI builds to one compiler job; CECORE_CI_JOBS can explicitly
+  enable parallel builds on machines with sufficient resources.
+- Reserve syscall recovery ownership before ptrace attachment. Retain failed
+  preflight detach and interrupt cleanup without replaying unfinished registers,
+  translate allocation failures safely, and preserve ownership through caller
+  destruction and target exit. Track initialization writes before attempting
+  them so errors after mutation still restore code, registers and syscall state.
+  Require live preflight recovery checks in native and ARM64 release gates.
+- Print CLI watchpoint hit counts at their full 64-bit width, avoiding truncation
+  or negative counts during long-running monitoring.
+- Preserve kernel-exposed extended register images during native memory syscalls.
+  Restore live ARM64 SVE/streaming SVE and ZA state, retain failed restoration
+  and its unreturned allocation, and verify exact register bytes and target
+  liveness in the required VM gate at default and maximum vector lengths.
+  Preserve deferred SVE/SME exec-time vector lengths with a guarded signal-return
+  backend, verified through real exec transitions in transient, private and
+  quiesced memory operations. Back up and verify borrowed stack bytes, retain
+  failed frame restoration for retry, and preserve signal masks and configured
+  alternate stacks. Reject live-vector operations under seccomp, active GCS or
+  nonstandard stacks before mutation; ARM64 memory capabilities remain partial.
+- Verify the real process API and executor on native
+  x86-64/i386 and an ARM64 full-system Linux guest, including real restoration
+  failures, recovery ownership, allocation cleanup, exit and signal delivery.
+  Require its ARM64 VM gate before release packaging and publish binary/kernel
+  hashes with operation evidence. Whole foreign-host builds and debugger/call
+  architecture backends remain in progress.
+
+This work remains in progress. See [the compatibility record](docs/COMPATIBILITY.md)
+for verified environments and incomplete backends; this is not a universal
+compatibility claim.
+
+## v0.9.5: deeper correctness fixes, site-specific injection, and GUI improvements (2026-10-03)
+
+This release combines deeper audits of the shared backend with usability improvements
+across the GUI, CLI, and Lua. It includes repeatable GUI screenshots and additional
+regression suites.
+
+- **Site-specific auto-assembler templates.** Code, AOB, full-code, and pointer
+  templates use the selected injection address and instruction range. Scripts keep
+  whole instructions, assert and restore the exact original bytes, use an explicit
+  five-byte near jump, and carry module-relative addresses or a unique AOB signature.
+  Relative branches and RIP-relative operands are preserved when moved to the cave.
+  Ambiguous AOB signatures and out-of-range relative jumps produce errors.
+- **Shared typed memory operations.** Integer overflow, malformed byte arrays, short
+  transfers, pointer width, byte order, string encoding, and floating-point round
+  trips are handled consistently. Lua gains `readValue` and `writeValue`; the CLI
+  accepts unique process names, address expressions, typed reads/writes/freezes,
+  verification, and auto-assembler scripts with timed cleanup.
+- **Scan results and editing.** The GUI loads additional results while scrolling and
+  exports every stored match to CSV with correct quoting and cancellation behavior.
+  String edits preserve their new byte lengths, shorter strings are terminated
+  within their previous length, and clearing a string writes a zero terminator.
+- **Scanner and persistence correctness.** Additional fixes cover Unicode and
+  case-insensitive matching, grouped and next scans, snapshot validation, disk-backed
+  results, pointer scanning, and interrupted or failed output writes.
+- **Debugger and hook correctness.** More reliable breakpoint failure handling,
+  stepping and tracing cleanup, stack bounds, hook relocation, and process/watchpoint
+  lifetimes. Changing targets closes dependent windows and releases their resources.
+- **Parser and Lua safety.** Additional bounds and consistency checks in ELF, PE,
+  IL2CPP, expressions, and auto-assembler preprocessing. Lua stream, snapshot, bitmap,
+  widget, and memory-record lifetimes are checked, including repeated cleanup.
+- **GUI layouts and readability.** Better column sizing, readable empty states,
+  compact-window scrolling, text-only scan options, and full-value tooltips. Hex
+  bytes align correctly after the midpoint gap; hex and disassembly panes scroll
+  horizontally. Function labels no longer replace the first instruction.
+- **Live themes and settings.** Custom views, assembler highlighting, console history,
+  and form canvases follow live theme changes. Font settings update existing result
+  and address tables. Cancel discards pending settings, and untouched disassembler
+  colors keep following the theme. Dark checkboxes, disabled controls, and toolbar
+  overflow buttons are easier to see.
+- **Dialogs and auxiliary views.** Process filtering clears hidden selections,
+  disables Open when no matches remain, and preserves selection on Refresh. Pointer
+  scanning and graphical memory views give address fields more room. The debugger
+  shows its active thread; register columns remain accessible. Large form canvases
+  scroll without enlarging the window, generated Lua follows form-size changes, and
+  Delete respects text editing. Invalid fill bytes are rejected before writing.
+- **Release validation.** Core and deep regressions, ASan/UBSan without Qt, 11 GUI
+  checks, CLI workflows, and a repeatable visual review covering 98 updated captures.
+  Release packaging runs the expanded regression checks before uploading assets.
+
+---
+
+## v0.9.0: correctness, safety, and portability fixes (2026-09-29)
+
+A full-tree audit fix release, with new regression tests. No new features; it makes
+existing behaviour correct and safe.
+
+- **Cheat tables: a table-level `<LuaScript>` is no longer shadowed by a record's script.**
+  With a nested group the loader matched the first `</CheatEntries>` (a child's), so a
+  later sibling record's `<LuaScript>` was read as the table script. It now uses the
+  matching close.
+- **`.CETRAINER` / JSON round-trip keeps pointer chains and element lengths.**
+  `saveJson`/`loadJson` dropped `addressString`, `<Offsets>`, `<Length>`, and `<Options>`,
+  so a protected table reloaded as a flat record at 0. These now round-trip.
+- **"All types" scans no longer emit duplicate rows.** A value matching several widths
+  (a 4-byte `42` also matches as int8/int16) produced one row per width; now one per
+  address.
+- **Compact AOB patterns parse correctly.** `488B05` was accepted as one all-hex token and
+  truncated to a single byte (`05`); it now splits into bytes (odd-length/non-hex rejected).
+- **Snapshots larger than 256 MB reload.** Save wrote a uint32 size but load rejected
+  anything over 256 MB; load now bounds by the real remaining file size.
+- **Memory safety.** Fixed a heap out-of-bounds read in the IL2CPP PE parser, a metadata
+  type-count stride overflow, a hotkey error-message use-after-free, a Lua-console output
+  callback use-after-free, and several dangling-handle GUI paths (process replacement /
+  target exit / remote connect).
+- **Debugger.** `PTRACE_SEIZE`+`INTERRUPT` instead of `PTRACE_ATTACH` on arbitrary threads
+  (Wine/Proton safety); newly cloned threads get the start breakpoint; a user breakpoint
+  hit during step-over/out/run-to-cursor is surfaced instead of mistaken for step
+  completion; hardware-breakpoint arm failures are propagated; a partially seized thread is
+  no longer left frozen.
+- **Platform.** `ProcessWatcher` no longer aborts on destruction; `ceserver` `stop()` no
+  longer hangs with a connected client and rejects negative/oversized transfers.
+- **Lua.** `tostring(MemoryRecord)` no longer raises; `createFileStream(path,"w")`
+  truncates/creates; numeric `findMonoFunction` params parse; `readString` and the IL2CPP
+  metadata file reads are bounded.
+- **DWARF.** Pointer width comes from the CU address size, correct for 32-bit modules.
+- **GUI.** Hex value edits (and freeze) no longer write the wrong number; the Debugger and
+  viewers are torn down before the process handle is replaced or freed; "New window"
+  viewers are tracked; `.CT` `<Length>` is preserved on load; the Settings default value
+  type maps to the right scanner type; Save Memory Region is capped.
+- **Build.** The fetched Keystone is patched to drop its `CMP0051 OLD` policy (rejected by
+  CMake ≥ 4.0) and add the `<cstdint>` include newer GCC needs.
+
+---
+
+## v0.8.0: CE parity sweep, global symbols, code pages, Lua breadth (2026-07-20)
+
+Also carries the v0.7.0 work, which was written up below but never tagged or published.
+
+- **Fixed: heap use-after-free generating an AOB injection.** `generateInjectionScript` kept a
+  pointer into the temporary `proc.modules()` vector past the loop. Caught by the ASan CI job.
+- **String scan results decode from the scan's code page.** A CP1252 hit like "café" rendered as
+  mojibake; the match was always correct, only the display was wrong. New `ce::decodeStringBytes`.
+- **User-defined labels are global (CE parity).** A label set in the Memory Viewer now resolves
+  everywhere: as a record address, in Lua, and in every open view (previously siloed per view).
+- **Cheat table: "Add to new group".** Wraps the selected records under a new group header.
+- **Fixed: deleting a group header now removes its whole subtree**, instead of orphaning the
+  children at an indent with no parent.
+- **Cheat table: "Convert to module+offset".** Rewrites a raw scanned address as `module+0x…` so a
+  saved table survives PIE/ASLR rebasing on the next launch.
+- **Scan results: "Remove selected addresses from the list" (CE parity).** Prunes the result set
+  properly (a rebuilt result), so a later Next Scan stays consistent. Undo restores them.
+- **Dissect Data: set a field's type from the context menu.** You could name a field but never type
+  one, which left save/load and the value column half-usable for a hand-built struct.
+- **Memory Viewer: "Add this address to the list" from the disassembler**, matching the hex pane.
+- **Lua: `disassembleBytes(bytes[, address])`.** Decode raw bytes with no process attached.
+- **Lua: `AOBScanUnique` / `AOBScanModuleUnique`.** Return a single address instead of a result list.
+- **Lua: `convertToUTF8` / `convertFromUTF8` / `ansiToUTF8`.** Code page conversion (iconv-backed)
+  for reading strings out of Windows games under Proton.
+- **Lua: `extractFileNameWithoutExt` + `getFileList`.** Basename minus extension, and a read-only
+  directory listing with a glob mask.
+- **Lua: `addMainMenuItem(caption, onclick)` for extensions.** A script (typically an autorun
+  one) can add a tool to a "Scripts" menu on the main window that runs its Lua callback when
+  clicked, so extensions can surface themselves in the UI, the natural companion to autorun.
+- **Autorun Lua scripts on startup (CE parity).** Every `.lua` in the user's
+  `<config>/cecore/Cheat Engine/autorun/` directory now runs once at startup in the shared Lua
+  engine (like CE's `autorun/` folder), so extensions can add functions, hotkeys, timers, or menu
+  items without touching the app. Opt-in (the folder is only scanned if it exists), run in the
+  same sandbox as any script (`shellExecute` / file-write functions stay gated), and a failing
+  script is reported without blocking the others.
+- **Lua Console: Up/Down command history.** The interactive console now recalls previously run
+  commands with the arrow keys (newest-first on Up, forward to an empty new line on Down), like
+  CE's console and any REPL. Immediate repeats aren't stored twice.
+- **Lua: `md5memory(address, size)` (.CT compat).** Returns the MD5 hex of a block of target
+  memory (matching `stringToMD5String` of the same bytes), for the tamper/change-detection
+  checksums CE trainer scripts use. Reuses our RFC-1321 MD5; no new capability.
+- **Lua: `getPointerSize()` + `getMemoryRegionInfo(address)` (.CT compat).** Pointer width (8/4)
+  for cross-32/64 scripts, and a region-info table with CE's Windows-style field names/values
+  (BaseAddress, RegionSize, Protect, State, Type, ...) mapped from Linux r/w/x + region type, so
+  scripts that compare against PAGE_*/MEM_* constants work.
+- **Lua: `enumModules()` (.CT compat).** Returns a table of `{Name, Address, Size}` for every
+  loaded module using CE's exact field names, so scripts that iterate modules work verbatim
+  (companion to our existing lowercase `getModuleList`).
+- **Lua: `getUniqueAOB(address)` (.CT compat).** Returns a byte pattern that uniquely identifies
+  a code address within its module (extended until unique) plus the offset to the address (0),
+  or nil for a non-module address. Backed by the same `uniqueAobSignature` the AOB-injection
+  generator uses, so injection scripts can build a stable signature for a hook site.
+- **Lua: more CE helpers `wideStringToByteTable` / `byteTableToWideString` / `signExtend` /
+  `getCPUCount` (.CT compat).** UTF-16LE widestring byte-table conversions (surrogate-pair
+  correct, with the `tableindex` start argument), CE's `signExtend(value, msb)`, and
+  `getCPUCount()`, all matching CE 7.7 semantics.
+- **Lua: CE string extensions `startsWith` / `endsWith` / `split` + `printf` (.CT compat).** Added
+  the CE Lua string helpers many trainer scripts use: `s:startsWith(p)`, `s:endsWith(p)`, and
+  `s:split(sep)` (separator is a character set; empty segments are skipped) as methods on the
+  string type, plus the global `printf(...)` (= `print(string.format(...))`). Improves
+  out-of-the-box compatibility for imported `.CT` tables that call these.
+- **Fixed: cheat-table hotkeys fired on the wrong entry after a reorder.** The toggle / set-value
+  / increase / decrease hotkeys captured an entry's row index, but Move Up/Down (and drag-drop)
+  swaps rows without rebuilding hotkeys, so pressing a hotkey after reordering acted on whatever
+  entry now sat at the old row. They now capture the entry's stable id and resolve the current row
+  each time the key is pressed, matching how the Lua memory-record API already survives reorders.
+- **Fixed: a comma-locale value-hotkey step was silently dropped.** The increase/decrease value
+  hotkey parsed its step with C-locale `toDouble`, so a user in a comma-decimal locale (e.g.
+  tr_TR) whose step was "0,5" got it ignored and fell back to 1. It now accepts a comma separator
+  like every other value field.
+- **Find what writes: the watchpoint size matches the record's type.** Running find-what-writes
+  on a cheat-table entry now sizes the hardware watchpoint to that entry's value type (Byte -> 1
+  byte, 2 Bytes -> 2, Qword/Double -> 8) instead of always 4, so a write to an adjacent byte no
+  longer shows up as a false hit (and an 8-byte value's writes aren't missed). String / Array-of-
+  byte and the memory-viewer paths still use the configured default.
+- **Disassembler: "Find out what addresses this instruction accesses" (CE parity).** Right-click
+  an instruction in the Memory Viewer's disassembler to monitor it and list the distinct data
+  addresses its memory operand touches (with hit counts), the complement of find-what-accesses. The
+  backend existed; this exposes it. Double-click a result to add that address to the cheat table.
+- **Find what writes/accesses: right-click a result to NOP it, restore it, or show it (CE
+  parity).** The results window gains a context menu with **Replace with code that does nothing
+  (NOP)** (the canonical CE workflow: NOP the store to freeze a value), **Restore with original
+  code** (revert a NOP back to the saved original bytes), **Show in the disassembler** (jump the
+  Memory Viewer to the writing/accessing instruction), and **Add to the address list**. NOP/restore
+  act on the recovered writing-instruction address and mark the patched row.
+- **Disassembler: double-click a plain instruction to edit it (CE parity).** Double-clicking a
+  jump/call/branch or a RIP-relative reference still follows it; double-clicking any other
+  instruction now opens the assembler on that line, so you can retype it in place (NOP-padded or
+  overwrite-warned like the context-menu "Assemble instruction").
+- **Change Address: live pointer-chain resolution preview (CE parity).** The pointer editor now
+  resolves the `[[base]+..]` chain against the target as you edit the base/offsets and shows the
+  final address **and the value it lands on** (`→ 0x… = 4321`, or `→ ?? (does not resolve)` when a
+  deref fails), so you can confirm the chain reaches the value you expect before committing.
+- **Dissect Data: adding a single field respects its declared type and name.** Right-click "Add
+  ... (auto)" on a dissector row now uses the field's declared type (set via naming / "Type as C
+  struct") and carries its name to the cheat-table description, matching what "Add all fields"
+  already did, instead of the raw byte guess and a generic "Dissect +0x.." label.
+- **Dissect Data: valid-pointer fields are colored (CE parity).** In the Structure Dissector's
+  single-struct view, a field whose 8 bytes form a valid pointer now paints its Pointer? cell
+  teal, so references stand out at a glance (CE colors pointer fields). The live-change red still
+  wins when a row also changed that refresh.
+- **Hex view: selection stays anchored to its address while scrolling (CE parity).** Selecting
+  bytes and then scrolling with the wheel or scrollbar now keeps the highlight on the same
+  memory (the selected addresses), instead of the same screen position, and drops the selection
+  once it scrolls out of view. Arrow-key cursor movement is unchanged.
+- **Disassembler: selection stays on its instruction while scrolling (CE parity).** The same
+  anchoring now applies to the disassembler: scrolling the pane keeps the selected instruction
+  highlighted (by address) rather than the same screen row, clearing it only when it leaves view.
+- **`.CT` hotkeys are now CE-compatible both ways (CE parity).** CE stores a record's hotkeys as
+  a nested `<Hotkeys><Hotkey><Action>N</Action><Keys><Key>vk</Key>...</Keys></Hotkey>...` structure
+  with Windows virtual-key codes; we only understood our own flat format, so a CE table's hotkeys
+  imported as garbage and CE couldn't read ours. The loader now maps each `Action` (toggle / set
+  value / increase / decrease) to the matching hotkey slot and translates the VK codes to a Qt key
+  sequence (`Ctrl+H`, `F5`, `Ctrl+Up`); the saver writes the same nested structure, so tables
+  round-trip through Cheat Engine. Our old flat format still loads (auto-detected).
+- **Fixed: saving a String / Array-of-byte / Custom record to `.CT` corrupted its type to 4
+  Bytes.** The table builder's type map only covered the numeric types, so every String, Unicode
+  String, Array-of-byte, Binary, Grouped, and Custom record became Int32 on save. All are now
+  mapped correctly.
+- **`.CT` string/AoB length + wide-string flag (CE parity).** Import and export CE's `<Length>`
+  (String / Array-of-byte element length) and `<Unicode>` (a `String` record with `<Unicode>1</Unicode>`
+  is our Unicode String, written back the same way), so an imported record keeps its length and
+  wide-ness and round-trips.
+- **Group `<Options>` from CE tables are honored and preserved (CE parity).** A cheat table's
+  group-behavior flags now import: `moActivateChildrenAsWell` / `moDeactivateChildrenAsWell`
+  gate whether toggling a group header cascades to its children (previously always cascaded), and
+  the whole `<Options>` element is preserved verbatim on save so flags we don't model
+  (`moRecursiveSetValue`, `moHideChildren`, ...) survive a load+edit+save round-trip. New groups
+  keep the cascade-on default.
+- **Fixed: `.CT` dropdown options were dropped on import from real CE files.** CE writes a
+  record's value list as `<DropDownList>` (PascalCase, like every other tag), but the parser
+  looked for `<DropdownList>` (case-sensitive), so a genuine CE table's dropdown options silently
+  vanished. Now reads (and writes) CE's `<DropDownList>`, with the old mis-cased tag accepted as a
+  fallback so tables saved by earlier builds of this port still load.
+- **Fixed: a pointer-scan result was added to the address list as a static address, not a
+  pointer.** Double-clicking a pointer-scanner result added the resolved numeric address with the
+  path only in the description, so the record broke as soon as the module rebased (a game
+  restart) - defeating the whole point of pointer scanning. It now adds the path as the record's
+  address expression, so it re-resolves live and survives restarts.
+- **Cheat table: drag-and-drop reordering (CE parity).** Drag an entry to move it in the list
+  instead of only the context-menu Move Up/Down. Dragging a group header carries its whole
+  subtree, dropping in the empty area moves the entry to the end, and **dropping onto a group
+  header nests the entry (and its subtree) into that group**. Dropping between rows is a flat
+  move that preserves each entry's indent.
+- **Region-type scan filters exposed (CE parity).** The scanner's "Memory Scan Options" group
+  gains **Private / Image / Mapped** checkboxes (CE's MEM_PRIVATE / MEM_IMAGE / MEM_MAPPED). All
+  on by default (scan everything); turn one off to skip that class of memory, e.g. Image-only to
+  search a module's static data, or Private-only to skip loaded code. The backend already
+  filtered by region type (`ScanConfig::scan{Private,Image,Mapped}`); this wires the toggles that
+  were missing, and they persist across restarts.
+- **Step from the Memory Viewer (CE parity).** The Memory Viewer's Debug menu and toolbar
+  gain working **Run (F9)**, **Step into (F7)**, **Step over (F8)**, and **Run to cursor
+  (F4)** controls that drive the paused target directly, matching CE where the memory view
+  is the debug view. They delegate to the debug session the Debugger window owns, so the
+  current-instruction line in the viewer advances on each stop. Run-to-cursor targets the
+  viewer's own selected line (a one-shot breakpoint). All are no-ops while nothing is paused.
+
+- **Big-endian everywhere.** `cescan read` / `write` / `freeze` gain `--be`, so a
+  big-endian value at any host address (a console value found via guest-scan and
+  addressed by host address, a network/file buffer) reads, edits, and freezes by its
+  logical value. All value paths -- these, the GUI cheat table, and guest-scan -- now
+  route through one Qt-free, unit-tested transform (`core/value_transform.hpp`), so
+  endianness and obfuscation codecs compose the same way everywhere.
+- **Emulator cheat-table entries are endianness-aware** (GUI): right-click -> "Big-endian
+  value" (guest-scan sets it automatically), so a big-endian guest value reads and edits
+  correctly in the list.
+- **Hex pane "Add address to the list" uses the current display type** (CE-style): adding
+  from Float display makes a Float record, Qword display an 8-byte record, etc., instead of
+  always Int32. Asserted in `gui_hexview_smoke`.
+- **Memory-viewer Find supports wildcard AOBs**: `48 8B ?? 05` (or `488b??05`) now matches
+  any byte at the `??` positions, so you can search for a pattern regardless of a
+  displacement or immediate. Exact byte and quoted-string search are unchanged. Covered by a
+  new offscreen `gui_search_smoke` in the CI mirror.
+- **Memory-viewer "Find previous" (Shift+F3)**: searches backward for the closest match
+  strictly below the cursor, complementing Find next (F3). Asserted in `gui_search_smoke`.
+- **A search hit highlights the matched bytes** in the hex pane, so you can see exactly what
+  Find landed on instead of just the address. Asserted in `gui_hexview_smoke`.
+- **Fixed: "Follow pointer" now sizes the pointer to the target** (4 bytes on a 32-bit
+  process, 8 on a 64-bit one). It previously always read an 8-byte qword, so following a
+  32-bit pointer jumped to a bogus address built from unrelated high bytes. Asserted in
+  `gui_hexview_smoke`.
+- **Debugger annotates register-relative memory operands** (CE parity): when paused, an
+  instruction like `mov [rax+8],rbx` or `mov rax,[rbx+rcx*4+10]` now shows the effective
+  address it touches (resolved from the live registers) and the symbol / value there, not just
+  RIP-relative operands, in **both** the Debugger window and the Memory Viewer's disassembler.
+  Uses the existing (previously unused) `ce::computeEffectiveAddress`; the current-instruction
+  highlight now carries the full register context, not just the flags. The Memory Viewer's
+  register-relative hint also shows the sized value at the effective address, matching its
+  RIP-relative hint and the Debugger.
+- **Debugger flags show every state, not just the set ones** (CE parity): the register panel's
+  Flags line now reads `CF=0 PF=1 AF=0 ZF=1 SF=0 DF=0 OF=0` instead of just the names of the set
+  flags, so you can read a clear flag's state next to a conditional jump. Backed by a Qt-free
+  `ce::describeEflagsVerbose`, unit-tested in `cecore_test`.
+- **Debugger "Run to cursor" gets F4 and a context-menu item** (CE parity): the Run to Cursor
+  button now carries CE's **F4** shortcut, and right-clicking a disassembly line offers "Run to
+  cursor" (enabled only while paused), so you can run to a clicked instruction without setting a
+  temporary breakpoint.
+- **Debugger disassembly shows your inline comments** (CE parity): comments set in the Memory
+  Viewer ("Set comment...") now also appear on the matching lines in the Debugger window's
+  disassembly, so annotated code reads the same while debugging (labels already did, via the
+  symbol resolver). MainWindow resolves the annotations' symbolic addresses to numbers and pushes
+  the map to the debugger when it opens and whenever a comment changes; the paused disassembly
+  re-renders at once so a new comment appears immediately. Asserted in `gui_debugger_smoke`.
+- **Debugger register panel now shows R8-R15** (CE parity): the panel listed RIP/RSP/RBP/RAX-RDI/
+  RFLAGS + XMM but omitted the extended general-purpose registers R8-R15, which modern x86-64 code
+  uses heavily. They are now shown (between RFLAGS and XMM0) and editable like the other GP
+  registers; the XMM rows shifted down accordingly.
+- **Debugger predicts conditional jumps** (CE parity): when the target is paused on a
+  conditional branch (`je`, `jne`, `jbe`, `jg`, ...), the disassembly line now reads
+  `(will jump)` or `(no jump)` based on the live flags, so you can see the path before you
+  step, in **both** the Debugger window and the Memory Viewer's disassembler (which follows the
+  stop). The mnemonic+flags decision is a Qt-free `ce::conditionalJumpTaken`, unit-tested in
+  `cecore_test`.
+- **Regression guard: integer format<->parse round-trip test**: `cecore_test` now formats every
+  width/sign/base combination of representative values (0, 127, 128, 255, min-signed, max-unsigned,
+  ...) and parses it back, asserting the width-masked bytes match. This locks in the consolidated
+  value pipeline where several hex/signed display-vs-parse bugs were fixed.
+- **Scan value input parses through the same hex-aware helper**: the integer scan value (and the
+  "Value between" upper bound) went through `toLongLong(base)`, which mishandled a `0x`-prefixed
+  entry in Hex mode; they now use the shared `parseIntField` / `ce::parseIntegerScalar`, so a
+  scan value parses exactly like a cheat-table value (bare hex or `0x`, signed). This was the last
+  integer-parse site not on the shared helper.
+- **Fixed: value comparison ignored the signed-display flag**: the memory-read side interpreted
+  a Byte as unsigned but wider ints as signed (a fixed per-type choice), while the frozen/typed
+  text follows the record's Signed flag. So a signed-shown byte over 127 (now the default) or an
+  unsigned-shown int never equalled its own frozen text, breaking directional freeze, the step
+  hotkeys, and edit-revert detection. The read side now honors the record's Signed flag, matching
+  the parse, and the edit-verify target is parsed hex/signed-aware too.
+- **Fixed: directional freeze (Increase/Decrease Only) silently broke on hex-display records**:
+  a hex record stores its frozen value with a `0x` prefix, but the freeze comparison parsed it
+  as base-10 and failed, falling through to an unconditional write, so "Increase Only" etc.
+  behaved like a plain freeze. The comparison now parses via the shared hex-aware
+  `ce::parseIntegerScalar`, so directional freezes hold correctly regardless of hex display.
+- **Fixed: inline-editing a pointer record's Value cell could write to a stale address**: typing a
+  new value directly into the Value column wrote through the address cached at the last refresh
+  instead of re-resolving the pointer chain first, so for a moving pointer the write could land on
+  the wrong target. It now re-resolves before writing, matching every other value-write path.
+- **Refactor: one `reresolveAddress` helper for pointer records**: the six read/write paths that
+  re-resolve a pointer record's address expression (freeze, value refresh, live value, inline
+  edit, "Set value", step hotkeys) now share a single helper instead of six copies of the same
+  block, so the staleness class of bug (fixed twice above) can't reappear in one path but not
+  another.
+- **Fixed: inline-editing a pointer record's value could write to a stale address**: editing the
+  Value cell directly (or Lua `setValue`) went through a path that did not re-resolve the pointer
+  chain first, unlike the "Set value..." menu, so a moved pointer got the new value written to its
+  old target. `setValue` now re-resolves the address expression before writing, so every value
+  path (inline edit, "Set value", step hotkeys, freeze) is consistent.
+- **Fixed: freezing a pointer record could write to a stale address**: the freeze runs every
+  100 ms but the value refresh (which re-resolves pointer chains into the cached address) runs
+  far slower, so between refreshes the freeze wrote its frozen value to the pointer's *old*
+  target, up to ~500 ms out of date, if the pointer moved. `freezeWrite` now re-resolves a
+  record's address expression each tick before writing, exactly as the increase/decrease hotkeys
+  already do, so a frozen pointer always hits its current target.
+- **Fixed: increase/decrease-value hotkeys corrupted hex-display records**: the step hotkeys
+  built the new value as a bare decimal but told the writer to parse it in the record's display
+  base, so a hex record turned an increment into a hex misread (e.g. `256` written as `0x256`).
+  The new value is now rendered in the record's own display format (via the shared
+  `formatIntegerScalar` / `formatFloatScalar`), so it writes back correctly and also matches the
+  column immediately; floats no longer flash fixed-decimal text before the next refresh.
+- **"Set value" on a group applies to its children** (CE `moRecursiveSetValue`): since a group
+  header has no value of its own, setting a value on a selected group now writes it to all the
+  group's child entries recursively (deduped when a group and a child are both selected). The
+  subtree-span logic is a Qt-free `ce::descendantRange`, unit-tested in `cecore_test`.
+- **Group collapse state persists** (CE `Collapsed`): a collapsed group stays collapsed after
+  saving and reopening a table (CE XML `.CT`, `.CETRAINER`, and native JSON), via a
+  `<Collapsed>1</Collapsed>` tag, and re-hides its children on load. Asserted in `cecore_test`.
+- **Cheat-table groups collapse and expand** (CE tree parity): double-clicking a group header
+  (outside its Description) now hides or shows its child rows, with a `▾`/`▸` marker on the
+  group. Nested groups collapse independently, and the hidden state re-applies after refreshes
+  and reorders. The "which rows to hide" logic is a Qt-free `ce::hiddenByCollapse`, unit-tested
+  in `cecore_test`.
+- **Float values display trimmed of trailing zeros** (CE parity): a float of `100.0` now reads
+  `100`, not `100.0000`, and `99.5` reads `99.5`; precision matches the type (~7 significant
+  digits for Float, ~15 for Double). The cheat table, scan results, and Structure Dissector all
+  share one Qt-free `ce::formatFloatScalar`, unit-tested in `cecore_test`.
+- **.Net menu is functional; empty menus removed**: the top-level **.Net** menu (previously an
+  empty dropdown) now opens the Mono/IL2CPP dissector (shared with Tools via a new
+  `openMonoDissector`), and the empty **Plugins** / **Languages** menus are dropped (no plugin
+  loader, English-only), the same treatment the dead D3D menu already got.
+- **"Set value" pre-fills the current value** (CE parity): right-click -> "Set value..." now
+  opens with the first selected entry's current value (in its display format) already in the
+  box, so you edit from it instead of a blank field.
+- **Scan results and the cheat table format integers identically**: scan-result values now
+  render through the same shared `ce::formatIntegerScalar` (signed by default, hex
+  width-masked) as the cheat table, so a value reads the same in the results list and after
+  "Add to the address list" (previously a byte could show unsigned in results but signed once
+  added). Removes the internal quirk where results showed Byte unsigned but wider ints signed.
+- **"Add Address Manually" opens the full address dialog** (CE parity): instead of a bare
+  text prompt, adding an address by hand now uses the same `formAddressChangeUnit` dialog as
+  "Change address", so a new entry gets its type, hex/signed flags, length, and an optional
+  structured pointer chain in one step. `AddressListModel::addEntry` now returns the new id so
+  the flags can be applied.
+- **Memory Viewer can load a region from a file** (CE parity): the disassembler right-click gains
+  "Load region from file..." to complement "Save region to file...", writing a saved/prepared
+  binary back into the target at the clicked address (with a confirmation of the byte count and
+  destination, since it patches live memory) and refreshing the panes. Both are also in the
+  Memory Viewer's **File** menu (acting at the address in view), like CE. The load is capped at
+  256 MB (matching the save prompt) so a huge or wrong file can't exhaust memory.
+- **Memory Viewer Tools menu is populated** (CE parity): the previously empty **Tools** menu
+  now offers **Auto Assemble...** (opens a script editor) and **Dissect data/structures...**
+  (opens a Structure Dissector at the current address), routed through the openers MainWindow
+  owns. Asserted in `gui_search_smoke`.
+- **Fixed: address expressions broke on hyphenated library names**: the expression parser split
+  on `-`, so a Linux library whose name contains a hyphen (e.g. `libssl-1.1.so+0x10`) was split
+  at the hyphen and failed to resolve, which also broke the symbolic address bar's round-trip for
+  such modules. The parser now recognizes a known module-name prefix (longest match) and takes it
+  whole, so its internal `-` is not mistaken for subtraction. Unit-tested in `cecore_test`.
+- **Hex pane offers 64 bytes per row** (CE parity): the "Bytes per row" menu now includes 64
+  alongside 8/16/32 for wider dumps; 64 divides by every display-type group size, so grouped
+  views stay valid.
+- **Robustness: clamp the persisted hex "Display type"**: a stale or out-of-range
+  `memview/displayType` setting is now clamped to the valid enum range on load instead of casting
+  to an invalid display type.
+- **Memory Viewer remembers "Bytes per row" and "Display type"** (CE parity): both hex-pane
+  choices now persist across sessions. Bytes-per-row was loaded from settings but the menu
+  change never saved it (so it always reverted to 16), and display type wasn't persisted at all;
+  both are now written on change and restored when a Memory Viewer opens.
+- **Fixed: inline-editing a record's Type parsed the new type names wrong**: after the Type
+  column was renamed to CE's wording, the reverse parser still only knew the old names, so
+  committing a Type-cell edit on a Unicode-String record (or "All") fell back to 4 Bytes. The
+  reverse parser now derives from the same `ce::valueTypeName`, so every displayed name
+  round-trips, with the old names kept as synonyms.
+- **Scan value-type dropdown uses the same names as the cheat table**: the scanner said "Text" /
+  "Unicode Text" / "Array of Bytes" / "All Types" while the address list and Change-address dialog
+  said "String" / "Unicode String" / "Array of byte" / "All" (`ce::valueTypeName`); the scanner now
+  matches, so a type reads the same when you scan it and when it lands in the list.
+- **Cheat-table Type column uses CE's wording and shows element length**: the list column
+  said "Text" / "Array of Bytes" / "Unicode Text" while the Change-address dialog (and CE)
+  said "String" / "Array of byte"; both now agree via one shared `ce::valueTypeName`. String
+  and Array records also show their element length in brackets ("String[10]",
+  "Array of byte[8]"). Unit-tested in `cecore_test`.
+- **Editing a hex-displayed value reads the input as hex** (CE parity): when a record shows
+  its value in hexadecimal, typing a bare `1a` into the Value cell now writes `0x1A`, not a
+  failed decimal parse. Integer value input goes through a Qt-free `ce::parseIntegerScalar`
+  (the input counterpart of `formatIntegerScalar`): hex mode reads a bare token as hex, a
+  `0x` prefix always forces hex, and signs/decimal still work. Unit-tested in `cecore_test`.
+- **Signed display persists to `.CT` tables** (CE `<ShowAsSigned>`): a record's signed/unsigned
+  choice now survives save/load in every format (CE XML `.CT`, `.CETRAINER`, and our native
+  JSON), so a table shared or reopened keeps its value display. Signed is the default, so only
+  an unsigned override is written (`<ShowAsSigned>0</ShowAsSigned>`); a table without the tag
+  loads as signed. Asserted in `cecore_test` (round-trip + absent-tag default + explicit
+  override).
+- **"Change address" dialog: Signed toggle now works** (CE `ShowAsSigned`): the last dead
+  control is wired. Ticking **Signed** shows integer values as signed (e.g. a byte `200`
+  reads `-56`), unticking shows unsigned (`200`); the box is offered only for integer types,
+  round-trips a record's flag, and persists in saved tables. This also makes the value
+  formatter consistent (Byte was always unsigned, the wider ints always signed). The
+  signed/unsigned/hex rendering is a Qt-free `ce::formatIntegerScalar`, unit-tested in
+  `cecore_test`; the dialog wiring is asserted in `gui_changeaddr_smoke`.
+- **"Change address" dialog: structured pointer editor** (CE parity): ticking **Pointer**
+  reveals a base-address field plus an offset chain (Add offset / remove per row), and the
+  address field shows the composed `[[base]+..]` as you edit. Opening an existing pointer
+  record parses its expression back into the base and offset rows, so it round-trips. The
+  compose/parse pair is the Qt-free `buildPointerExpression` / new `parsePointerExpression`
+  (unit-tested inverse) in `core/ct_file`; the editor is asserted in `gui_changeaddr_smoke`.
+- **"Change address" dialog: Unicode box and Length now work** (CE parity): ticking
+  **Unicode** on a String record makes it a Unicode string (CE has no separate type, it is
+  String + the box), and it round-trips: a Unicode record reopens as String with the box
+  ticked. The **Length** field is seeded from the record's actual element length (not a hard
+  1) and is applied on OK, so String/Array/Unicode lengths can be edited. Unicode is offered
+  only for the String type. Asserted in the new `gui_changeaddr_smoke`.
+- **AOB injection generates a unique signature** (CE parity): "Create AOB injection here"
+  now scans the containing module and extends the byte pattern past the stolen bytes until
+  it matches only the hook site, so the generated `aobscanmodule(...)` finds exactly one
+  address instead of the raw (possibly repeated) opcode bytes. The uniqueness search is a
+  pure, unit-tested helper (`ce::shortestUniqueAobLen` / `ce::uniqueAobSignature`); it falls
+  back to the raw bytes when the module can't be scanned. Asserted in `cecore_test`.
+- **Memory Viewer address bar shows the location symbolically** (CE parity): after any
+  jump the box reads `module+offset` (e.g. `libc.so.6+0x1234`) when the address is inside a
+  mapped module, instead of a bare hex number, so you can see where you are at a glance. The
+  symbolic form round-trips: pressing Enter on it navigates back to the same address.
+  Off-module addresses (heap, stack, anonymous) still show as hex. Asserted in
+  `gui_search_smoke`.
+- **Structure Dissector resolves where pointer fields point** (CE Dissect Data): a pointer field
+  now reads `-> module+0xoffset` when it lands inside a mapped module (e.g. `-> libgame.so+0x1234`)
+  instead of a bare `-> 0xADDRESS`, so you can tell a pointer into game code/data from a heap
+  pointer at a glance. Falls back to the raw address off-module.
+- **Structure Dissector follows pointers on double-click** (CE Dissect Data spider):
+  double-clicking a pointer field re-bases the dissector to the pointed-to structure, so
+  you can walk a linked structure by clicking through it. Non-pointer cells still open the
+  field-name dialog. Asserted in `gui_structdissect_smoke` (follows a real pointer, and a
+  plain integer field does not follow).
+- **Double-clicking a cheat-table Address browses it in the Memory Viewer** (CE parity):
+  the viewer opens at that address and focuses the disassembler for code or the hex dump
+  for data, with **Shift** forcing the disassembler and **Ctrl** forcing the hex dump. The
+  pane-choice policy is a Qt-free helper (`core/memview_nav.hpp`), unit-tested in
+  `cecore_test`; `focusPane` is asserted in `gui_search_smoke`.
+- **`cescan il2cpp --pid <pid>`** resolves a running Unity game's class layouts (field
+  offsets + method RVAs) directly, auto-locating the metadata and GameAssembly from the
+  process (through the sandbox root for Proton/Flatpak).
+- **`cescan tree <pid>`** lists a process and its descendants (largest RSS first, with a
+  sandbox badge) to find the right renderer/helper of a browser or Electron game.
+- **IL2CPP generics** now spell concrete arguments as `List<PlayerData>`, not
+  `List` + backtick-arity + `<PlayerData>` (validated across all fields of a real game).
+- **Guest-scan dialog** gained an end-to-end offscreen regression test (exact + unknown
+  + comparison narrowing), now in the CI mirror.
+- **Structure Dissector compare mode is now side-by-side** (CE Dissect Data): entering one
+  or more compare addresses lays each instance out as its own value column next to the
+  base, and any cell that differs from the base at that offset is coloured, so the fields
+  that discriminate between instances stand out (same = default, different = red). Before,
+  only the base's values were shown with the whole differing row tinted. Single-struct mode
+  also gained a **live-change highlight**: a value that changes between refreshes paints
+  red (like CE's Dissect Data and the hex pane), reset on a base-address change. Both are
+  covered by the offscreen `gui_structdissect_smoke` in the CI mirror.
+- **Structure Dissector Base and Compare addresses accept expressions**: both the base and
+  the compare-address fields now take a CE-style expression (module+offset `game.exe+0x100`,
+  pointer deref `[rax+8]`, decimal `#1234`) via the shared ExpressionParser, not just a bare
+  hex address. Asserted in `gui_structdissect_smoke`.
+- **Structure Dissector "Add All to List"**: after labelling a struct's fields (by hand or
+  via Type as IL2CPP / C struct), one button adds every named field to the cheat table
+  (base+offset, name, type) instead of adding them one at a time. Fields typed via Type-as
+  now keep their **declared type** (float stays float, int32 stays int32) in the compare
+  columns and when added to the list, rather than re-guessing from the bytes; the type is
+  saved/loaded with the structure definition. Asserted in `gui_structdissect_smoke`.
+- **Memory Viewer marks the current instruction** when the debugger is paused: the line at
+  the stopped thread's RIP paints green with a ► marker, and the first open viewer follows
+  execution. See the debugger notes below.
+- **Debugger memory pane highlights changed bytes** as you step: bytes that differ from the
+  previous dump at the same address paint red, so you can watch what the code writes (like
+  the standalone hex pane). A new address resets the baseline. Asserted in
+  `gui_debugger_smoke`.
+- **F5 toggles a breakpoint** at the disassembly cursor in the debugger (adds one if none
+  is there, removes it if there is), matching CE's debugger which already binds F7/F8/F9 to
+  step-into/over/continue. Asserted in `gui_debugger_smoke`.
+- **Fixed: debugger disassembly showed `int3` when stopped at a breakpoint.** A software
+  breakpoint replaces the instruction's first byte with 0xCC; reading it back for the
+  disassembly rendered `int3` and desynced the whole pane (it collapsed to a single line).
+  Planted breakpoint bytes are now un-masked to their originals before disassembling, so the
+  paused code reads as its real, correctly-aligned instructions. Asserted in
+  `gui_debugger_smoke`.
+- **Debugger disassembly keeps the caret on its instruction across re-renders**: toggling a
+  breakpoint, stepping, or an auto-refresh no longer jerks the caret to the top of the pane
+  (it is restored to the same address). Asserted in `gui_debugger_smoke`.
+- **Debugger disassembly annotates data references**: a memory operand is resolved (via the
+  disassembler's pre-computed effective address) to the symbol / module+offset it points at
+  **and its current value** — sized by the operand's byte/word/dword/qword prefix, or shown
+  as a quoted string when the target is printable text — as a `; -> name = value` /
+  `; -> name "text"` comment. So you can see which global the paused code reads or writes and
+  what it holds. Asserted in `gui_debugger_smoke`.
+- **Debugger shows decoded CPU flags**: a "Flags:" line under the register table spells out
+  the status/control flags set in RFLAGS (CF PF AF ZF SF TF IF DF OF), instead of leaving
+  you to decode the raw hex. Backed by a Qt-free `ce::describeEflags()` unit-tested in
+  cecore_test and asserted end to end in `gui_debugger_smoke`.
+- **Debugger stack pane reads as a call stack**: stack slots whose value points into code
+  (return addresses) are annotated with the **function name** (`func+0xNN` from the symbol
+  table), falling back to "module+offset" when there is no symbol, so you can read the call
+  chain instead of raw pointers. Asserted in `gui_debugger_smoke`.
+- **Debugger disassembly is symbol-annotated**: a direct call/jmp shows its target's symbol
+  and the current (`=>`) line shows the function it is stopped in, appended inline as a
+  `; symbol` comment (so it never shifts the line/address mapping the breakpoint actions
+  rely on). The current line also gets a **full-width background highlight** so the stopped
+  location stands out at a glance. Both asserted in `gui_debugger_smoke`.
+- **Disassembler multi-instruction selection**: Shift+Up/Down and Shift+click select a
+  range of instructions (the whole range highlights), and Ctrl+C copies every selected line
+  as a block. A plain move or click collapses back to a single line; right-clicking inside a
+  range keeps it so the menu acts on the whole selection. The context menu is range-aware
+  too: "Copy bytes", "Copy lines", and "NOP N instructions (M bytes)" all operate on every
+  selected instruction. **Ctrl+A** selects every visible instruction (then Copy/NOP acts on
+  the whole block). **Home/End** jump the cursor to the first/last visible instruction
+  (Shift extends the range) and **Escape** collapses a range back to a single line.
+  Covered by a new offscreen `gui_disasm_smoke` in the CI mirror.
+- **Hex pane highlights changed bytes** (CE-style): bytes whose value differs from the
+  previous refresh paint red across the hex and ASCII columns, so live-changing memory is
+  obvious at a glance. Navigating to a new address resets the baseline (no false "changed"
+  flash). Covered by a new offscreen `gui_hexview_smoke` in the CI mirror.
+- **Paste bytes into the hex pane**: the right-click menu gains "Paste N bytes here" when
+  the clipboard holds an array of bytes ("90 90 c3", "9090c3", or "?? c3" with wildcards),
+  patching memory at the cursor so you can copy an AOB and paste it as a patch. Wildcards
+  leave the existing byte untouched. **Ctrl+V** pastes and **Ctrl+C** copies the selected
+  bytes as an AOB, from the keyboard. A **"Fill selection with…"** action writes one byte
+  value across the whole selected range (e.g. 0x90 to NOP a region). **Shift+Left/Right**
+  extends the byte selection from the keyboard, **Home/End** jump the cursor to the
+  start/end of its row (Shift extends), and **Ctrl+A** selects every readable byte in the
+  window. Asserted in `gui_hexview_smoke`.
+- **yuzu/Citra guest RAM** is now recognized: the Switch/3DS emulator family (and its
+  suyu / sudachi / citron / Lime3DS / Azahar forks) backs guest memory with a
+  `memfd_create("HostMemory")` fastmem mapping, so `findGuestRam` picks it up as a named
+  guest-RAM marker and collapses the fastmem mirrors by file offset, exactly like the
+  Dolphin / PCSX2 / DuckStation adapters. Switch/3DS are little-endian with no fixed
+  console base, so the regions surface 0-based and unswapped. Validated against a
+  synthetic `HostMemory` process in cecore_test.
+- **Emulator guest-RAM mirror dedup now keys on the backing inode**, not just a named
+  shm's offset, so an emulator that maps guest RAM at several virtual addresses via
+  *unnamed* memfds no longer shows duplicate candidates. RPCS3 maps every object at both
+  `g_base_addr` and a `g_sudo` write-mirror (`memfd_create("")` / `"2M"`), which carry no
+  usable name -- its guest RAM now surfaces once through the generic large-region
+  heuristic with the mirrors collapsed. Anonymous arenas (inode 0) stay distinct.
+
+---
+
+## v0.7.0 — emulators, sandboxes, obfuscated values, scriptable find-what-writes (2026-07-19)
+
+A large release that turns hard targets from silent failures into first-class,
+honestly-reported workflows: console emulators, sandboxed (Flatpak / Snap / Proton)
+games, and games that obfuscate or protect their values. Most new backend work is also
+exposed on the `cescan` CLI, so it is scriptable and testable headlessly. See
+`docs/CHALLENGING_TARGETS.md` for the design map behind this work.
+
+### Know the target before you scan (capability probe)
+
+- Attaching now probes the target and reports, in plain language, what it is and what
+  that limits: architecture and endianness, Wine/Proton, whether it is already traced
+  (anti-debug), seccomp, PID namespace (sandbox), managed runtimes (.NET / Mono / JVM /
+  V8 / Go), and recognized emulators. Shown on the GUI status line + tooltip and via
+  `cescan info <pid>`.
+
+### Emulators — scan a console game's guest memory
+
+- **`cescan guest-scan`** scans a recognized emulator's guest RAM in guest-address
+  space, with correct byte order for big-endian consoles (PS3 / Wii / GameCube). Full
+  workflow: exact and unknown-value first scans, `--next`, and
+  `--changed` / `--increased` / `--decreased` / `--unchanged` narrowing, all with `--be`.
+- **`cescan guest-write`** edits a guest address by its logical value (translated and
+  byte-swapped for you). Recognizes Dolphin, PCSX2, RPCS3, DuckStation, yuzu, Ryujinx,
+  Citra, PPSSPP and more, locating candidate guest-RAM regions.
+
+### Sandboxed and containerized apps (Flatpak / Snap / Proton)
+
+- Symbol loading and module analysis now work on sandboxed targets: their backing files
+  exist only inside the sandbox mount namespace, so paths are resolved through
+  `/proc/<pid>/root`. IL2CPP metadata (a data file) resolves the same way, so
+  `global-metadata.dat` opens on Flatpak and Steam-Proton (pressure-vessel) Unity games.
+- The process picker badges sandboxed processes, and the probe reports the target's
+  inner-namespace PID.
+
+### Obfuscated and protected values
+
+- **Value codecs**: a value stored XOR'd, offset, or bit-rotated can be found, read,
+  edited, and frozen by its logical value. In the GUI, right-click a cheat-table entry
+  → "Set value codec…" (`none | xor:0xKEY | add:N | rol:N | ror:N`); the value displays
+  decoded and every write (edit, freeze, adjust, hotkey) stores the encoded form. On the
+  CLI: `scan` / `read` / `write` / `freeze --codec`.
+- **Reverted-value detection**: `cescan write --verify` (and the GUI, after a manual
+  edit) re-reads shortly after and warns if the game or an integrity check overwrote the
+  value, pointing you to find-what-writes.
+
+### Find what writes — scriptable, and more precise in the GUI
+
+- **`cescan watch <pid> <addr>`** exposes find-what-writes/accesses on the CLI (Wine-safe
+  main-thread hardware watch by default). `--regs` reports the register holding the
+  target address, or `[reg + offset]` — the base for a pointer path.
+- **Exact store recovery**: a hardware watchpoint traps one instruction past the writer;
+  both the CLI and the GUI now recover the precise store instruction instead of an
+  occasional backward-disassembly mis-decode.
+- **`cescan write --verify --find-writer`** chains write → detect revert → name the exact
+  restoring instruction in one command.
+- The GUI "Find what writes" window gains a **Pointer path** column.
+
+### Freeze
+
+- **`cescan freeze <pid> <addr> <val>`** locks a value (normal / floor / ceil), and is
+  codec-aware for obfuscated values.
+
+---
+
+## v0.6.6 — find-what-writes and code injection on Wine/Proton (2026-07-18)
+
+"Find what writes/accesses" and auto-assembler code injection used to freeze or
+crash a game running under Wine/Proton (validated against Mount & Blade Warband
+under Proton 9.0). This release makes every transient debug operation Wine-safe.
+
+### Watchpoints ("Find what writes / accesses")
+
+- **No longer freezes Wine/Proton games.** The watchpoint used to `PTRACE_SEIZE` +
+  stop the game's entire thread group to arm; stopping wineserver, esync/fsync and
+  GPU/driver threads deadlocks the game (it went unresponsive, black screen). On a
+  Wine/Proton target it now arms a **hardware watchpoint on the main thread only**
+  (the game-logic thread that writes money/HP), touching nothing else. Native Linux
+  keeps the full all-thread watch. The software page-guard backend (which fought
+  Proton's kernel write-watch / userfaultfd) is no longer used on Wine.
+- **Repeatable.** A finished monitor kept the thread traced, so a second
+  find-what-writes silently found nothing; finished monitors are now stopped (and
+  released when their window closes) before a new one starts.
+- Fixed a **use-after-free crash at exit** (the monitor thread could call into a
+  debugger object that had already been destroyed).
+- `CE_CODEFINDER_MODE=hw|sw|st` overrides the backend for diagnostics;
+  `CE_LOG=debugger:debug` logs arming, hits and teardown.
+
+### Code injection (auto-assembler scripts, loadlibrary, Mono agent)
+
+- **AA code-injection scripts work on Wine/Proton.** The code-cave allocation
+  (`remoteSyscall` -> `mmap`) used `PTRACE_ATTACH` and hijacked a thread parked in a
+  syscall, which on Wine (threads sit in esync/fsync/wineserver waits) corrupted the
+  wineserver RPC and froze the game. Switched to `PTRACE_SEIZE + PTRACE_INTERRUPT`, a
+  clean stop that preserves the interrupted syscall's restart state.
+- **WoW64 allocations no longer wrongly reported as failures.** A valid 32-bit
+  `mmap2` address at or above 2 GB (e.g. `0xEBDF9000`) was sign-extended to a
+  negative value, so `allocate()` rejected a successful mapping. Only the i386
+  `-errno` range is treated as an error now.
+- The **dlopen injector** (`loadlibrary()`, `createthread()`, the Mono agent) and
+  the WoW64 bitness probe were switched to the same Wine-safe stop.
+- The full debugger and break-and-trace still stop the whole process on purpose
+  (that is what they do); everything meant to be quick and transparent does not.
+
+## v0.6.5 — whole-app UI/UX overhaul + IL2CPP dissector depth (2026-07-18)
+
+A comprehensive, panel-by-panel usability pass over the entire app, on top of
+IL2CPP dissector depth and a batch of Cheat-Engine-parity scanning details.
+Every panel, window, dialog and settings page was audited (screenshot-verified
+in both the light and dark themes via a new `--pid` / `--panel` /
+`--settings-page` launch harness).
+
+### UI / UX overhaul (every panel audited)
+
+- **Table columns stop clipping their contents.** Every list/table in the app
+  (pointer scanner, memory/heap/module/thread regions, find-statics, structure
+  dissector, code-finder, break-and-trace, register/SIMD editor, code references,
+  stacktrace, advanced options, settings hotkeys) used to leave its columns at
+  Qt's 100px default, so 16-digit hex addresses and 64/128-bit register values
+  were truncated. Each table now sizes its fixed columns to content and lets the
+  one variable column take the slack.
+- **No more text-less or cryptic controls.** Spinbox/combo dropdown arrows were
+  unstyled and rendered blank app-wide (now drawn); the Structure Dissector's
+  "Compare" field had collapsed to a bare "..." because its toolbar overflowed a
+  single row (now a two-row layout with the field spelled out); the Lua console
+  grew explicit **Run** and **Clear** buttons instead of relying on the Enter key.
+- **Analysis tools are findable from the main window.** Auto Assemble, Pointer
+  scan, Dissect data/structures, Find static addresses, the Mono dissector, the
+  Lua engine and the ELF inspector were only in the Memory Viewer's own menus;
+  they now also appear in the main window's Tools menu.
+- **Decluttered layout.** The Structure Dissector toolbar was split into an
+  address row and an actions row; the dead Windows-only **D3D** menu (every item
+  permanently disabled on Linux) was removed; the Fill Memory dialog's fields are
+  aligned in a form layout, and the process picker groups Open/Cancel on the right.
+- **Colours fit both themes.** The two remaining hardcoded disassembler colours
+  (DWARF source-line annotations and the breakpoint gutter glyph) washed out on
+  the light theme; both are now theme-gated. The Lua console dims echoed commands
+  and shows errors in red.
+- **Code References no longer looks frozen.** Analyzing a module drives a
+  cancelable progress dialog across its eight scan passes instead of hanging.
+- **System theme on first launch, working scrollbars, real breakpoint toggle**
+  (from the same pass): the app follows the desktop's light/dark preference on
+  first run; the memory-view scrollbars track an absolute flattened-memory model
+  so dragging no longer snaps back; and Toggle Breakpoint truly toggles.
+
+### IL2CPP (Unity) dissector
+
+- **Managed field type names** resolved offline from the GameAssembly binary:
+  `System.Single`, `UnityEngine.Vector3` (VALUETYPE/CLASS), arrays (`MyClass[]`),
+  pointers, and generics spelled out (``List`1<System.String>``,
+  ``Dictionary`2<K, V>``). Every field on real v27/v31 games resolves a name.
+- **Base class** of each type (parent chain), rendered as `Foo : Bar` in the
+  dissector; and **full object layouts** with inherited fields
+  (`getIl2CppObjectLayout`, `cescan il2cpp --object <class>`), each field tagged
+  with its declaring type.
+
+### Scanning
+
+- **Tri-state Writable/Executable region filters** (CE's grey/checked/unchecked
+  boxes): must-have / must-not-have / don't-care.
+- **"Pause target while scanning"** — SIGSTOP the target for a consistent snapshot
+  during each scan, then resume (skips a target that's already stopped).
+- **New Scan flow**: First Scan becomes New Scan after scanning and locks the
+  value type; a **Previous column** shows the scan-time value next to the live one.
+- **AOB / string result values fixed** — they showed "?"; AOB now renders as
+  `48 8B 05` and strings as text, in both the results list and the cheat table
+  (which also keeps AOB/string entry types across save/load).
+- Enter-to-scan, type-aware value placeholders (`48 8B ?? 05` for AOB), the value
+  box greys out for no-value compares, thousands-separated result counts, clear
+  status feedback when there's no process, and **Save current scanresults** to
+  txt/csv.
+
+### UI / memory viewer
+
+- **Scan panel rebuilt** with real Qt layouts (was absolute pixel coordinates:
+  dead space, no scaling); results list expands into the reclaimed width.
+- **Memory-view scrollbars work** — the disassembly/hex panes had a dead or
+  missing scrollbar; both now scroll memory, and scrolling up past mapped memory
+  no longer strands the view ("no memory" with no way back).
+- **Jumping to unmapped memory now says so**: a Go / follow / back-forward that
+  lands on an unreadable address shows `0x… is not readable (unmapped or
+  protected page)` in the status bar, instead of a silent pane of `??`.
+- **Memory viewer gives the disassembly/hex more width by default**: the register
+  and stack panels only show placeholders (live registers are in the Debugger
+  window), so they no longer take a quarter of the width, and the disassembler's
+  `module+offset` / data-reference annotations stop truncating off the edge.
+- **Every "Browse this memory region" opens the full memory viewer.** Opening it
+  from a scan result, a cheat-table entry, Advanced Options, or the Memory
+  Regions/Heap/Module/referenced-strings windows used to give a stripped-down
+  viewer with no breakpoints, "add to list", Tools/Debug menus or debugger launch;
+  all of those now open the same fully-wired viewer as the Memory View button.
+- **No crash when the target exits with a Memory Viewer or Structure Dissector
+  open.** When the attached process ends (or you attach to a different one), open
+  Memory Viewers and Structure Dissectors are frozen and the Lua engine's process
+  pointer is cleared before the process handle is destroyed, so a refresh timer or
+  table script can't read the freed handle.
+- **Dark-theme tree fix** — tree widgets (Mono dissector, breakpoint/thread/module
+  lists, structure dissector) rendered class rows as unreadable white stripes;
+  now themed. Tool buttons, radios, and the speedhack slider themed to match.
+- **Addresses as `module+offset`** (`game.bin+0x1234`) in the cheat table, stable
+  across restarts; empty-state hints on the results and cheat-table panes; the
+  window title shows the attached process.
+- **Static scan results shown in green** (CE's cue): a result address inside a
+  loaded module is pointer-stable across restarts, so it is coloured green and
+  hovering it reveals the `module+offset` it belongs to.
+- **Disassembler annotates unnamed call/jmp targets** with `module+offset`
+  (e.g. `jmp 0x… ; GameAssembly.so+0x1234`) when no symbol exists, so stripped
+  game binaries are still navigable; conditional jumps stay uncluttered.
+- **Hex view: multi-byte range selection** by drag or shift+click (highlighted
+  in both the hex and ASCII columns), with right-click "Copy selection as AOB"
+  and "Copy selection (hex, no spaces)". Editing or arrow-navigating collapses
+  the range back to a single byte.
+- **Scan result count no longer looks truncated**: the results table shows at
+  most 10,000 rows for responsiveness, so when a scan finds more the "Found"
+  label now says e.g. `Found: 2,000,000  (showing first 10,000)` instead of
+  leaving the capped list unexplained.
+- **Disassembler colours fixed for the light theme.** The operand text, the
+  selected/branch-target row highlights, and the user-comment colour were
+  hardcoded to dark-theme values, so on the light theme operands rendered as
+  near-invisible pale lavender and a selected row became a dark bar. These are
+  now theme-aware (readable dark-slate operands and a soft selection tint on
+  light; unchanged on dark).
+- **Memory viewer debug toolbar decluttered**: the six near-identical Run/Step
+  buttons (which all just opened the separate Debugger window) collapse to a
+  single "Debugger" button, leaving Toggle BP / Debugger / Preferences.
+- **Memory viewer hides the register/stack panels by default.** They only
+  populate during a debug session (which runs in the separate Debugger window),
+  so they were dead `-` placeholders taking a quarter of the width; now the
+  disassembly and hex use the full width, and a persisted View toggle ("CPU
+  registers & stack panels") brings them back for CE's layout.
+- **Settings dialog redesigned with a vertical category sidebar.** The 15
+  categories used to overflow a horizontal tab bar (most tab names hidden); they
+  now sit in an always-visible left-hand list (horizontal text) with the page on
+  the right, the standard modern settings layout. `--settings` opens the dialog
+  straight on launch.
+- **Zebra-striped result and cheat-table rows** for easier scanning of dense
+  address/value lists. The theme already defined the alternating colour but the
+  views never enabled it; enabled now, with the light stripe nudged from nearly
+  invisible to a soft, readable grey.
+- **Scan panel declutters for the value type**: the float-only Rounding and
+  Tolerance controls are now hidden (not just greyed) for integer/text scans, so
+  the row collapses instead of leaving dead controls under Value Type. They
+  reappear when you pick Float/Double (Tolerance only in "Extreme" mode).
+- **Percentage scan fields hide until needed**: the "Compare by %" value and the
+  "Percent max" row now appear only when "Compare by %" is ticked (and the max
+  only for a "between" compare), instead of sitting greyed on every scan.
+- **The main window and Memory Viewer remember their size, position and panel
+  layout** across runs (window geometry and every splitter are saved on close,
+  restored on launch), instead of always reopening at the default 760x560 /
+  900x600.
+- **File > Load Recent now works.** It was a permanently empty menu; it now
+  lists the last 10 cheat tables you opened or saved (most recent first, full
+  path on hover), greys out ones that have since moved, and has a "Clear list".
+- **Paste records copied from Cheat Engine.** Ctrl+V in the cheat table now
+  accepts CE's `<CheatEntries>` XML clipboard format (addresses, types, pointer
+  offsets, groups) in addition to our own JSON, so records copied straight from a
+  CE session or a shared table snippet drop in.
+- **Table > Show Cheat Table Lua Script (Ctrl+Alt+L)** now works (was a dead menu
+  item). View and edit the table-level Lua that runs when the table loads, run it
+  on demand, and it is saved back into the `.CT`/JSON, so you can author trainer
+  logic, not just import a script that already runs.
+- **Help > Cheat Engine Help / Lua documentation** now open the shipped README /
+  `docs/SCRIPTING.md` in a rendered Markdown viewer (with an "Open on GitHub"
+  button), instead of being dead menu items; they fall back to the online copy
+  when the docs aren't installed next to the binary.
+- **Lua Engine now follows the attached process.** Attaching to a new target
+  re-points the shared Lua engine (and any open Lua Engine console) at it, and the
+  console binds the address list, so `getMemoryRecord`/`readInteger` etc. act on
+  the current process instead of a stale one (or failing when no table was loaded).
+- **Debugger highlights changed registers** (CE's cue): after each step or
+  breakpoint stop, the registers the instruction modified paint red (general
+  purpose and XMM0-15), so what an instruction touched reads at a glance. The
+  first stop of a session stays neutral.
+- **One shared Debugger window.** Opening it twice (the Memory Viewer's step
+  buttons, or Debug > Full debugger) used to spawn a second window whose
+  ptrace-attach then failed; now the existing one is raised instead, and it is
+  torn down cleanly when you attach to a different process.
+- **`--pid <N>`** attaches to a process on launch (no picker dialog).
+
+### Scripting / RE
+
+- Wayland global hotkeys wired into `GlobalHotkeyManager` (xdg-desktop-portal).
+- Lua: `findReferencedStrings`, `findCodeCaves`, `findAssemblyPattern`,
+  `disassembleRange`, `getIl2CppObjectLayout`; `cescan analyze` surfaces the
+  static RE toolkit from the shell. New `docs/SCRIPTING.md` + `examples/`.
+- `cescan scan` gained `--executable` / `--no-executable` (and `--no-writable`),
+  exposing the tri-state region filters the GUI already has, so a shell scan can
+  target code vs data the same way.
+- `cescan disasm` annotates a direct call/jmp target with its symbol, or its
+  `module+offset` when unnamed (e.g. `jmp 0x… ; sleep+0x2020`), matching the GUI
+  disassembler; register/indirect branches stay unannotated. RIP-relative data
+  references also get a `; -> symbol` / `; -> module+offset` note for what the
+  effective address points at (e.g. `mov rax, [0x…]  ; -> libc!environ`).
+- `cescan write` gained `--type string` (raw text) and `--type aob` (`"90 90 05"`
+  hex bytes), so you can patch code (NOP a branch) or write a string from the
+  shell, not just numeric values. Wildcards are rejected for an in-place byte write.
+- `cescan read --type <t>` interprets the bytes instead of dumping hex: an integer
+  (`123 (0x7b)`), float/double, pointer, or a `"string"` (with the size argument as
+  its length cap). Without `--type` it still hex-dumps as before.
+
+## v0.6.0: scanner performance overhaul (2026-07-16)
+
+Performance release. The value scanner (first scan and next scan) was rebuilt
+around the memory pipeline: cache-blocked reads, all cores on one region,
+resident-page skipping, SIMD numeric and byte-pattern compares, and coalesced
+next-scan reads. Results are unchanged, verified against a brute-force reference
+and clean under ASan/UBSan. In a same-machine head-to-head it is now the fastest
+scanner on Linux: a first scan is about 2x faster than Cheat Engine 7.7 and 30 to
+40x faster than scanmem, GameConqueror, and PINCE, with larger margins on some
+scans. A new [BENCHMARK.md](BENCHMARK.md) documents the full comparison and how
+to reproduce it.
+
+### Performance
+
+Heavy optimization of the memory scanner (finding values), with no change to
+results (verified against a brute-force reference across every value width,
+alignment, comparator, and both scan phases, and clean under ASan/UBSan).
+
+- **Cache-blocked first scan (~3x).** A worker read a region in 8 MiB chunks,
+  then scanned each chunk — but by scan time the chunk had been evicted from
+  cache and was re-fetched from RAM, so the value read cost twice. Reading in
+  small (128 KiB) chunks instead keeps the just-read data hot in L2 for the scan
+  (and the small reused read buffer stays cached too), so a 1 GiB scan runs at
+  ~13 GB/s instead of ~3.5. On this machine a sparse 1 GiB first scan dropped
+  ~0.28s to ~0.083s. Tune with `CE_SCAN_CHUNK_KB` if a different cache size
+  wants a different block.
+
+- **First scan now uses every core on a single big region.** Work was split
+  per memory region, so a process dominated by one large heap/mapping (common in
+  games) scanned on a single thread. Scanning is now split into fixed-size
+  chunks handed to threads as contiguous, address-ordered runs, so one big
+  region saturates all cores while the merged result stays sorted. Roughly 5x
+  faster on a one-region scan on a 12-thread machine.
+- **SIMD exact-value scan.** The hot path (an exact integer or float/double
+  over an aligned buffer) is vectorized with a runtime-selected AVX2 path and an
+  SSE2 baseline (scalar elsewhere), replacing a per-element function-pointer
+  compare. Float equality uses an ordered SIMD compare that matches C++ exactly
+  (NaN never matches, -0.0 equals 0.0). Rounded/truncated/extreme float searches
+  are vectorized too, via a superset reject (a window around the search value)
+  then the exact scalar check on the few survivors, so results are identical to
+  the scalar path (~12x faster on a 1 GiB rounded-float scan). Set
+  `CE_SCAN_SIMD=off|sse2|avx2` to override for testing.
+- **SIMD array-of-bytes and string scans (~2x).** An AOB/string scan checks
+  every unaligned offset, so it was compute-bound. It now anchors on one fixed
+  pattern byte and uses an SSE2 byte search to reject 16 non-matching offsets at
+  a time, verifying the full pattern only at candidates (a 6-byte AOB over 1 GiB
+  went 3.5 to 7.9 GB/s). Handles wildcard/nibble masks (anchors on the first
+  full byte; an all-wildcard pattern falls back to scalar) and leading
+  wildcards; case-insensitive string search stays scalar.
+- **Next scan is batched and multi-threaded.** Re-reading previous results used
+  one `process_vm_readv` syscall per address on a single thread; it now reads up
+  to 1024 addresses per syscall (scatter read) and fans big result sets across
+  cores (~8x on a large result set). It degrades gracefully: handles that cannot
+  be read concurrently, e.g. a socket-backed ceserver handle, stay
+  single-threaded, which also fixes a latent first-scan data race on those.
+- **Coalesced next-scan reads (~14x contiguous, ~5-9x tight strides).** Even
+  batched, the scatter read described each address as its own tiny iovec, so a
+  dense result (consecutive matched values after an unknown-value scan, or an
+  array field) cost the kernel millions of size-byte copies. Back-to-back
+  addresses are now merged into one large iovec per run (a 16.7M-result
+  contiguous next scan dropped ~1.7s to ~0.12s), and a batch whose matches are a
+  small stride apart (a struct-array field, gap <= 64 bytes) is read as one span
+  into a scratch buffer and scattered out instead of per-match (stride 8 ~8.9x,
+  16 ~7x, 32 ~5.8x, 64 ~4.5x). Larger strides and scattered results keep the
+  per-address scatter read; a fault on a span read falls back to it.
+- **Skip reserved-but-untouched memory on first scan.** Games map large address
+  ranges they never touch; those pages are demand-zero, and we were reading every
+  one of them. The first scan now consults `/proc/pid/pagemap` and reads only the
+  resident/swapped pages of anonymous regions, coalesced into runs. On a sparse
+  512 MiB region with a handful of touched pages that is ~80x faster; it does not
+  change results and is guarded three ways: only when an all-zero window can't
+  match the search (so 0/unknown searches still read everything), only when a
+  value can't straddle a page (aligned scans), and only for anonymous mappings
+  (a file-backed page still holds file data). Falls back to a full read if
+  pagemap is unavailable. Override with `CE_SCAN_PAGEMAP=off`.
+- **First scan stores its value stream once.** On a first scan every match's
+  "first value" equals its current value, yet both streams were written to disk,
+  duplicating a third of the output for a 4-byte type. The first scan now skips
+  the `first_values` stream and reads fall back to `values` (a later next scan
+  writes distinct first-values as before). About 25% less first-scan output; a
+  dense 16.7M-result first scan drops ~0.099s to ~0.074s.
+- **Compact result addresses (half the size).** A matched address was stored as
+  8 bytes; it is now a 4-byte offset from a per-shard frame base (a new frame
+  opens only when an address is >= 2^32 past the base, so usually one frame per
+  region). `address = frameBase + offset`. This halves the address storage of
+  every result, so the tool holds roughly twice as many results in the same
+  RAM/temp space, and large scans that spill past the OS page cache to real disk
+  are faster. On results that fit in cache the wall-clock is unchanged (these
+  scans are not disk-bound). Public `ScanResult` API is unchanged.
+- **No result-merge copy.** A scan wrote each worker's matches to its own file
+  and then concatenated them into one merged file, so every result byte was
+  written twice and read once more. The result now references the worker files
+  in place through a small manifest (`ScanResult` reads transparently across the
+  shards), which cut a dense first scan (16.7 M results) from ~0.44 s to ~0.10 s
+  and shaved the large next scan further. Public `ScanResult` API is unchanged.
+- Smaller win: results are appended without a redundant zero-fill.
+
+## v0.5.0 — Mono/Unity dissector, diagnostics, Lua table compatibility, debugger polish (2026-07-14)
+
+Feature release. The headline is a native **Mono/Unity dissector** (the biggest
+gap vs Cheat Engine for Linux gaming), plus a diagnostic logging system, a large
+batch of Lua functions real cheat tables need, `.CT` round-trip fixes verified
+against real downloaded tables, and a round of interactive-debugger polish.
+
+### Added
+
+- **Native Mono dissector (live).** An injected in-process agent
+  (`libcecore_mono_agent.so`) queries the Mono runtime for ground-truth class and
+  field layout (real offsets, types, static flags). Host side injects + parses it
+  into a model; browse it in **Tools ▸ Mono dissector...** (assemblies → classes →
+  fields, filter, double-click a field to add `base+offset` to the address list),
+  or from Lua via `monoDissect()`. `findMonoFunction(ns, class, method)` resolves a
+  method's address on demand (targeted JIT compile via the resident agent, never
+  mass-compiles). IL2CPP targets are detected and reported (live IL2CPP dissection
+  is a separate track).
+- **Diagnostic logging (`CE_LOG`).** Silent by default; `CE_LOG=ptrace:debug`
+  (per-category) or `CE_LOG=debug` and `CE_LOG_FILE=/path` turn on cecore logging
+  with no rebuild — e.g. the exact `process_vm_readv` error behind a blank memory
+  pane.
+- **Lua functions real tables use:** `isKeyPressed` (evdev), the timer API
+  (`createTimer`/`timer_setInterval`/`timer_onTimer`), `createStringlist` +
+  `stringlist_*`, `selectFilePath`, `playSound`, and `createSimpleHook` /
+  `removeSimpleHook` (a safe jmp-detour hook that refuses to patch
+  position-dependent code rather than corrupt it).
+- **Debugger:** conditional breakpoints (a Lua expression over register state;
+  the debugger auto-continues when it's false), hardware **data breakpoints**
+  (break on write/access), a **Break-on-exceptions** menu (SIGSEGV/…), breakpoint
+  **enable/disable** checkboxes and **hit counts**.
+- **Memory Viewer** got its own CE-style menu bar and a **stacktrace** panel; its
+  step buttons now open the Debugger instead of being dead stubs.
+
+### Fixed
+
+- **`.CT` compatibility.** Tables are detected by content, not a case-sensitive
+  extension, so an uppercase `GAME.CT` or a mislabelled table loads. Fixed three
+  saver bugs found against 14 real downloaded tables (address over-escaping,
+  Auto-Assembler records mis-typed, negative pointer offsets dropped); all 14 now
+  round-trip faithfully.
+- **Theme.** The auto-assembler console and other custom-painted widgets (structure
+  dissector, scan-results highlight, form-designer canvas, disassembler-preference
+  swatches) now follow light/dark instead of being hardcoded dark.
+
+---
+
+## v0.4.1 — Theme, memory-access, and packaging fixes (2026-07-13)
+
+Bug-fix release on top of v0.4.0.
+
+### Fixes
+
+- **Light/dark theme now works.** Toggling "Dark theme" in Settings applies live
+  (no restart), and the startup default and the Settings checkbox agree (both
+  default to light). The two stylesheets moved into a shared `gui/theme` module so
+  startup and the dialog use the same sheets.
+- **Memory browser no longer fails silently.** When a process can't be read
+  because of the kernel's ptrace policy (`kernel.yama.ptrace_scope`), the
+  disassembler shows a clear explanation instead of a blank pane, and opening such
+  a process pops a warning naming the exact remedies. This is why "browse memory"
+  appeared to work only on some processes.
+
+### Packaging
+
+- **Automatic ptrace access.** The `.deb` now runs `setcap cap_sys_ptrace+ep` on
+  the installed binaries at install time (via a postinst; depends on `libcap2-bin`),
+  so scanning/browsing/debugging works without running as root. For AppImage or
+  ad-hoc runs, the "process not readable" dialog has a one-click **Grant access…**
+  button (via `pkexec`).
+- **Working AppImage.** The AppImage is now built with linuxdeploy + the Qt plugin,
+  so it bundles the Qt platform plugins and actually runs (the earlier hand-rolled
+  bundle was missing them).
+
+## v0.4.0 — CLI / headless parity for every GUI tool (2026-07-13)
+
+Everything the GUI can do is now doable from the terminal. The guiding principle:
+a GUI action must only gather input and call a shared core function (in `cecore`
+or exposed via Lua), never hold its own copy of the logic, so the terminal path
+and the GUI path run the same code and any GUI-only failure is provably a GUI bug.
+Every item below is exercised by an automated test in `cecore_test`
+(`test_lua_headless_bindings`, `test_lua_ceserver_connect`, `test_trainer_generation`);
+the full suite is green.
+
+### Headless runner
+
+- **`cescan lua <file> | -e "<code>" | -`** plus a REPL — runs the same `LuaEngine`
+  the GUI console uses, backed by a headless in-memory address list, so the whole
+  Lua API (now ~205 functions) works from the terminal.
+
+### New Lua tool bindings (each calls the same core code as the GUI)
+
+- **Cheat table:** `saveTable(path)` / `loadTable(path)` (the GUI's `.CT`/JSON format).
+- **Create trainer:** `generateTrainer(path)` compiles a standalone trainer binary;
+  `generateTrainerSource()` returns the C source.
+- **Pointer scanner:** `pointerScan(target[, maxDepth[, maxOffset[, opts]]])`.
+- **Structure dissect:** `dissectStructure(addr | {addrs}, size)` — the
+  discriminating-field detector across N instances.
+- **Detect Mono/.NET:** `getManagedRuntimes()`.
+- **Find what accesses / writes:** `findWhatWrites` / `findWhatAccesses`
+  (hardware data watchpoint via the code finder).
+- **Break and trace:** `breakAndTrace(start[, maxSteps[, opts]])`.
+- **Branch mapper:** `branchMap([secs[, tid]])` / `branchMapAvailable()` (hardware LBR).
+- **Debug register / stack:** `debug_getRegisters` / `debug_setRegister` /
+  `debug_getStack`; `debug_pumpEvents` now publishes the full GP register set.
+- **Find statics:** `findStatics([module])`.
+- **Connect to ceserver:** `connectToCeserver(host, port, pid)` installs a remote
+  process as the target so the whole read/write/scan API works over the network.
+- **Address-list grouping:** `createGroup([desc])` and memory-record `.Indent`
+  (indent / outdent).
+
+### Fixes
+
+- **Trainer code generation:** a whole-number float value (e.g. `9999`) was emitted
+  as `9999f` — an invalid integer-with-`f`-suffix that failed to compile. Now forces
+  a fractional part (`9999.0f`), guards against inf/nan, and defines `_GNU_SOURCE` in
+  the generated source so `process_vm_readv`/`writev` use their real `ssize_t`
+  prototype (was implicitly declared, truncating the 64-bit return on x86-64). This
+  also fixed the GUI's Create Trainer.
+
+## v0.3.0 — Complete interactive debugger, ceserver, and security hardening (2026-07-12)
+
+A large release that finishes the interactive debugger, turns cecore into a
+remote-debug **server**, and closes the untrusted-`.CT` security gaps. Every
+change below shipped CI-green (build + ASan/UBSan) with backend tests and a
+headless offscreen-Qt GUI smoke test.
+
+### Interactive debugger — complete (#15, #16)
+
+- **Real Lua `debug_*` API** (was a facade): `debug_setBreakpoint` plants a real
+  software breakpoint through a `LuaEngine`-owned `DebugSession`; hits are queued
+  on the tracer thread and drained by `debug_pumpEvents` on the Lua thread, which
+  publishes the register context and fires the CE-compatible `debugger_onBreakpoint`.
+  The handler can **read and rewrite registers**; `debug_removeBreakpoint` unplants.
+- **Hardware data watchpoints**: a non-zero `type` arms DR0-3 on every thread; the
+  event loop reports the watched address on `TRAP_HWBKPT` and disarms the debug
+  registers before detach (verified: the tracee survives detach).
+- **Debugger window**: editable GP/R8-R15/**XMM** registers, a thread switcher,
+  a memory/hex pane, and a disassembly right-click menu (set breakpoint / NOP).
+
+### Be a ceserver, not just a client (#24)
+
+- New `CeserverServer` serves the CE ceserver protocol over TCP:
+  GETVERSION, OPENPROCESS, CLOSEHANDLE, READ/WRITEPROCESSMEMORY, VIRTUALQUERYEXFULL
+  (regions), GETARCHITECTURE, and CREATETOOLHELP32SNAPSHOTEX (threads + modules).
+  A remote CE (or another cecore) can now attach for memory access and inspection.
+
+### Security hardening (#6)
+
+- `shellExecute` and the `write*Local` self-memory functions are **default-deny**,
+  enabled only by the out-of-band `CECORE_LUA_ALLOW_UNSAFE=1`.
+- Every Lua binding is wrapped by a central exception firewall (a C++ exception
+  can no longer unwind through liblua's C frames).
+
+### Analysis, symbols, and formats
+
+- "Find what addresses this instruction accesses" (`findInstructionAccesses`),
+  the `computeEffectiveAddress` primitive, and length-preserving NOP with undo.
+- Multi-thread all-stop Break&Trace; build-id / `.gnu_debuglink` stripped-symbol
+  resolution; pointer rescan-by-value.
+- Embedded `<Forms>` are now preserved across `.CT` load/save.
+- Lua additions: `getRegionInfo`, `getNameFromAddress` (hex fallback),
+  `nopInstruction`, `getSymbolInfo`, `reinitializeSymbolhandler`.
+
+---
+
+## v0.2.1 — AOB injection fix + 32-bit/WoW64/Wine support (2026-07-10)
+
+A correctness release headlined by a fix that makes **AOB injection scripts
+actually work**, plus the 32-bit / WoW64 / Wine support that landed since v0.2.0.
+
+### Headline fix — AOB injection scripts
+
+The standard auto-assembler idiom
+(`aobscanmodule(INJECT, game, <pattern>)` + `alloc` + `INJECT: jmp newmem`)
+silently failed to patch its target. The auto-assembler's label pre-pass built
+its "already declared" set from `alloc`/`define`/`registersymbol`/`label` but
+**not** the `aobscan` family, so it auto-declared a phantom `label(INJECT)` that
+shadowed the scanned address with a zero-address forward label. The injection
+`jmp` and stolen bytes were written into the code cave instead of over the
+target instruction, while `execute()` still reported success.
+
+Now the result name of `aobscan` / `aobscanmodule` / `aobscanregion` /
+`aobscanall` resolves to the scanned address when used as an injection label, so
+`INJECT:` lands the hook where it belongs. AOB *scanning* was always correct;
+only the inject-label binding was broken. Verified end-to-end on **64-bit
+no-PIE, 64-bit PIE (ASLR), and 32-bit** targets, guarded by a regression test
+(`test_autoassembler_aobscan_inject_label`).
+
+### Also since v0.2.0
+
+- **32-bit code injection (WoW64).** Detects 32-bit code execution,
+  assembles/disassembles caves in the target's actual code bitness, and uses a
+  CS-aware remote syscall so hooks and allocations work in 32-bit and WoW64
+  processes.
+- **Wine / Proton targets.** Enumerates Wine PE modules with correct WoW64
+  attribution and bitness, so `aobscanmodule(name, game.exe, ...)` resolves
+  against the right module.
+- **Injection reliability.** Fixed a ptrace self-conflict that could block code
+  injection outright.
+- **Auto-assembler workflow.** Pre-filled injection templates from the memory
+  browser, syntax-highlighted AA scripts, and saving AA scripts as toggleable
+  cheat-table entries.
+- **Scanning & UI.** Live progress bar during threaded scans, save/export
+  code-finder findings, and a simplified Open Process picker.
+
+Single-player and reverse-engineering focus; does not target multiplayer
+anti-cheat. Regression suite: 233 assertions.
+
+---
+
+## v0.2.0 — Real-time results, CE-parity scanning, hardened core (2026-07-06)
+
+A large stability, correctness, and feature release. The project now covers the
+full Cheat Engine workflow natively on Linux, with nine subsystems independently
+audited and every reported defect verified and fixed with a regression test
+where practical.
+
+### Highlights
+
+- **Real-time scan results.** The scan-result and address lists refresh live
+  from target memory (500 ms), highlight changed values, and cost nothing on
+  million-row result sets because only the visible rows are re-read. F5 forces
+  an immediate refresh.
+- **CE-parity float scanning.** Float scans default to "Rounded" and match at
+  the entered decimal precision (within half the last place), like Cheat Engine.
+- **Persistent disassembler annotations.** User comments and labels are saved
+  with the cheat table (`.CT` and JSON), keyed module-relative so they survive
+  ASLR.
+- **Batch address-list editing.** Set the value of every selected entry at once,
+  alongside batch freeze-mode and type changes.
+- **Complete auto-assembler template set** (Ctrl+I): Allocate memory, Code
+  injection, AOB injection, Full code injection, Pointer injection, Cheat table
+  framework, and Lua script.
+
+### Correctness and safety fixes
+
+Nine subsystems were reviewed line by line (Lua bindings, auto-assembler,
+disassembler, pointer scanner, scan-comparison engine, ptrace/injector platform
+layer, ELF/DWARF parsers, scan-result storage, analysis). Notable fixes:
+
+- **Platform:** near-allocation used `MAP_FIXED` where `MAP_FIXED_NOREPLACE` was
+  intended (could silently unmap and crash a live target region);
+  `createRemoteThread` now quiesces sibling threads to avoid a loader-lock
+  deadlock; hardware-breakpoint `PTRACE_PEEKUSER` reads now clear/check `errno`.
+- **Scanner:** the "all types" scan stored variable-width records that desynced
+  from the address list and crashed next-scan (now uniform records); short
+  backing-file writes (disk full) are detected instead of returning zeroed
+  garbage; sharded pointer scans read all regions so a path through a static
+  intermediate is never lost.
+- **Auto-assembler:** a failed line during execute now rolls the target back
+  cleanly instead of leaving a half-applied hook; `//` comment stripping is
+  quote-aware so `db "http://x"` survives.
+- **Lua:** fixed a use-after-free of the Lua state through GUI timer/widget
+  callbacks on shutdown, bounded file reads, non-throwing filesystem calls,
+  target-width pointer reads, and an uncapped scan-result table.
+- **Debugger:** breakpoint conditions from untrusted tables now run in a
+  sandboxed, execution-bounded Lua state and can no longer hang the debugger.
+
+~40,000 lines across ~158 files; 229-assertion regression suite.
+
+---
+
+## v0.1.1 — PortProton/Lutris/Heroic support + deferred-list catch-up (2026-05-21)
+
+Patch release with a stack of features and fixes since v0.1.0. **Most relevant
+user fix:** PortProton / Lutris / Heroic / Bottles Wine-wrapped games now show up
+in the Open Process dialog
+([#2](https://github.com/wleeaf/cheat-engine-linux/issues/2)).
+
+### Fixes
+
+- **PortProton / Lutris / Heroic / Bottles compatibility** — process enumerator
+  now picks up Wine-wrapped games regardless of what their `/proc/<pid>/comm`
+  reads; filter and tooltip prefer the recognisable `.exe` name from `cmdline`.
+- **CI hardening** — DWARF code path compiles cleanly with `libdw-dev` (was
+  missing `<dwarf.h>`).
+
+### New features since v0.1.0
+
+- **Auto-assembler:** `{$if}/{$else}/{$endif}` conditionals; `@@:` anonymous
+  labels with `@F`/`@B`; `globalalloc()` and `break`; inline `{$ccode}` blocks
+  via libtcc.
+- **Debugger:** LBR tracer via `perf_event_open` + Branch Mapper window; Intel PT
+  raw-capture wrapper; follow fork/vfork/clone/exec; ARM64 + ARM32 CONTEXT
+  marshalling; ceserver `CMD_GETSYMBOLLISTFROMFILE`; in-process VEH shim.
+- **Analysis & symbols:** find-statics pass; DWARF function-name lookup in the
+  disassembler pane.
+- **GUI:** Form Designer (visual Lua-trainer builder); File Patcher; ELF
+  Inspector; Snapshot/freezer engine; Process Watcher auto-attach.
+- **Lua:** `Stream` and `StringList` userdata; `setProcessName`/`getProcessName`.
+- **Process-name camouflage** (documented limits): `prctl(PR_SET_NAME)` binding
+  plus optional kernel-side `/proc/<pid>` filtering via `cecore_kmod`
+  (CAP_SYS_ADMIN, up to 32 PIDs). Does **not** defeat multiplayer anti-cheat.
+- **Speedhack:** now covers `clock_nanosleep`, `usleep`, `sleep`, `select`,
+  `poll`, `SDL_GetTicks`, `SDL_Delay`.
+- **Network:** Mono soft-debugger client. **i18n:** `QTranslator` scaffolding.
+  **GPU:** `CudaSearch` foundation (gated behind CUDA).
+
+---
+
+## v0.1.0 — first tagged release (2026-05-08)
+
+First tagged release: Linux-native C++23/Qt6 reimplementation of Cheat Engine.
+Build green on Ubuntu 24.04, regression suite passing, the surface below
+exercised end-to-end via tests or interactive use.
+
+- **Memory scanning:** numeric / string (UTF-8/Unicode/codepage via iconv) / AOB
+  (`??` wildcards) / binary (bitmask) / all-types / grouped / custom Lua-formula;
+  full compare-op set; float rounding modes; multi-threaded with progress +
+  cancellation; disk-backed result buffers.
+- **Pointer scanning:** reverse-BFS path discovery with depth/offset/alignment/
+  static-only filters; distributed sharding; save/load, sort, dedup-merge,
+  rescan against a new target.
+- **Debugger (local + remote):** ptrace attach; software int3 + hardware DR0-3
+  breakpoints; conditional Lua breakpoints, one-shot, thread-filtered;
+  single-step (Into/Over/Out), break-and-trace; frame-pointer stack trace;
+  GDB remote client; full **ceserver** remote target support.
+- **Auto-assembler:** `alloc` (±2GB near-alloc), `dealloc`, multi-pass labels;
+  `aobscan*`; data directives; `loadbinary`/`loadlibrary`/`createthread`;
+  `struct/endstruct`; `{$try}/{$except}`; `{$lua}...{$asm}` preprocess blocks;
+  plugin-extensible commands.
+- **Code analysis:** module dissect + call graph; referenced strings;
+  RIP-relative scan; code-cave detection; assembly-pattern scan;
+  find-what-accesses/writes with per-hit register snapshots.
+- **Cheat tables:** CE-compatible `.CT` XML; password-wrapped `.CETRAINER`;
+  embedded enable/disable AA + Lua scripts; persisted structure definitions;
+  standalone trainer generator.
+- **Lua (5.3):** typed memory R/W; `AOBScan`; `assemble`/`disassemble`/
+  `autoAssemble`; process/module/thread enumeration; `MemoryRecord`/`AddressList`
+  userdata; GUI component factory; hotkeys, threads, custom types, structures.
+- **GUI (Qt6):** process selection + inline scan controls; memory browser (hex +
+  disassembler split, symbol + RIP-relative + DWARF source-line annotations);
+  find-what-accesses window; tracer; breakpoint list; register editor (incl. FPU);
+  thread/stack/regions/heap/module/xref views; six-tab settings; ceserver
+  connect; Lua console; Catppuccin dark theme.
+- **Symbols:** ELF `.dynsym`/`.symtab`; `module!symbol+offset` arithmetic;
+  `/proc/kallsyms`; optional DWARF line tables via libdw.
+- **Plugin ABI:** structured C ABI (`plugins/cecore_plugin.h`) with a host
+  callback vtable; legacy symbol-based ABI as fallback.
+- **Network / remote:** ceserver TCP client (24 of ~40 wire commands);
+  `RemoteProcessHandle`/`RemoteDebugger` adapters; zlib compression; GDB client.
+- **Optional kernel helper:** `cecore_kmod` with CAP_SYS_ADMIN-gated ioctls for
+  privileged VM access and phys-mem R/W. Process hiding intentionally omitted.
+- **Speedhack:** LD_PRELOAD time-function intercept with a live shared-memory
+  multiplier. **Vulkan overlay:** explicit loader layer + X11 click-through OSD.
+
+**Known limits at the time:** no kernel process hiding (rootkit-style stealth is
+out of scope); DWARF needs `libdw-dev`; ARM/ARM64 backend not exercised in tests;
+Form Designer not yet implemented; ceserver `get/setThreadContext` x86_64-only.
+
+Thanks to @Twig6943 for prompting the build polish that made this release
+possible (#1).

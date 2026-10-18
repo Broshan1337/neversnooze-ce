@@ -1,0 +1,184 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write   # action-gh-release needs this to upload assets / create the release
+
+jobs:
+  # A tag must name the version the sources build: otherwise the release would
+  # publish files and binaries that report another version.
+  version:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Tag matches the project version
+        run: |
+          project=$(sed -n 's/^project(cecore VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+          tag="${GITHUB_REF_NAME#v}"
+          echo "tag $tag, CMakeLists.txt $project"
+          test "$tag" = "$project"
+          grep -q "<release version=\"$tag\"" packaging/*.metainfo.xml
+          grep -q "^## v$tag\b" CHANGELOG.md
+
+  arm32-compatibility:
+    uses: ./.github/workflows/arm32-compatibility.yml
+
+  arm64-compatibility:
+    uses: ./.github/workflows/arm64-compatibility.yml
+
+  wine-compatibility:
+    uses: ./.github/workflows/wine-compatibility.yml
+
+  x32-compatibility:
+    uses: ./.github/workflows/x32-compatibility.yml
+
+  isa-compatibility:
+    uses: ./.github/workflows/isa-compatibility.yml
+
+  appimage:
+    needs: [version, wine-compatibility, arm64-compatibility, x32-compatibility, arm32-compatibility, isa-compatibility]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Lua 5.3 is vendored under third_party/lua and built by CMake — no
+      # upstream checkout needed.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends \
+            build-essential \
+            gcc-multilib \
+            cmake \
+            ninja-build \
+            qemu-system-arm \
+            mono-runtime-sgen mono-mcs libmonosgen-2.0-1 \
+            qt6-base-dev \
+            libcapstone-dev \
+            zlib1g-dev \
+            libdw-dev \
+            libasound2-dev \
+            libsoundtouch-dev \
+            libfuse2t64 \
+            rpm \
+            ca-certificates \
+            file \
+            wget \
+            imagemagick
+
+      - name: Cache FetchContent + build directory
+        uses: actions/cache@v6
+        with:
+          path: build/_deps
+          key: cecore-deps-release-${{ runner.os }}-keystone-0.9.2-v2
+
+      - name: Configure + build (Release)
+        run: |
+          cmake -S . -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCECORE_REQUIRE_NATIVE_CALL_I386=ON \
+            -DCMAKE_INSTALL_PREFIX=/usr
+          cmake --build build -j"$(nproc)"
+
+      - name: Run regression suite
+        timeout-minutes: 15   # fail fast on a hang instead of burning the whole job
+        run: |
+          ./build/cecore_test
+          ./build/cecore_deep_test
+          ./build/cecore_compatibility_test
+          ./build/table_persistence_integration
+          python3 test/table_json_gate.py build --report build/compatibility-evidence/table-json.json
+          python3 test/ceserver_compatibility_gate.py build --report build/compatibility-evidence/ceserver.json
+          python3 test/gdb_transport_gate.py build --require-qemu --report build/compatibility-evidence/gdb-transport.json
+          python3 test/gdb_gui_gate.py build --require-qemu --report build/compatibility-evidence/gdb-gui.json
+          python3 test/elf_debug_gate.py build --require-i386 --report build/compatibility-evidence/elf-debug.json
+          python3 test/autoasm_module_gate.py build --report build/compatibility-evidence/autoasm-modules.json
+          python3 test/native_syscall_gate.py build --report build/compatibility-evidence/native-syscalls.json
+          python3 test/code_write_gate.py build --output build/compatibility-evidence/code-write.log --report build/compatibility-evidence/code-write.json
+          python3 test/memory_image_gate.py build --output build/compatibility-evidence/memory-image.log --report build/compatibility-evidence/memory-image.json
+          python3 test/native_call_gate.py build --require-i386 --report build/compatibility-evidence/native-injector.json
+          python3 test/mono_compatibility_gate.py build --report build/compatibility-evidence/mono-runtime.json
+          python3 test/mono_compatibility_gate.py build --embedded --report build/compatibility-evidence/mono-embedded.json
+          python3 test/gui_runtime_gate.py build --report build/compatibility-evidence/native-frontends.json
+          for test in gui_debugger_smoke gui_theme_smoke gui_guest_scan_smoke \
+                      gui_structdissect_smoke gui_hexview_smoke gui_disasm_smoke \
+                      gui_search_smoke gui_changeaddr_smoke gui_luaconsole_smoke \
+                      gui_codefinder_smoke gui_lifecycle_smoke; do
+            QT_QPA_PLATFORM=offscreen "./build/$test"
+          done
+          python3 test/gui_injection_gate.py build --report build/compatibility-evidence/gui-injection.json
+          python3 test/cli_usability_test.py build/cescan
+
+      - name: Build .deb and .rpm packages
+        run: (cd build && cpack -G DEB -G RPM)
+
+      - name: Download required Wine compatibility evidence
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wine-*-evidence
+          path: build/compatibility-evidence
+          merge-multiple: true
+
+      - name: Download required ARM64 syscall evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: arm64-syscall-evidence
+          path: build/compatibility-evidence
+
+      - name: Download required ARM32 register evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: arm32-register-evidence
+          path: build/compatibility-evidence/arm32
+
+      - name: Download required x32 kernel evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: x32-kernel-evidence
+          path: build/compatibility-evidence/x32
+
+      - name: Download required ARM64 frontend evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: arm64-frontend-evidence
+          path: build/compatibility-evidence
+
+      - name: Build AppImage
+        run: |
+          bash packaging/build-appimage.sh
+          file build/NeversnoozeCE-*-x86_64.AppImage
+
+      - name: Checksums
+        run: |
+          cd build
+          for f in NeversnoozeCE-*-x86_64.AppImage neversnooze-ce_*_amd64.deb neversnooze-ce-*.rpm; do
+            sha256sum "$f" > "$f.sha256"
+          done
+
+      # Test evidence stays with the workflow run; the release page carries
+      # only what people download.
+      - name: Keep the compatibility evidence with the run
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-compatibility-evidence
+          path: build/compatibility-evidence
+          if-no-files-found: error
+
+      - name: Upload packages to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/NeversnoozeCE-*-x86_64.AppImage
+            build/NeversnoozeCE-*-x86_64.AppImage.sha256
+            build/neversnooze-ce_*_amd64.deb
+            build/neversnooze-ce_*_amd64.deb.sha256
+            build/neversnooze-ce-*.rpm
+            build/neversnooze-ce-*.rpm.sha256
+          fail_on_unmatched_files: true
+          generate_release_notes: false

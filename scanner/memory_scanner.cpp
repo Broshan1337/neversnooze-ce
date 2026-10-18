@@ -1,0 +1,3421 @@
+#include <charconv>
+#include <bit>
+#include <array>
+#include "scanner/memory_scanner.hpp"
+
+#include <thread>
+#include <exception>
+#include <mutex>
+#include <sstream>
+#include <fstream>
+#include <cstring>
+#include <cmath>
+#include <algorithm>
+#include <type_traits>
+#include <stdexcept>
+#include <cctype>
+#include <cerrno>
+#include <limits>
+#include <optional>
+#include <cstdlib>
+#include <csetjmp>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/file.h>
+#include <signal.h>
+#include <chrono>
+#include <iconv.h>
+#if defined(__x86_64__)
+#include <immintrin.h>   // SIMD exact-match scanning (SSE2 baseline + runtime AVX2)
+#endif
+
+extern "C" {
+#include <lua.h>
+#include <lauxlib.h>
+#include <lualib.h>
+}
+#include "scripting/lua_sandbox.hpp"
+
+namespace ce {
+
+constexpr ByteOrder nativeScanByteOrder=std::endian::native==std::endian::big ? ByteOrder::Big : ByteOrder::Little;
+
+template<typename T>
+T swapScanScalar(T value) {
+    auto bytes=std::bit_cast<std::array<uint8_t,sizeof(T)>>(value);
+    std::reverse(bytes.begin(),bytes.end());return std::bit_cast<T>(bytes);
+}
+template<typename T>
+T readScanScalar(const uint8_t* bytes,ByteOrder order) {
+    T value{};std::memcpy(&value,bytes,sizeof(T));
+    if constexpr (sizeof(T)>1) if (order!=nativeScanByteOrder) value=swapScanScalar(value);
+    return value;
+}
+
+// ── Value size lookup ──
+
+size_t MemoryScanner::valueSizeFor(ValueType vt) {
+    switch (vt) {
+        case ValueType::Byte:    return 1;
+        case ValueType::Int16:   return 2;
+        case ValueType::Int32:   return 4;
+        case ValueType::Int64:   return 8;
+        case ValueType::Pointer: return sizeof(uintptr_t);
+        case ValueType::Float:   return 4;
+        case ValueType::Double:  return 8;
+        case ValueType::String:  return 1;
+        case ValueType::UnicodeString: return 2;
+        default:                 return 4;
+    }
+}
+
+// Test-only override of the SIMD dispatch path: -1 = detect from CPU/env,
+// otherwise a SimdMode value (0=Scalar, 1=SSE2, 2=AVX2). simdMode()'s CPU/env
+// choice is cached for the process lifetime, so the differential scan test uses
+// this to exercise scalar/SSE2/AVX2 in one process. Never set in production;
+// callers must only force a mode the CPU actually supports (AVX2 target code
+// would SIGILL otherwise). External linkage so the test can set it.
+std::atomic<int> g_scanSimdOverride{-1};
+
+// ── Comparison functions ──
+
+namespace {
+
+std::string trimCopy(const std::string& value) {
+    size_t start = 0;
+    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start])))
+        ++start;
+    size_t end = value.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1])))
+        --end;
+    return value.substr(start, end - start);
+}
+
+std::string lowerCopy(const std::string& value) {
+    std::string out = value;
+    std::transform(out.begin(), out.end(), out.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return out;
+}
+
+std::string unquoteCopy(const std::string& value) {
+    auto trimmed = trimCopy(value);
+    if (trimmed.size() >= 2) {
+        char first = trimmed.front();
+        char last = trimmed.back();
+        if ((first == '"' && last == '"') || (first == '\'' && last == '\''))
+            return trimmed.substr(1, trimmed.size() - 2);
+    }
+    return trimmed;
+}
+
+bool parseInt64Token(const std::string& text, int64_t& out) {
+    auto token = trimCopy(text);
+    if (token.empty()) return false;
+    errno = 0;
+    char* end = nullptr;
+    long long parsed = std::strtoll(token.c_str(), &end, 0);
+    if (errno != 0 || end == token.c_str() || *end != '\0')
+        return false;
+    out = static_cast<int64_t>(parsed);
+    return true;
+}
+
+bool parseDoubleToken(const std::string& text, double& out) {
+    auto token = trimCopy(text);
+    if (token.empty()) return false;
+    // Parse locale-independently: std::strtod honours the C locale, which Qt sets
+    // to comma-decimal, so "3.14" would parse as 3. Accept both '.' and ',' and
+    // parse with '.' via std::from_chars (always locale-independent).
+    for (auto& c : token) if (c == ',') c = '.';
+    // from_chars accepts a leading '-' but NOT a leading '+' (unlike strtoll, which
+    // parseInt64Token uses), so skip one so "+3.14" parses like "+100" does.
+    size_t begin = (!token.empty() && token[0] == '+') ? 1 : 0;
+    double parsed = 0;
+    auto [ptr, ec] = std::from_chars(token.data() + begin, token.data() + token.size(), parsed);
+    if (ec != std::errc() || ptr != token.data() + token.size())
+        return false;
+    out = parsed;
+    return true;
+}
+
+bool parseSizeToken(const std::string& text, size_t& out) {
+    auto token = trimCopy(text);
+    if (token.empty()) return false;
+    errno = 0;
+    char* end = nullptr;
+    unsigned long long parsed = std::strtoull(token.c_str(), &end, 0);
+    if (errno != 0 || end == token.c_str() || *end != '\0')
+        return false;
+    if (parsed > std::numeric_limits<size_t>::max())
+        return false;
+    out = static_cast<size_t>(parsed);
+    return true;
+}
+
+bool isUtf8Encoding(const std::string& encoding) {
+    auto normalized = lowerCopy(trimCopy(encoding));
+    return normalized.empty() || normalized == "utf8" || normalized == "utf-8";
+}
+
+}  // end anonymous namespace: encodeStringBytes/decodeStringBytes need external linkage
+   // (the header declares them; the GUI decodes String scan results with decodeStringBytes)
+
+std::vector<uint8_t> encodeStringBytes(const std::string& text, const std::string& encoding) {
+    if (isUtf8Encoding(encoding))
+        return {text.begin(), text.end()};
+
+    iconv_t cd = iconv_open(encoding.c_str(), "UTF-8");
+    if (cd == reinterpret_cast<iconv_t>(-1))
+        throw std::invalid_argument("unsupported string encoding: " + encoding);
+
+    size_t inLeft = text.size();
+    char* inPtr = const_cast<char*>(text.data());
+    std::vector<uint8_t> out(std::max<size_t>(16, text.size() * 4 + 8));
+    char* outPtr = reinterpret_cast<char*>(out.data());
+    size_t outLeft = out.size();
+
+    while (true) {
+        size_t converted = iconv(cd, &inPtr, &inLeft, &outPtr, &outLeft);
+        if (converted != static_cast<size_t>(-1))
+            break;
+        if (errno != E2BIG) {
+            iconv_close(cd);
+            throw std::invalid_argument("string encoding conversion failed for " + encoding);
+        }
+
+        size_t used = out.size() - outLeft;
+        out.resize(out.size() * 2);
+        outPtr = reinterpret_cast<char*>(out.data() + used);
+        outLeft = out.size() - used;
+    }
+
+    out.resize(out.size() - outLeft);
+    iconv_close(cd);
+    return out;
+}
+
+// The code unit width of a UTF-16/UCS-2 (2) or UTF-32/UCS-4 (4) encoding name,
+// 1 for anything else. Exact names only: CP932 and ISO-8859-16 are byte
+// encodings although their names hold "32" and "16".
+static size_t encodingUnitWidth(const std::string& encoding) {
+    std::string upper = encoding;
+    for (auto& c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    // iconv also accepts these without the dash.
+    if (upper.starts_with("UTF") && !upper.starts_with("UTF-")) upper.insert(3, "-");
+    if (upper.starts_with("UCS") && !upper.starts_with("UCS-")) upper.insert(3, "-");
+    static constexpr std::string_view wide2[] = {"UTF-16", "UTF-16LE", "UTF-16BE", "UCS-2", "UCS-2LE", "UCS-2BE",
+                                                 "UCS-2-INTERNAL", "UCS-2-SWAPPED"};
+    static constexpr std::string_view wide4[] = {"UTF-32", "UTF-32LE", "UTF-32BE", "UCS-4", "UCS-4LE", "UCS-4BE",
+                                                 "UCS-4-INTERNAL", "UCS-4-SWAPPED"};
+    for (auto name : wide2) if (upper == name) return 2;
+    for (auto name : wide4) if (upper == name) return 4;
+    return 1;
+}
+
+std::string decodeStringBytes(const uint8_t* data, size_t len, const std::string& encoding) {
+    // Inverse of encodeStringBytes: interpret `len` code-page bytes as UTF-8 text for
+    // display. A UTF-8 (or empty) encoding is already UTF-8; an unavailable charset
+    // passes through unchanged; bytes that don't map are skipped so display never throws.
+    if (isUtf8Encoding(encoding))
+        return std::string(reinterpret_cast<const char*>(data), len);
+
+    iconv_t cd = iconv_open("UTF-8", encoding.c_str());
+    if (cd == reinterpret_cast<iconv_t>(-1))
+        return std::string(reinterpret_cast<const char*>(data), len);
+
+    char* inPtr = const_cast<char*>(reinterpret_cast<const char*>(data));
+    size_t inLeft = len;
+    // A bad code unit is skipped whole: skipping one byte of a UTF-16 unit
+    // would misalign every character after it.
+    const size_t unit = encodingUnitWidth(encoding);
+    std::string out(len * 4 + 8, '\0');
+    char* outPtr = out.data();
+    size_t outLeft = out.size();
+    while (inLeft) {
+        size_t r = iconv(cd, &inPtr, &inLeft, &outPtr, &outLeft);
+        if (r != static_cast<size_t>(-1)) continue;
+        if (errno == E2BIG) {
+            size_t used = out.size() - outLeft;
+            out.resize(out.size() * 2);
+            outPtr = out.data() + used;
+            outLeft = out.size() - used;
+        } else {                     // EILSEQ / EINVAL: replace the offending unit
+            const size_t skip = std::min(unit, inLeft);
+            inPtr += skip; inLeft -= skip;
+            static constexpr char replacement[] = "\xEF\xBF\xBD";   // U+FFFD
+            if (outLeft < 3) {
+                size_t used = out.size() - outLeft;
+                out.resize(out.size() * 2 + 3);
+                outPtr = out.data() + used;
+                outLeft = out.size() - used;
+            }
+            std::memcpy(outPtr, replacement, 3);
+            outPtr += 3; outLeft -= 3;
+        }
+    }
+    out.resize(out.size() - outLeft);
+    iconv_close(cd);
+    return out;
+}
+
+namespace {  // reopen the anonymous namespace for the remaining file-local helpers
+
+template<typename T>
+using CompareFn = bool(*)(T current, T scanVal, T scanVal2);
+
+template<typename T> bool cmpExact(T c, T v, T)          { return c == v; }
+template<typename T> bool cmpGreater(T c, T v, T)        { return c > v; }
+template<typename T> bool cmpLess(T c, T v, T)           { return c < v; }
+// Auto-order the bounds so "between 200 and 100" means the same as "between 100
+// and 200" (a value between min and max is unambiguous); otherwise reversed input
+// silently finds nothing.
+template<typename T> bool cmpBetween(T c, T v, T v2)     { return v <= v2 ? (c >= v && c <= v2)
+                                                                          : (c >= v2 && c <= v); }
+template<typename T> bool cmpChanged(T c, T v, T)        { return c != v; }
+template<typename T> bool cmpUnchanged(T c, T v, T)      { return c == v; }
+template<typename T> bool cmpIncreased(T c, T v, T)      { return c > v; }
+template<typename T> bool cmpDecreased(T c, T v, T)      { return c < v; }
+template<typename T> bool cmpUnknown(T, T, T)             { return true; }
+
+template<typename T>
+CompareFn<T> getCompare(ScanCompare cmp) {
+    switch (cmp) {
+        case ScanCompare::Exact:     return cmpExact<T>;
+        case ScanCompare::Greater:   return cmpGreater<T>;
+        case ScanCompare::Less:      return cmpLess<T>;
+        case ScanCompare::Between:   return cmpBetween<T>;
+        case ScanCompare::Changed:   return cmpChanged<T>;
+        case ScanCompare::Unchanged: return cmpUnchanged<T>;
+        case ScanCompare::Increased: return cmpIncreased<T>;
+        case ScanCompare::Decreased: return cmpDecreased<T>;
+        case ScanCompare::SameAsFirst: return cmpUnchanged<T>;
+        case ScanCompare::Unknown:   return cmpUnknown<T>;
+        default:                     return cmpExact<T>;
+    }
+}
+
+template<typename T>
+bool compareFloatingExact(const ScanConfig& config, T current, double requested) {
+    if (std::isnan(current) || std::isnan(requested)) return false;
+    if (!std::isfinite(current) || !std::isfinite(requested)) return static_cast<double>(current) == requested;
+
+    switch (config.roundingType) {
+        case 1: {
+            double c = static_cast<double>(current);
+            double s = requested;
+            // CE "Rounded (default)": a memory value matches when it rounds to the
+            // same value at the search value's decimal precision, i.e. it's within
+            // half of the last decimal place. E.g. "3.14" (2 dp) matches [3.135,
+            // 3.145); "100" (0 dp) matches [99.5, 100.5).
+            if (config.floatDecimals >= 0) {
+                double half = 0.5 * std::pow(10.0, -config.floatDecimals);
+                return std::abs(c - s) <= half;
+            }
+            // No precision hint (non-GUI caller): fall back to integer rounding.
+            // std::llround is UB when the rounded value doesn't fit in long long
+            // (|v| > ~9.2e18), so round as doubles for out-of-range operands.
+            constexpr double kLLMax = 9.2e18; // < LLONG_MAX, safe margin
+            if (std::abs(c) > kLLMax || std::abs(s) > kLLMax)
+                return std::round(c) == std::round(s);
+            return std::llround(c) == std::llround(s);
+        }
+        case 2:
+            return std::trunc(static_cast<double>(current)) == std::trunc(requested);
+        case 3: {
+            double tolerance = config.floatTolerance > 0.0
+                ? config.floatTolerance
+                : std::max(1e-6, std::abs(requested) * 1e-6);
+            return std::abs(static_cast<double>(current) - requested) <= tolerance;
+        }
+        default:
+            return std::abs(requested) <= std::numeric_limits<T>::max() && current == static_cast<T>(requested);
+    }
+}
+
+template<typename T>
+bool compareFloating(const ScanConfig& config, T current, T, T) {
+    if (config.compareType == ScanCompare::Exact)
+        return compareFloatingExact(config, current, config.floatValue);
+    return getCompare<double>(config.compareType)(static_cast<double>(current), config.floatValue, config.floatValue2);
+}
+
+bool supportsPercentageCompare(ScanCompare cmp) {
+    switch (cmp) {
+        case ScanCompare::Greater:
+        case ScanCompare::Less:
+        case ScanCompare::Between:
+        case ScanCompare::Increased:
+        case ScanCompare::Decreased:
+            return true;
+        default:
+            return false;
+    }
+}
+
+template<typename T>
+bool comparePercentage(const ScanConfig& config, T current, T old) {
+    double base = std::abs(static_cast<double>(old));
+    if (base == 0.0) return false;
+
+    double deltaPct = ((static_cast<double>(current) - static_cast<double>(old)) / base) * 100.0;
+    switch (config.compareType) {
+        case ScanCompare::Increased:
+        case ScanCompare::Greater:
+            return deltaPct >= config.percentageValue;
+        case ScanCompare::Decreased:
+        case ScanCompare::Less:
+            return deltaPct <= -config.percentageValue;
+        case ScanCompare::Between: {
+            double lo = std::min(config.percentageValue, config.percentageValue2);
+            double hi = std::max(config.percentageValue, config.percentageValue2);
+            return deltaPct >= lo && deltaPct <= hi;
+        }
+        default:
+            return false;
+    }
+}
+
+template<typename T>
+void scanBufferFloating(const uint8_t* buf, size_t bufSize, uintptr_t baseAddr,
+                        size_t alignment, const ScanConfig& config, ScanResult& result)
+{
+    if (bufSize < sizeof(T)) return;
+    if (alignment == 0) alignment = 1; // never let a 0 stride spin forever
+    size_t limit = bufSize - sizeof(T) + 1;
+
+    T scanVal = static_cast<T>(config.floatValue);
+    T scanVal2 = static_cast<T>(config.floatValue2);
+    for (size_t offset = 0; offset < limit; offset += alignment) {
+        T current=readScanScalar<T>(buf+offset,config.byteOrder);
+        if (compareFloating(config, current, scanVal, scanVal2))
+            result.addResult(baseAddr + offset, buf+offset, sizeof(T));
+    }
+}
+
+// ── Fast integer scanning ──
+// The dominant scan by far is an exact integer value over an aligned buffer.
+// A vectorised equality search makes the common "no match in this vector" case
+// cost one compare + one movemask, so the scan runs near memory-bandwidth speed
+// instead of a branch (previously an indirect call) per element. AVX2 is chosen
+// at runtime; SSE2 is the guaranteed x86_64 baseline; every other case
+// (non-x86, 8-byte lanes without AVX2, unaligned strides, relational compares)
+// uses an inlined scalar loop, still element-wise but with no function-pointer
+// indirection, so the compiler can keep the comparison in registers.
+
+template<typename T>
+inline void emitAt(const uint8_t* buf, size_t off, uintptr_t base, ScanResult& res) {
+    res.addResult(base + off, buf + off, sizeof(T));
+}
+
+// Which vector path exact-integer scans take. Decided once from the CPU, with
+// an override for portability testing/benchmarking: CE_SCAN_SIMD=off|sse2|avx2
+// (consistent with the project's other runtime CE_* diagnostics).
+enum class SimdMode { Scalar, SSE2, AVX2 };
+inline SimdMode simdMode() {
+    if (int forced = g_scanSimdOverride.load(std::memory_order_relaxed); forced >= 0)
+        return static_cast<SimdMode>(forced);
+    static const SimdMode m = [] {
+#if defined(__x86_64__)
+        if (const char* e = std::getenv("CE_SCAN_SIMD")) {
+            if (!std::strcmp(e, "off") || !std::strcmp(e, "0") || !std::strcmp(e, "scalar"))
+                return SimdMode::Scalar;
+            if (!std::strcmp(e, "sse2")) return SimdMode::SSE2;
+            if (!std::strcmp(e, "avx2"))
+                return __builtin_cpu_supports("avx2") ? SimdMode::AVX2 : SimdMode::SSE2;
+        }
+        if (__builtin_cpu_supports("avx2")) return SimdMode::AVX2;
+        return SimdMode::SSE2; // SSE2 is the x86_64 baseline
+#else
+        return SimdMode::Scalar;
+#endif
+    }();
+    return m;
+}
+
+#if defined(__x86_64__)
+
+// Emit every lane in a movemask where the lane's low bit is set. cmpeq sets all
+// L bytes of a matching lane, so the low bit at lane*L reliably marks a hit.
+template<typename T, size_t W>
+inline void emitMaskLanes(const uint8_t* buf, size_t firstLane, unsigned mask,
+                          uintptr_t base, ScanResult& res) {
+    constexpr size_t L = sizeof(T);
+    for (size_t lane = 0; lane < W; ++lane)
+        if (mask & (1u << (lane * L)))
+            emitAt<T>(buf, (firstLane + lane) * L, base, res);
+}
+
+template<typename T>
+__attribute__((target("avx2")))
+void scanExactAVX2(const uint8_t* buf, size_t nLanes, uintptr_t base, T needle, ScanResult& res) {
+    constexpr size_t L = sizeof(T);
+    constexpr size_t W = 32 / L;
+    __m256i n;
+    if constexpr (L == 1)      n = _mm256_set1_epi8(static_cast<char>(needle));
+    else if constexpr (L == 2) n = _mm256_set1_epi16(static_cast<short>(needle));
+    else if constexpr (L == 4) n = _mm256_set1_epi32(static_cast<int>(needle));
+    else                       n = _mm256_set1_epi64x(static_cast<long long>(needle));
+
+    size_t i = 0;
+    for (; i + W <= nLanes; i += W) {
+        __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(buf + i * L));
+        __m256i eq;
+        if constexpr (L == 1)      eq = _mm256_cmpeq_epi8(v, n);
+        else if constexpr (L == 2) eq = _mm256_cmpeq_epi16(v, n);
+        else if constexpr (L == 4) eq = _mm256_cmpeq_epi32(v, n);
+        else                       eq = _mm256_cmpeq_epi64(v, n);
+        unsigned mask = static_cast<unsigned>(_mm256_movemask_epi8(eq));
+        if (mask) emitMaskLanes<T, W>(buf, i, mask, base, res);
+    }
+    for (; i < nLanes; ++i) {
+        T cur; std::memcpy(&cur, buf + i * L, L);
+        if (cur == needle) emitAt<T>(buf, i * L, base, res);
+    }
+}
+
+// SSE2 is unconditionally available on x86_64. It lacks a 64-bit integer
+// compare, so this handles 1/2/4-byte lanes; 8-byte falls through to scalar.
+template<typename T>
+void scanExactSSE2(const uint8_t* buf, size_t nLanes, uintptr_t base, T needle, ScanResult& res) {
+    constexpr size_t L = sizeof(T);
+    static_assert(L == 1 || L == 2 || L == 4, "SSE2 exact scan handles 1/2/4-byte lanes");
+    constexpr size_t W = 16 / L;
+    __m128i n;
+    if constexpr (L == 1)      n = _mm_set1_epi8(static_cast<char>(needle));
+    else if constexpr (L == 2) n = _mm_set1_epi16(static_cast<short>(needle));
+    else                       n = _mm_set1_epi32(static_cast<int>(needle));
+
+    size_t i = 0;
+    for (; i + W <= nLanes; i += W) {
+        __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(buf + i * L));
+        __m128i eq;
+        if constexpr (L == 1)      eq = _mm_cmpeq_epi8(v, n);
+        else if constexpr (L == 2) eq = _mm_cmpeq_epi16(v, n);
+        else                       eq = _mm_cmpeq_epi32(v, n);
+        unsigned mask = static_cast<unsigned>(_mm_movemask_epi8(eq));
+        if (mask) emitMaskLanes<T, W>(buf, i, mask, base, res);
+    }
+    for (; i < nLanes; ++i) {
+        T cur; std::memcpy(&cur, buf + i * L, L);
+        if (cur == needle) emitAt<T>(buf, i * L, base, res);
+    }
+}
+#endif // __x86_64__
+
+// Exact integer scan. For an aligned scan (stride == sizeof(T)) the candidate
+// offsets are exactly the T-lanes, so we can vectorise. nLanes is chosen so the
+// last lane's read stays within bufSize (nLanes*sizeof(T) <= bufSize).
+template<typename T>
+void scanExactInteger(const uint8_t* buf, size_t bufSize, uintptr_t base,
+                      size_t alignment, T needle, ScanResult& res) {
+    if (bufSize < sizeof(T)) return;
+    if (alignment == 0) alignment = 1;
+    if (alignment == sizeof(T)) {
+        size_t nLanes = (bufSize - sizeof(T)) / sizeof(T) + 1;
+#if defined(__x86_64__)
+        SimdMode mode = simdMode();
+        if (mode == SimdMode::AVX2) { scanExactAVX2<T>(buf, nLanes, base, needle, res); return; }
+        if (mode == SimdMode::SSE2) {
+            if constexpr (sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4) {
+                scanExactSSE2<T>(buf, nLanes, base, needle, res);
+                return;
+            }
+            // 8-byte lanes have no SSE2 integer compare → fall through to scalar.
+        }
+#endif
+        for (size_t i = 0; i < nLanes; ++i) {
+            T cur; std::memcpy(&cur, buf + i * sizeof(T), sizeof(T));
+            if (cur == needle) emitAt<T>(buf, i * sizeof(T), base, res);
+        }
+        return;
+    }
+    // Unaligned exact scan: inlined scalar, arbitrary stride.
+    size_t limit = bufSize - sizeof(T) + 1;
+    for (size_t off = 0; off < limit; off += alignment) {
+        T cur; std::memcpy(&cur, buf + off, sizeof(T));
+        if (cur == needle) emitAt<T>(buf, off, base, res);
+    }
+}
+
+// Relational / first-scan comparisons other than Exact. The predicate is a
+// stateless lambda selected once outside the loop, so it inlines (no CompareFn
+// function pointer).
+template<typename T>
+void scanRelational(const uint8_t* buf, size_t bufSize, uintptr_t base,
+                    size_t alignment, T v, T v2, ScanCompare cmp, ScanResult& res) {
+    if (bufSize < sizeof(T)) return;
+    if (alignment == 0) alignment = 1;
+    size_t limit = bufSize - sizeof(T) + 1;
+    auto run = [&](auto pred) {
+        for (size_t off = 0; off < limit; off += alignment) {
+            T cur; std::memcpy(&cur, buf + off, sizeof(T));
+            if (pred(cur)) emitAt<T>(buf, off, base, res);
+        }
+    };
+    switch (cmp) {
+        case ScanCompare::Greater:     run([&](T c){ return c > v; }); break;
+        case ScanCompare::Less:        run([&](T c){ return c < v; }); break;
+        case ScanCompare::Between:     run([&](T c){ return v <= v2 ? (c >= v && c <= v2)
+                                                                    : (c >= v2 && c <= v); }); break;
+        case ScanCompare::Changed:     run([&](T c){ return c != v; }); break;
+        case ScanCompare::Unchanged:   run([&](T c){ return c == v; }); break;
+        case ScanCompare::Increased:   run([&](T c){ return c > v; }); break;
+        case ScanCompare::Decreased:   run([&](T c){ return c < v; }); break;
+        case ScanCompare::SameAsFirst: run([&](T c){ return c == v; }); break;
+        case ScanCompare::Unknown:     run([&](T){ return true; }); break;
+        default:                       run([&](T c){ return c == v; }); break;
+    }
+}
+
+// Dispatch a first-scan integer comparison: exact goes through the SIMD path,
+// everything else through the inlined scalar predicate.
+template<typename T>
+void scanIntegerFast(const uint8_t* buf, size_t bufSize, uintptr_t base,
+                     size_t alignment, T v, T v2, ScanCompare cmp, ScanResult& res) {
+    if (cmp == ScanCompare::Exact)
+        scanExactInteger<T>(buf, bufSize, base, alignment, v, res);
+    else
+        scanRelational<T>(buf, bufSize, base, alignment, v, v2, cmp, res);
+}
+
+template<typename T>
+void scanIntegerTarget(const uint8_t* buf,size_t size,uintptr_t base,size_t alignment,
+                       T value,T value2,ScanCompare compare,ScanResult& result,ByteOrder order) {
+    if (sizeof(T)==1 || order==nativeScanByteOrder) {
+        scanIntegerFast<T>(buf,size,base,alignment,value,value2,compare,result);return;
+    }
+    if (compare==ScanCompare::Exact) {
+        // Equality can compare raw lanes against a reversed needle without
+        // abandoning the SIMD path or changing persisted target bytes.
+        scanExactInteger<T>(buf,size,base,alignment,swapScanScalar(value),result);return;
+    }
+    if (size<sizeof(T)) return;
+    alignment=std::max<size_t>(1,alignment);auto predicate=getCompare<T>(compare);
+    for (size_t offset=0;offset<=size-sizeof(T);offset+=alignment)
+        if (predicate(readScanScalar<T>(buf+offset,order),value,value2))
+            result.addResult(base+offset,buf+offset,sizeof(T));
+}
+
+// ── Fast float scanning ──
+// A float/double exact scan uses the SIMD ordered-equality compare (_CMP_EQ_OQ /
+// cmpeq_p*), which matches C++ float == exactly: NaN never matches, and -0.0
+// equals 0.0. This is only equivalent to the scalar compareFloatingExact when
+// there is no rounding (roundingType 0) and the search value is finite, so the
+// caller only routes those cases here; rounded/tolerant/inf searches keep the
+// scalar path. Lane emission and bounds mirror the integer SIMD scanners.
+#if defined(__x86_64__)
+template<typename T>
+__attribute__((target("avx2")))
+void scanExactFloatAVX(const uint8_t* buf, size_t nLanes, uintptr_t base, T needle, ScanResult& res) {
+    if constexpr (sizeof(T) == 4) {
+        constexpr size_t L = 4, W = 8;
+        __m256 n = _mm256_set1_ps(needle);
+        size_t i = 0;
+        for (; i + W <= nLanes; i += W) {
+            __m256 v = _mm256_loadu_ps(reinterpret_cast<const float*>(buf + i * L));
+            unsigned mask = (unsigned)_mm256_movemask_ps(_mm256_cmp_ps(v, n, _CMP_EQ_OQ));
+            if (mask) for (size_t lane = 0; lane < W; ++lane)
+                if (mask & (1u << lane)) emitAt<T>(buf, (i + lane) * L, base, res);
+        }
+        for (; i < nLanes; ++i) { T c; std::memcpy(&c, buf + i * L, L); if (c == needle) emitAt<T>(buf, i * L, base, res); }
+    } else {
+        constexpr size_t L = 8, W = 4;
+        __m256d n = _mm256_set1_pd(needle);
+        size_t i = 0;
+        for (; i + W <= nLanes; i += W) {
+            __m256d v = _mm256_loadu_pd(reinterpret_cast<const double*>(buf + i * L));
+            unsigned mask = (unsigned)_mm256_movemask_pd(_mm256_cmp_pd(v, n, _CMP_EQ_OQ));
+            if (mask) for (size_t lane = 0; lane < W; ++lane)
+                if (mask & (1u << lane)) emitAt<T>(buf, (i + lane) * L, base, res);
+        }
+        for (; i < nLanes; ++i) { T c; std::memcpy(&c, buf + i * L, L); if (c == needle) emitAt<T>(buf, i * L, base, res); }
+    }
+}
+
+template<typename T>
+void scanExactFloatSSE(const uint8_t* buf, size_t nLanes, uintptr_t base, T needle, ScanResult& res) {
+    if constexpr (sizeof(T) == 4) {
+        constexpr size_t L = 4, W = 4;
+        __m128 n = _mm_set1_ps(needle);
+        size_t i = 0;
+        for (; i + W <= nLanes; i += W) {
+            __m128 v = _mm_loadu_ps(reinterpret_cast<const float*>(buf + i * L));
+            unsigned mask = (unsigned)_mm_movemask_ps(_mm_cmpeq_ps(v, n));
+            if (mask) for (size_t lane = 0; lane < W; ++lane)
+                if (mask & (1u << lane)) emitAt<T>(buf, (i + lane) * L, base, res);
+        }
+        for (; i < nLanes; ++i) { T c; std::memcpy(&c, buf + i * L, L); if (c == needle) emitAt<T>(buf, i * L, base, res); }
+    } else {
+        constexpr size_t L = 8, W = 2;
+        __m128d n = _mm_set1_pd(needle);
+        size_t i = 0;
+        for (; i + W <= nLanes; i += W) {
+            __m128d v = _mm_loadu_pd(reinterpret_cast<const double*>(buf + i * L));
+            unsigned mask = (unsigned)_mm_movemask_pd(_mm_cmpeq_pd(v, n));
+            if (mask) for (size_t lane = 0; lane < W; ++lane)
+                if (mask & (1u << lane)) emitAt<T>(buf, (i + lane) * L, base, res);
+        }
+        for (; i < nLanes; ++i) { T c; std::memcpy(&c, buf + i * L, L); if (c == needle) emitAt<T>(buf, i * L, base, res); }
+    }
+}
+#endif // __x86_64__
+
+// Rounded/tolerant float exact scan (roundingType != 0). SIMD rejects lanes
+// outside a superset window [needle-W, needle+W] (matches for every rounding mode
+// lie within W of the needle), then the survivors get the EXACT scalar
+// compareFloatingExact — so results are identical to the scalar path, but the
+// vast majority of values (far from the needle) are discarded 8/16-wide. `hw` is
+// the superset half-width the caller computed for the config.
+template<typename T, typename Verify>
+inline void roundedFloatScalarTail(const uint8_t* buf, size_t start, size_t nLanes,
+                                   uintptr_t base, Verify verify, ScanResult& res) {
+    for (size_t i = start; i < nLanes; ++i) {
+        T c; std::memcpy(&c, buf + i * sizeof(T), sizeof(T));
+        if (verify(c)) emitAt<T>(buf, i * sizeof(T), base, res);
+    }
+}
+
+#if defined(__x86_64__)
+template<typename T, typename Verify>
+__attribute__((target("avx2")))
+void scanRoundedFloatAVX(const uint8_t* buf, size_t nLanes, uintptr_t base,
+                         T lo, T hi, Verify verify, ScanResult& res) {
+    constexpr size_t L = sizeof(T);
+    size_t i = 0;
+    if constexpr (L == 4) {
+        constexpr size_t W = 8;
+        __m256 vlo = _mm256_set1_ps(lo), vhi = _mm256_set1_ps(hi);
+        for (; i + W <= nLanes; i += W) {
+            __m256 v = _mm256_loadu_ps(reinterpret_cast<const float*>(buf + i * L));
+            __m256 m = _mm256_and_ps(_mm256_cmp_ps(v, vlo, _CMP_GE_OQ), _mm256_cmp_ps(v, vhi, _CMP_LE_OQ));
+            unsigned mask = static_cast<unsigned>(_mm256_movemask_ps(m));
+            while (mask) { unsigned b = (unsigned)__builtin_ctz(mask); T c; std::memcpy(&c, buf + (i + b) * L, L);
+                          if (verify(c)) emitAt<T>(buf, (i + b) * L, base, res); mask &= mask - 1; }
+        }
+    } else {
+        constexpr size_t W = 4;
+        __m256d vlo = _mm256_set1_pd(lo), vhi = _mm256_set1_pd(hi);
+        for (; i + W <= nLanes; i += W) {
+            __m256d v = _mm256_loadu_pd(reinterpret_cast<const double*>(buf + i * L));
+            __m256d m = _mm256_and_pd(_mm256_cmp_pd(v, vlo, _CMP_GE_OQ), _mm256_cmp_pd(v, vhi, _CMP_LE_OQ));
+            unsigned mask = static_cast<unsigned>(_mm256_movemask_pd(m));
+            while (mask) { unsigned b = (unsigned)__builtin_ctz(mask); T c; std::memcpy(&c, buf + (i + b) * L, L);
+                          if (verify(c)) emitAt<T>(buf, (i + b) * L, base, res); mask &= mask - 1; }
+        }
+    }
+    roundedFloatScalarTail<T>(buf, i, nLanes, base, verify, res);
+}
+
+template<typename T, typename Verify>
+void scanRoundedFloatSSE(const uint8_t* buf, size_t nLanes, uintptr_t base,
+                         T lo, T hi, Verify verify, ScanResult& res) {
+    constexpr size_t L = sizeof(T);
+    size_t i = 0;
+    if constexpr (L == 4) {
+        constexpr size_t W = 4;
+        __m128 vlo = _mm_set1_ps(lo), vhi = _mm_set1_ps(hi);
+        for (; i + W <= nLanes; i += W) {
+            __m128 v = _mm_loadu_ps(reinterpret_cast<const float*>(buf + i * L));
+            __m128 m = _mm_and_ps(_mm_cmpge_ps(v, vlo), _mm_cmple_ps(v, vhi));
+            unsigned mask = static_cast<unsigned>(_mm_movemask_ps(m));
+            while (mask) { unsigned b = (unsigned)__builtin_ctz(mask); T c; std::memcpy(&c, buf + (i + b) * L, L);
+                          if (verify(c)) emitAt<T>(buf, (i + b) * L, base, res); mask &= mask - 1; }
+        }
+    } else {
+        constexpr size_t W = 2;
+        __m128d vlo = _mm_set1_pd(lo), vhi = _mm_set1_pd(hi);
+        for (; i + W <= nLanes; i += W) {
+            __m128d v = _mm_loadu_pd(reinterpret_cast<const double*>(buf + i * L));
+            __m128d m = _mm_and_pd(_mm_cmpge_pd(v, vlo), _mm_cmple_pd(v, vhi));
+            unsigned mask = static_cast<unsigned>(_mm_movemask_pd(m));
+            while (mask) { unsigned b = (unsigned)__builtin_ctz(mask); T c; std::memcpy(&c, buf + (i + b) * L, L);
+                          if (verify(c)) emitAt<T>(buf, (i + b) * L, base, res); mask &= mask - 1; }
+        }
+    }
+    roundedFloatScalarTail<T>(buf, i, nLanes, base, verify, res);
+}
+#endif // __x86_64__
+
+// If this float scan is a finite-needle exact search on an aligned buffer, run a
+// SIMD path and return true. roundingType 0 is a direct equality; the rounded /
+// truncated / extreme modes use a superset reject then an exact scalar verify.
+// Otherwise return false so the caller falls back to scanBufferFloating
+// (relational compares, unaligned strides, non-finite needle).
+template<typename T>
+bool tryScanExactFloat(const uint8_t* buf, size_t bufSize, uintptr_t base,
+                       size_t alignment, const ScanConfig& config, ScanResult& res) {
+    if (config.compareType != ScanCompare::Exact) return false;
+    if (alignment != sizeof(T)) return false;
+    if (bufSize < sizeof(T)) return false;
+    if (!std::isfinite(config.floatValue) || std::abs(config.floatValue) > std::numeric_limits<T>::max()) return false;
+    T needle = static_cast<T>(config.floatValue);
+    size_t nLanes = (bufSize - sizeof(T)) / sizeof(T) + 1;
+
+    if (config.roundingType == 0) {
+#if defined(__x86_64__)
+        switch (simdMode()) {
+            case SimdMode::AVX2: scanExactFloatAVX<T>(buf, nLanes, base, needle, res); return true;
+            case SimdMode::SSE2: scanExactFloatSSE<T>(buf, nLanes, base, needle, res); return true;
+            default: break;
+        }
+#endif
+        for (size_t i = 0; i < nLanes; ++i) {
+            T c; std::memcpy(&c, buf + i * sizeof(T), sizeof(T));
+            if (c == needle) emitAt<T>(buf, i * sizeof(T), base, res);
+        }
+        return true;
+    }
+
+    // Rounded/tolerant: superset window then exact scalar verify. Every rounding
+    // mode's match lies within `hw` of the needle (rounded/truncated: < 1;
+    // extreme: its tolerance), so a generous window is a safe superset — the
+    // scalar verify guarantees exact semantics regardless.
+    double s = config.floatValue;
+    double tol = (config.roundingType == 3)
+        ? (config.floatTolerance > 0.0 ? config.floatTolerance : std::max(1e-6, std::abs(s) * 1e-6))
+        : 0.0;
+    double hw = std::max(2.0, tol) + 2.0;
+    const T lo = std::nextafter(static_cast<T>(s - hw), -std::numeric_limits<T>::infinity());
+    const T hi = std::nextafter(static_cast<T>(s + hw), std::numeric_limits<T>::infinity());
+    auto verify = [&](T c) { return compareFloatingExact(config, c, config.floatValue); };
+#if defined(__x86_64__)
+    switch (simdMode()) {
+        case SimdMode::AVX2: scanRoundedFloatAVX<T>(buf, nLanes, base, lo, hi, verify, res); return true;
+        case SimdMode::SSE2: scanRoundedFloatSSE<T>(buf, nLanes, base, lo, hi, verify, res); return true;
+        default: break;
+    }
+#endif
+    roundedFloatScalarTail<T>(buf, 0, nLanes, base, verify, res);
+    return true;
+}
+
+// Find every position in [startPos, endPos) where buf[p] == anchor, calling
+// verify(p) for each. A byte-pattern scan (AOB, string) is compute-bound — it
+// checks every unaligned offset — so rejecting non-anchor positions 16 at a time
+// (SSE2, the x86_64 baseline; CE_SCAN_SIMD=off forces scalar) is a large win; the
+// caller only pays the full compare at the few positions matching one chosen byte.
+template<typename Verify>
+inline void anchorScan(const uint8_t* buf, size_t startPos, size_t endPos,
+                       uint8_t anchor, Verify verify) {
+    size_t p = startPos;
+#if defined(__x86_64__)
+    if (simdMode() != SimdMode::Scalar) {
+        __m128i a = _mm_set1_epi8(static_cast<char>(anchor));
+        for (; p + 16 <= endPos; p += 16) {
+            __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(buf + p));
+            unsigned m = static_cast<unsigned>(_mm_movemask_epi8(_mm_cmpeq_epi8(v, a)));
+            while (m) {
+                unsigned b = static_cast<unsigned>(__builtin_ctz(m));
+                verify(p + b);
+                m &= m - 1;
+            }
+        }
+    }
+#endif
+    for (; p < endPos; ++p)
+        if (buf[p] == anchor) verify(p);
+}
+
+// ASCII case folding must agree across first, next and grouped scans. UTF-16
+// folds whole ASCII code units only, never the low byte of a non-ASCII unit.
+bool stringBytesMatch(const uint8_t* value, const uint8_t* needle, size_t size,
+                      bool caseSensitive, bool unicode = false, ByteOrder order=ByteOrder::Little) {
+    if (caseSensitive) return std::memcmp(value, needle, size) == 0;
+    auto lower = [](uint8_t c) { return c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c; };
+    if (unicode) {
+        if (size % 2) return false;
+        for (size_t i = 0; i < size; i += 2) {
+            const size_t low=i+(order==ByteOrder::Big ? 1 : 0),high=i+(order==ByteOrder::Big ? 0 : 1);
+            if (value[high]!=needle[high]) return false;
+            if (value[high]==0 && value[low]<128 && needle[low]<128) {
+                if (lower(value[low])!=lower(needle[low])) return false;
+            } else if (value[low]!=needle[low]) return false;
+        }
+    } else {
+        for (size_t i = 0; i < size; ++i)
+            if (lower(value[i]) != lower(needle[i])) return false;
+    }
+    return true;
+}
+
+/// Scan buffer for a string (exact substring match).
+void scanBufferString(const uint8_t* buf, size_t bufSize, uintptr_t baseAddr,
+                      const std::vector<uint8_t>& needle, ScanResult& result,
+                      bool caseInsensitive = false)
+{
+    if (needle.empty() || bufSize < needle.size()) return;
+    size_t nLen = needle.size();
+    size_t limit = bufSize - nLen + 1;
+
+    if (!caseInsensitive) {
+        // Anchor on the first byte, verify the rest only at candidate positions.
+        anchorScan(buf, 0, limit, needle[0], [&](size_t offset) {
+            if (std::memcmp(buf + offset, needle.data(), nLen) == 0)
+                result.addResult(baseAddr + offset, buf + offset, nLen);
+        });
+        return;
+    }
+
+    for (size_t offset = 0; offset < limit; ++offset) {
+        if (stringBytesMatch(buf + offset, needle.data(), nLen, false))
+            result.addResult(baseAddr + offset, buf + offset, nLen);
+    }
+}
+
+std::vector<uint8_t> utf16Bytes(const std::string& text,ByteOrder order);
+
+/// Scan buffer for a UTF-16 string in the selected data byte order.
+void scanBufferUnicode(const uint8_t* buf, size_t bufSize, uintptr_t baseAddr,
+                       const std::string& needle, ScanResult& result,
+                       bool caseInsensitive = false, ByteOrder order=ByteOrder::Little)
+{
+    // Share the target-order encoder with next scans and grouped terms,
+    // including surrogate pairs, without normalizing the saved target bytes.
+    std::vector<uint8_t> n = utf16Bytes(needle,order);
+    size_t nBytes = n.size();
+    if (nBytes == 0 || bufSize < nBytes) return;
+
+    size_t limit = bufSize - nBytes + 1;
+
+    for (size_t offset = 0; offset < limit; offset += 2) {
+        if (stringBytesMatch(buf + offset, n.data(), nBytes, !caseInsensitive, true,order))
+            result.addResult(baseAddr + offset, buf + offset, nBytes);
+    }
+}
+
+/// Scan buffer for an array of bytes with wildcard mask.
+void scanBufferAOB(const uint8_t* buf, size_t bufSize, uintptr_t baseAddr,
+                   const std::vector<uint8_t>& pattern, const std::vector<uint8_t>& mask,
+                   ScanResult& result)
+{
+    if (pattern.empty() || mask.size() != pattern.size() || bufSize < pattern.size()) return;
+    size_t pLen = pattern.size();
+    size_t limit = bufSize - pLen + 1;
+
+    auto verifyAt = [&](size_t offset) {
+        for (size_t j = 0; j < pLen; ++j)
+            // Per-byte AND-mask (full 0xFF, wildcard 0x00, nibble 0xF0/0x0F).
+            if ((buf[offset + j] & mask[j]) != (pattern[j] & mask[j])) return;
+        result.addResult(baseAddr + offset, buf + offset, pLen);
+    };
+
+    // Anchor the SIMD search on the pattern's first full-byte (0xFF-mask) byte,
+    // so a candidate is where that exact byte appears; verify the rest only
+    // there. A pattern that is all wildcards/nibbles has no full byte to anchor
+    // on, so it falls back to checking every offset.
+    size_t anchorIdx = pLen;
+    for (size_t j = 0; j < pLen; ++j)
+        if (mask[j] == 0xFF) { anchorIdx = j; break; }
+
+    if (anchorIdx == pLen) {
+        for (size_t offset = 0; offset < limit; ++offset) verifyAt(offset);
+        return;
+    }
+    // A hit for pattern[anchorIdx] at buf position p means the pattern starts at
+    // p - anchorIdx. Valid starts are [0, limit), so anchor positions are
+    // [anchorIdx, limit + anchorIdx) (<= bufSize).
+    anchorScan(buf, anchorIdx, limit + anchorIdx, pattern[anchorIdx],
+               [&](size_t p) { verifyAt(p - anchorIdx); });
+}
+
+/// Scan buffer for binary pattern with bitmask wildcards.
+/// Pattern bytes and mask bytes: mask bit 1 = must match, 0 = wildcard.
+void scanBufferBinary(const uint8_t* buf, size_t bufSize, uintptr_t baseAddr,
+                      const std::vector<uint8_t>& pattern, const std::vector<uint8_t>& mask,
+                      size_t alignment, ScanResult& result)
+{
+    if (pattern.empty() || mask.size() != pattern.size() || bufSize < pattern.size()) return;
+    if (alignment == 0) alignment = 1; // never let a 0 stride spin forever
+    size_t pLen = pattern.size();
+    size_t limit = bufSize - pLen + 1;
+
+    for (size_t offset = 0; offset < limit; offset += alignment) {
+        bool match = true;
+        for (size_t j = 0; j < pLen; ++j) {
+            if ((buf[offset + j] & mask[j]) != (pattern[j] & mask[j])) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            result.addResult(baseAddr + offset, buf + offset, pLen);
+        }
+    }
+}
+
+/// "All Types" scan — scan for byte, int16, int32, int64, float, double simultaneously.
+// emitLimit bounds the start offsets this call may emit (the window's "owned"
+// length); the sub-type reads may still look ahead up to bufSize (the overlap),
+// so a match starting at the last owned offset completes without the next
+// window re-emitting it. When there is no overlap, pass emitLimit == bufSize.
+constexpr std::array<size_t,6> allCandidateWidths{1,2,4,8,4,8};
+template<typename T>
+bool compareAllFloatingLiteral(const ScanConfig& config, T current) {
+    if (config.compareType == ScanCompare::Exact)
+        return compareFloatingExact(config, current, config.floatValue);
+    return getCompare<double>(config.compareType)(static_cast<double>(current), config.floatValue, config.floatValue2);
+}
+// The same bits read with the opposite signedness, widened (a byte 0xFF is
+// 255 one way and -1 the other).
+template <typename T>
+static int64_t otherSignedness(T value) {
+    if constexpr (std::is_signed_v<T>) return static_cast<int64_t>(static_cast<std::make_unsigned_t<T>>(value));
+    else return static_cast<int64_t>(static_cast<std::make_signed_t<T>>(value));
+}
+
+bool compareAllIntegerLiteral(const ScanConfig& config, int64_t current) {
+    if (!config.allIntegerValue || (config.compareType != ScanCompare::Exact && config.compareType != ScanCompare::Greater &&
+        config.compareType != ScanCompare::Less && config.compareType != ScanCompare::Between))
+        return getCompare<int64_t>(config.compareType)(current, config.intValue, config.intValue2);
+    const auto& lower = *config.allIntegerValue;
+    if (lower.unordered) return false;
+    const int order = lower.compare(current);
+    switch (config.compareType) {
+        case ScanCompare::Exact: return order == 0;
+        case ScanCompare::Greater: return order > 0;
+        case ScanCompare::Less: return order < 0;
+        case ScanCompare::Between: {
+            if (!config.allIntegerValue2 || config.allIntegerValue2->unordered) return false;
+            const int upper = config.allIntegerValue2->compare(current);
+            return (order >= 0 && upper <= 0) || (upper >= 0 && order <= 0);
+        }
+        default: return false;
+    }
+}
+// The 8-byte reading taken as unsigned: an exact value above INT64_MAX
+// (18446744073709551615) has no signed 8-byte reading to match.
+static bool matchesUnsigned64(const ScanConfig& config, uint64_t current) {
+    const auto& value = config.allIntegerValue;
+    return config.compareType == ScanCompare::Exact && value && !value->negative && !value->fractional &&
+           !value->outsideMagnitude && !value->unordered &&
+           value->magnitude > static_cast<uint64_t>(INT64_MAX) && value->magnitude == current;
+}
+uint8_t allCandidatesFitting(uint8_t mask,uintptr_t lastDistance) {
+    for (size_t i=0;i<allCandidateWidths.size();++i)
+        if (allCandidateWidths[i]-1>lastDistance) mask&=static_cast<uint8_t>(~(1u<<i));
+    return mask;
+}
+size_t allCandidateReadSize(uint8_t mask) {
+    size_t size=0;
+    for (size_t i=0;i<allCandidateWidths.size();++i) if (mask&(1u<<i)) size=std::max(size,allCandidateWidths[i]);
+    return size;
+}
+uint8_t allCandidateFor(ValueType type) {
+    constexpr std::array<ValueType,6> types{ValueType::Byte,ValueType::Int16,ValueType::Int32,ValueType::Int64,ValueType::Float,ValueType::Double};
+    for (size_t i=0;i<types.size();++i) if (types[i]==type) return static_cast<uint8_t>(1u<<i);
+    return 0;
+}
+void scanBufferAllTypes(const uint8_t* buf,size_t bufSize,uintptr_t baseAddr,
+                        size_t alignment,const ScanConfig& config,ScanResult& result,size_t emitLimit) {
+    alignment=std::max<size_t>(1,alignment);emitLimit=std::min(emitLimit,bufSize);
+    result.enableAllTypeCandidates();
+    for (size_t offset=0;offset<emitLimit;offset+=alignment) {
+        uint8_t mask=0;
+        auto candidate=[&]<typename T>(size_t bit) {
+            if (sizeof(T)>bufSize-offset) return;
+            const T current=readScanScalar<T>(buf+offset,config.byteOrder);
+            bool matches;
+            if constexpr (std::is_floating_point_v<T>)
+                matches=compareAllFloatingLiteral(config,current);
+            else {
+                // Keep the full search value. Truncating 298 to a byte must not
+                // invent a Byte=42 match or change relational/between bounds.
+                matches=compareAllIntegerLiteral(config,static_cast<int64_t>(current));
+                // An exact value matches either reading of a narrow field, as in
+                // the single-type scans: 40000 is a 2-byte 0x9C40, -1 a byte 0xFF.
+                if (!matches && config.compareType==ScanCompare::Exact && sizeof(T)<8)
+                    matches=compareAllIntegerLiteral(config,otherSignedness(current));
+                if (!matches && sizeof(T)==8) matches=matchesUnsigned64(config,static_cast<uint64_t>(current));
+            }
+            if (matches) mask|=static_cast<uint8_t>(1u<<bit);
+        };
+        candidate.template operator()<uint8_t>(0);candidate.template operator()<int16_t>(1);
+        candidate.template operator()<int32_t>(2);candidate.template operator()<int64_t>(3);
+        candidate.template operator()<float>(4);candidate.template operator()<double>(5);
+        if (!mask) continue;
+        // Samples keep a uniform stride. The type mask defines which bytes are
+        // meaningful; short region tails are padded rather than discarded.
+        std::array<uint8_t,8> window{};
+        std::memcpy(window.data(),buf+offset,std::min<size_t>(8,bufSize-offset));
+        result.addAllTypeResult(baseAddr+offset,window.data(),mask);
+    }
+}
+
+std::vector<uint8_t> utf16Bytes(const std::string& text,ByteOrder order) {
+    return encodeStringBytes(text,order==ByteOrder::Big ? "UTF-16BE" : "UTF-16LE");
+}
+
+bool compareMaskedBytes(const uint8_t* currentVal,
+                        const std::vector<uint8_t>& pattern,
+                        const std::vector<uint8_t>& mask);
+
+size_t groupedTermValueSize(const ScanConfig::GroupedTerm& term,uint8_t pointerWidth=sizeof(uintptr_t)) {
+    switch (term.valueType) {
+        case ValueType::Byte:
+            return 1;
+        case ValueType::Int16:
+            return 2;
+        case ValueType::Int32:
+        case ValueType::Float:
+            return 4;
+        case ValueType::Pointer:
+            return pointerWidth;
+        case ValueType::Int64:
+        case ValueType::Double:
+            return 8;
+        case ValueType::String:
+            return std::max<size_t>(1, term.stringValue.size());
+        case ValueType::UnicodeString:
+            return std::max<size_t>(2, utf16Bytes(term.stringValue,ByteOrder::Little).size());
+        case ValueType::ByteArray:
+        case ValueType::Binary:
+            return std::max<size_t>(1, term.byteArray.size());
+        default:
+            return 0;
+    }
+}
+
+bool groupedTermMatches(const uint8_t* value, const ScanConfig::GroupedTerm& term, const ScanConfig& config) {
+    switch (term.valueType) {
+        case ValueType::Byte: {
+            uint8_t current = value[0];
+            return current == static_cast<uint8_t>(term.intValue);
+        }
+        case ValueType::Int16: {
+            int16_t current=readScanScalar<int16_t>(value,config.byteOrder);
+            return current == static_cast<int16_t>(term.intValue);
+        }
+        case ValueType::Int32: {
+            int32_t current=readScanScalar<int32_t>(value,config.byteOrder);
+            return current == static_cast<int32_t>(term.intValue);
+        }
+        case ValueType::Int64: {
+            int64_t current=readScanScalar<int64_t>(value,config.byteOrder);
+            return current == term.intValue;
+        }
+        case ValueType::Pointer: {
+            const uint64_t current=config.pointerWidth==4 ? readScanScalar<uint32_t>(value,config.byteOrder) : readScanScalar<uint64_t>(value,config.byteOrder);
+            return current==(config.pointerWidth==4 ? static_cast<uint32_t>(term.intValue) : static_cast<uint64_t>(term.intValue));
+        }
+        case ValueType::Float: {
+            float current=readScanScalar<float>(value,config.byteOrder);
+            return compareFloatingExact(config, current, term.floatValue);
+        }
+        case ValueType::Double: {
+            double current=readScanScalar<double>(value,config.byteOrder);
+            return compareFloatingExact(config, current, term.floatValue);
+        }
+        case ValueType::String:
+            return stringBytesMatch(value, reinterpret_cast<const uint8_t*>(term.stringValue.data()),
+                                    term.stringValue.size(), config.caseSensitive);
+        case ValueType::UnicodeString: {
+            return stringBytesMatch(value,term.byteArray.data(),term.byteArray.size(),config.caseSensitive,true,config.byteOrder);
+        }
+        case ValueType::ByteArray:
+            return compareMaskedBytes(value, term.byteArray, term.byteArrayMask);
+        case ValueType::Binary: {
+            if (term.byteMask.size() != term.byteArray.size())
+                return false;
+            for (size_t i = 0; i < term.byteArray.size(); ++i) {
+                if ((value[i] & term.byteMask[i]) != (term.byteArray[i] & term.byteMask[i]))
+                    return false;
+            }
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+bool groupedBlockMatches(const uint8_t* block, size_t blockSize, const ScanConfig& config) {
+    for (const auto& term : config.groupedTerms) {
+        size_t termSize = groupedTermValueSize(term,config.pointerWidth);
+        if (termSize == 0 || termSize>blockSize || term.offset > blockSize - termSize)
+            return false;
+        if (!groupedTermMatches(block + term.offset, term, config))
+            return false;
+    }
+    return true;
+}
+
+void scanBufferUnknown(const uint8_t* buf, size_t bufSize, uintptr_t baseAddr,
+                       size_t alignment, size_t valueSize, ScanResult& result) {
+    if (valueSize == 0 || bufSize < valueSize) return;
+    if (alignment == 0) alignment = 1;
+
+    size_t limit = bufSize - valueSize + 1;
+    for (size_t offset = 0; offset < limit; offset += alignment)
+        result.addResult(baseAddr + offset, buf + offset, valueSize);
+}
+
+void scanBufferGrouped(const uint8_t* buf, size_t bufSize, uintptr_t baseAddr,
+                       size_t alignment, const ScanConfig& config, ScanResult& result) {
+    if (config.groupedTerms.empty()) return;
+    size_t blockSize = config.groupedValueSize();
+    if (blockSize == 0 || bufSize < blockSize) return;
+    if (alignment == 0) alignment = 1;
+
+    size_t limit = bufSize - blockSize + 1;
+    for (size_t offset = 0; offset < limit; offset += alignment) {
+        if (groupedBlockMatches(buf + offset, blockSize, config))
+            result.addResult(baseAddr + offset, buf + offset, blockSize);
+    }
+}
+
+size_t valueSizeForConfig(const ScanConfig& config) {
+    switch (config.valueType) {
+        case ValueType::String:
+            return std::max<size_t>(1, config.stringValueSize());
+        case ValueType::UnicodeString:
+            return std::max<size_t>(2, utf16Bytes(config.stringValue,config.byteOrder).size());
+        case ValueType::ByteArray:
+        case ValueType::Binary:
+            return std::max<size_t>(1, config.byteArray.size());
+        case ValueType::All:
+            return 8;
+        case ValueType::Grouped:
+            return std::max<size_t>(1, config.groupedValueSize());
+        case ValueType::Custom:
+            return std::max<size_t>(1, config.customValueSize);
+        case ValueType::Byte:
+            return 1;
+        case ValueType::Int16:
+            return 2;
+        case ValueType::Int32:
+        case ValueType::Float:
+            return 4;
+        case ValueType::Pointer:
+            return config.pointerWidth;
+        case ValueType::Int64:
+        case ValueType::Double:
+            return 8;
+        default:
+            return 4;
+    }
+}
+
+template<typename T>
+bool compareNextNumericValues(const ScanConfig& config,T cur,T old) {
+    if (config.percentageScan && supportsPercentageCompare(config.compareType))
+        return comparePercentage(config, cur, old);
+
+    if (config.compareType == ScanCompare::SameAsFirst)
+        return cur == old;
+
+    // "Increased/Decreased value by N": delta comparison. Integers compare the
+    // delta exactly; floats use a relative tolerance because the true delta is
+    // rarely exactly representable (e.g. 0.3f-0.1f != 0.2f), so an exact == would
+    // silently miss legitimate matches.
+    if (config.compareType == ScanCompare::IncreasedBy ||
+        config.compareType == ScanCompare::DecreasedBy) {
+        if constexpr (std::is_floating_point_v<T>) {
+            double d = static_cast<double>(config.floatValue);
+            double actual = config.compareType == ScanCompare::IncreasedBy
+                ? static_cast<double>(cur) - static_cast<double>(old)
+                : static_cast<double>(old) - static_cast<double>(cur);
+            // The operands' own precision counts too: 100.0f + 0.1f stores as
+            // 100.0999985, a difference 1.5e-6 away from 0.1.
+            const double magnitude = std::max(std::abs(static_cast<double>(cur)), std::abs(static_cast<double>(old)));
+            const double tol = std::max({1e-6, std::abs(d) * 1e-5, 4.0 * std::numeric_limits<T>::epsilon() * magnitude});
+            const bool dir = config.compareType == ScanCompare::IncreasedBy ? (cur > old) : (cur < old);
+            const T expected = config.compareType == ScanCompare::IncreasedBy ? static_cast<T>(old + static_cast<T>(d))
+                                                                               : static_cast<T>(old - static_cast<T>(d));
+            return dir && (cur == expected || std::abs(actual - d) <= tol);
+        } else {
+            using U=std::make_unsigned_t<T>;
+            if constexpr (std::is_signed_v<T> || sizeof(T)<8) if (config.intValue<0) return false;
+            const bool increased=config.compareType==ScanCompare::IncreasedBy;
+            if (increased ? cur<=old : old<=cur) return false;
+            const U distance=increased ? static_cast<U>(static_cast<U>(cur)-static_cast<U>(old)) :
+                                        static_cast<U>(static_cast<U>(old)-static_cast<U>(cur));
+            return static_cast<uint64_t>(distance)==static_cast<uint64_t>(config.intValue);
+        }
+    }
+
+    auto cmp = getCompare<T>(config.compareType);
+    if (config.compareType >= ScanCompare::Changed)
+        return cmp(cur, old, T{});
+
+    if constexpr (std::is_floating_point_v<T>) {
+        T v1 = static_cast<T>(config.floatValue);
+        T v2 = static_cast<T>(config.floatValue2);
+        return compareFloating(config, cur, v1, v2);
+    } else {
+        return cmp(cur, static_cast<T>(config.intValue), static_cast<T>(config.intValue2));
+    }
+}
+
+template<typename T>
+bool compareNextNumeric(const ScanConfig& config,const uint8_t* currentVal,const uint8_t* oldVal) {
+    return compareNextNumericValues(config,readScanScalar<T>(currentVal,config.byteOrder),
+                                    readScanScalar<T>(oldVal,config.byteOrder));
+}
+
+bool compareNextAllInteger(const ScanConfig& config, int64_t current, int64_t old) {
+    if (!config.allIntegerValue || (config.percentageScan && supportsPercentageCompare(config.compareType)) ||
+        (config.compareType != ScanCompare::Exact && config.compareType != ScanCompare::Greater &&
+         config.compareType != ScanCompare::Less && config.compareType != ScanCompare::Between &&
+         config.compareType != ScanCompare::IncreasedBy && config.compareType != ScanCompare::DecreasedBy))
+        return compareNextNumericValues(config, current, old);
+    if (config.compareType == ScanCompare::IncreasedBy || config.compareType == ScanCompare::DecreasedBy) {
+        const auto& value = *config.allIntegerValue;
+        if (value.negative || value.fractional || value.outsideMagnitude || value.unordered) return false;
+        const bool increased = config.compareType == ScanCompare::IncreasedBy;
+        if (increased ? current <= old : old <= current) return false;
+        const uint64_t distance = increased ? static_cast<uint64_t>(current) - static_cast<uint64_t>(old) :
+            static_cast<uint64_t>(old) - static_cast<uint64_t>(current);
+        return distance == value.magnitude;
+    }
+    return compareAllIntegerLiteral(config, current);
+}
+
+bool compareMaskedBytes(const uint8_t* currentVal,
+                        const std::vector<uint8_t>& pattern,
+                        const std::vector<uint8_t>& mask) {
+    if (pattern.empty()) return false;
+    for (size_t i = 0; i < pattern.size(); ++i) {
+        // Per-byte AND-mask: only the set bits must match (supports full-byte and
+        // nibble wildcards for AOB, and per-bit masks for binary patterns).
+        uint8_t m = i < mask.size() ? mask[i] : 0xFF;
+        if ((currentVal[i] & m) != (pattern[i] & m)) return false;
+    }
+    return true;
+}
+
+// Read exactly `n` bytes from `fd` into `buf`, retrying on EINTR and short
+// reads. Returns true only if the full count was satisfied; a genuine EOF or
+// hard error before `n` bytes yields false so callers can treat the result
+// file as truncated rather than scanning stale/garbage buffer contents.
+bool readFull(int fd, void* buf, size_t n) {
+    auto* p = static_cast<uint8_t*>(buf);
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = ::read(fd, p + got, n - got);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (r == 0)
+            return false; // EOF before satisfying the request → truncated
+        got += static_cast<size_t>(r);
+    }
+    return true;
+}
+
+// pread exactly `n` bytes at `offset`, retrying on EINTR/short reads. Returns
+// true only if the full count was satisfied.
+bool preadFull(int fd, void* buf, size_t n, off_t offset) {
+    auto* p = static_cast<uint8_t*>(buf);
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = ::pread(fd, p + got, n - got, offset + static_cast<off_t>(got));
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (r == 0)
+            return false;
+        got += static_cast<size_t>(r);
+    }
+    return true;
+}
+
+bool memoryTypeAllowed(const ScanConfig& config, MemType type) {
+    switch (type) {
+        case MemType::Private: return config.scanPrivate;
+        case MemType::Image:   return config.scanImage;
+        case MemType::Mapped:  return config.scanMapped;
+    }
+    return false;
+}
+
+// Reusable evaluator for ValueType::Custom formula scans. Standing up and
+// tearing down a full Lua VM per candidate offset (the previous behaviour) was
+// pathologically slow; this keeps ONE lua_State for the lifetime of the scan
+// (or per worker thread, since lua_State is not thread-safe) and compiles the
+// formula once into a reusable chunk. Each candidate only resets the
+// current/old/hasOld/valueSize globals and re-calls the precompiled function.
+// Only base/math/string libraries are loaded: a numeric match predicate has
+// no need for os/io (which would also be a sandbox-escape vector).
+//
+// The state has a 16 MiB budget, so any allocation can fail. Lua raises that
+// as an error, and an error outside a protected call goes to the panic
+// handler, after which Lua calls abort(). So every API call that can allocate
+// runs inside lua_pcall (the values travel as a light userdata argument,
+// which allocates nothing), and the panic handler jumps back here instead of
+// returning. A state that ran out of memory or panicked is rebuilt.
+class CustomFormulaEvaluator {
+public:
+    explicit CustomFormulaEvaluator(std::string formula)
+        : formula_(std::move(formula)) {}
+
+    ~CustomFormulaEvaluator() { closeState(); }
+
+    CustomFormulaEvaluator(const CustomFormulaEvaluator&) = delete;
+    CustomFormulaEvaluator& operator=(const CustomFormulaEvaluator&) = delete;
+
+    // Returns true if the formula evaluated to a usable boolean/number result;
+    // matchOut holds the predicate outcome. Returns false on compile/runtime
+    // error or non-bool/number result (treated as "no match" by callers).
+    bool eval(const uint8_t* currentVal, const uint8_t* oldVal,
+              size_t valueSize, bool hasOld, bool& matchOut) {
+        matchOut = false;
+        if (formula_.empty())
+            return false;
+        if (!ensureCompiled())
+            return false;
+        EvalCall call{currentVal, oldVal, valueSize, hasOld, chunkRef_};
+        const int status = runProtected(&evalBody, &call);
+        if (status == LUA_ERRMEM || status == kPanicked)
+            closeState(status == kPanicked);   // the next candidate starts from a fresh state
+        if (status != LUA_OK || !call.ok)
+            return false;
+        matchOut = call.match;
+        return true;
+    }
+
+private:
+    static constexpr int kPanicked = -1;
+
+    struct EvalCall {
+        const uint8_t* current;
+        const uint8_t* old;
+        size_t size;
+        bool hasOld;
+        int chunkRef;
+        bool ok = false;
+        bool match = false;
+    };
+
+    struct SetupCall {
+        const std::string* formula;
+        int chunkRef = LUA_NOREF;
+        bool compiled = false;
+    };
+
+    static int evalBody(lua_State* L) {
+        auto* call = static_cast<EvalCall*>(lua_touserdata(L, 1));
+        lua_pushlstring(L, reinterpret_cast<const char*>(call->current), call->size);
+        lua_setglobal(L, "current");
+        lua_pushlstring(L, reinterpret_cast<const char*>(call->old), call->size);
+        lua_setglobal(L, "old");
+        lua_pushboolean(L, call->hasOld ? 1 : 0);
+        lua_setglobal(L, "hasOld");
+        lua_pushinteger(L, static_cast<lua_Integer>(call->size));
+        lua_setglobal(L, "valueSize");
+        lua_rawgeti(L, LUA_REGISTRYINDEX, call->chunkRef);
+        // A runaway formula (a loop that never ends) fails this candidate
+        // instead of hanging the scan. Setting the hook restarts its count.
+        lua_sandbox::armInstructionBudget(L, 1000000);
+        lua_call(L, 0, 1);
+        if (lua_isboolean(L, -1)) {
+            call->match = lua_toboolean(L, -1) != 0;
+            call->ok = true;
+        } else if (lua_isnumber(L, -1)) {
+            call->match = lua_tonumber(L, -1) != 0.0;
+            call->ok = true;
+        }
+        return 0;
+    }
+
+    static int setupBody(lua_State* L) {
+        auto* call = static_cast<SetupCall*>(lua_touserdata(L, 1));
+        // Restricted library set: arithmetic only, no os/io.
+        luaL_requiref(L, "_G", luaopen_base, 1);   lua_pop(L, 1);
+        luaL_requiref(L, "math", luaopen_math, 1);  lua_pop(L, 1);
+        luaL_requiref(L, "string", luaopen_string, 1); lua_pop(L, 1);
+        // No loading files or code, and nothing that escapes the limits.
+        lua_sandbox::restrictLibraries(L);
+        const int loaded = luaL_loadstring(L, call->formula->c_str());
+        if (loaded == LUA_ERRMEM) return lua_error(L);   // retried on a later candidate
+        if (loaded != LUA_OK) return 0;                  // a syntax error: never matches
+        call->chunkRef = luaL_ref(L, LUA_REGISTRYINDEX);
+        call->compiled = true;
+        return 0;
+    }
+
+    // Never returns to Lua, so Lua never reaches its abort(). Every call on
+    // the state, lua_close included, runs armed, so the jump always has a
+    // target; the exit only keeps this function from returning.
+    static int panic(lua_State* L) {
+        auto* self = *static_cast<CustomFormulaEvaluator**>(lua_getextraspace(L));
+        if (self && self->panicArmed_) std::longjmp(self->panicJump_, 1);
+        std::_Exit(70);
+    }
+
+    // Calls body(ud) under lua_pcall. Nothing between the setjmp and the
+    // longjmp in panic() has a destructor to skip: only Lua's C frames.
+    int runProtected(lua_CFunction body, void* ud) {
+        if (setjmp(panicJump_) != 0) {
+            panicArmed_ = false;
+            return kPanicked;
+        }
+        panicArmed_ = true;
+        lua_pushcfunction(L_, body);   // a light C function: no allocation
+        lua_pushlightuserdata(L_, ud);
+        const int status = lua_pcall(L_, 1, 0, 0);
+        lua_settop(L_, 0);             // the error object, if any
+        panicArmed_ = false;
+        return status;
+    }
+
+    bool ensureCompiled() {
+        if (compiled_)
+            return chunkRef_ != LUA_NOREF;
+        if (!L_) {
+            memory_.used = 0;
+            L_ = lua_newstate(lua_sandbox::budgetAlloc, &memory_);   // protected inside
+            if (!L_)
+                return false;
+            *static_cast<CustomFormulaEvaluator**>(lua_getextraspace(L_)) = this;
+            lua_atpanic(L_, &panic);
+        }
+        SetupCall call{&formula_};
+        const int status = runProtected(&setupBody, &call);
+        if (status != LUA_OK) {
+            // A fresh state that cannot hold the libraries and this formula
+            // never will: stop trying instead of rebuilding per candidate.
+            closeState(status == kPanicked);
+            compiled_ = true;
+            return false;
+        }
+        compiled_ = true;
+        chunkRef_ = call.compiled ? call.chunkRef : LUA_NOREF;
+        return chunkRef_ != LUA_NOREF;
+    }
+
+    // A state left by a panic may be inconsistent, so it is abandoned rather
+    // than closed (it holds at most the 16 MiB budget).
+    void closeState(bool abandon = false) {
+        if (L_ && !abandon) {
+            if (setjmp(panicJump_) == 0) {
+                panicArmed_ = true;
+                lua_close(L_);
+            }
+            panicArmed_ = false;
+        }
+        L_ = nullptr;
+        chunkRef_ = LUA_NOREF;
+        compiled_ = false;
+    }
+
+    std::string formula_;
+    lua_sandbox::MemoryBudget memory_{0, 16u << 20};   // outlives L_ (closed in the destructor body)
+    lua_State* L_ = nullptr;
+    int chunkRef_ = LUA_NOREF;
+    bool compiled_ = false;
+    bool panicArmed_ = false;
+    std::jmp_buf panicJump_;
+};
+
+} // anonymous namespace
+
+// ── AOB pattern parser ──
+
+bool ScanConfig::parseAOB(const std::string& pattern) {
+    byteArray.clear();
+    byteArrayMask.clear();
+    bool valid = true;
+    auto nib = [&](char c, uint8_t& val, uint8_t& mask) {
+        if (c == '?' || c == '*') { val = 0; mask = 0x0; }
+        else if (c >= '0' && c <= '9') { val = c - '0';        mask = 0xF; }
+        else if (c >= 'a' && c <= 'f') { val = c - 'a' + 10;   mask = 0xF; }
+        else if (c >= 'A' && c <= 'F') { val = c - 'A' + 10;   mask = 0xF; }
+        else { val = 0; mask = 0x0; valid = false; }   // not hex and not a wildcard
+    };
+    auto isHex = [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+    };
+    std::istringstream ss(pattern);
+    std::string token;
+    while (ss >> token) {
+        if (token == "??" || token == "?" || token == "*") {
+            byteArray.push_back(0);
+            byteArrayMask.push_back(0x00);           // full-byte wildcard
+        } else if (token.size() == 2) {
+            // Per-nibble: supports "48" (full), "4?"/"?8" (nibble wildcards).
+            uint8_t hv, hm, lv, lm;
+            nib(token[0], hv, hm); nib(token[1], lv, lm);
+            byteArray.push_back((uint8_t)((hv << 4) | lv));
+            byteArrayMask.push_back((uint8_t)((hm << 4) | lm));
+        } else if (token.size() > 2) {
+            // Compact multi-byte token ("488B05"): split into 2-digit bytes.
+            // Accepting it as one all-hex token and truncating via strtoul to a
+            // single byte silently scanned the wrong pattern, so split instead.
+            // Require all-hex and an even digit count; reject anything else.
+            for (char c : token) if (!isHex(c)) valid = false;
+            if (!valid || token.size() % 2 != 0) {
+                valid = false;
+            } else {
+                for (size_t i = 0; i < token.size(); i += 2) {
+                    uint8_t hv, hm, lv, lm;
+                    nib(token[i], hv, hm); nib(token[i + 1], lv, lm);
+                    byteArray.push_back((uint8_t)((hv << 4) | lv));
+                    byteArrayMask.push_back((uint8_t)((hm << 4) | lm));
+                }
+            }
+        } else {
+            // A single hex digit: a one-byte value (0x0..0xF).
+            for (char c : token) if (!isHex(c)) valid = false;
+            byteArray.push_back((uint8_t)strtoul(token.c_str(), nullptr, 16));
+            byteArrayMask.push_back(0xFF);
+        }
+    }
+    return valid && !byteArray.empty();
+}
+
+void ScanConfig::parseBinary(const std::string& pattern) {
+    // Parse binary string like "0110??01" into bytes + mask
+    // Every 8 bits = 1 byte. ? = wildcard bit.
+    byteArray.clear();
+    byteArrayMask.clear();
+    byteMask.clear();
+
+    uint8_t currentByte = 0, currentMask = 0;
+    int bitCount = 0;
+
+    for (char c : pattern) {
+        if (c == ' ') continue;
+        if (c == '0' || c == '1' || c == '?' || c == '*') {
+            currentByte <<= 1;
+            currentMask <<= 1;
+            if (c == '1') { currentByte |= 1; currentMask |= 1; }
+            else if (c == '0') { currentMask |= 1; }
+            // '?' and '*' leave both as 0 (wildcard)
+            bitCount++;
+            if (bitCount == 8) {
+                byteArray.push_back(currentByte);
+                byteMask.push_back(currentMask);
+                currentByte = 0;
+                currentMask = 0;
+                bitCount = 0;
+            }
+        }
+    }
+    // Handle partial last byte
+    if (bitCount > 0) {
+        currentByte <<= (8 - bitCount);
+        currentMask <<= (8 - bitCount);
+        byteArray.push_back(currentByte);
+        byteMask.push_back(currentMask);
+    }
+    binaryString = pattern; // Keep original for reference
+    byteArrayMask.resize(byteMask.size());
+    for (size_t i = 0; i < byteMask.size(); ++i)
+        byteArrayMask[i] = byteMask[i];
+}
+
+size_t ScanConfig::stringValueSize() const {
+    return encodeStringBytes(stringValue, stringEncoding).size();
+}
+
+bool ScanConfig::parseGrouped(const std::string& expression, std::string* error) {
+    groupedTerms.clear();
+    groupedExpression = expression;
+
+    auto fail = [&](const std::string& message) {
+        if (error)
+            *error = message;
+        groupedTerms.clear();
+        return false;
+    };
+
+    auto expr = trimCopy(expression);
+    if (expr.empty())
+        return fail("grouped expression is empty");
+
+    std::stringstream ss(expr);
+    std::string rawTerm;
+    size_t termIndex = 0;
+    while (std::getline(ss, rawTerm, ';')) {
+        auto termText = trimCopy(rawTerm);
+        if (termText.empty())
+            continue;
+        ++termIndex;
+
+        auto atPos = termText.rfind('@');
+        if (atPos == std::string::npos)
+            return fail("missing @offset in grouped term " + std::to_string(termIndex));
+
+        auto lhs = trimCopy(termText.substr(0, atPos));
+        auto offsetToken = trimCopy(termText.substr(atPos + 1));
+        size_t offset = 0;
+        if (!parseSizeToken(offsetToken, offset))
+            return fail("invalid offset in grouped term " + std::to_string(termIndex));
+
+        auto colonPos = lhs.find(':');
+        if (colonPos == std::string::npos)
+            return fail("missing type:value in grouped term " + std::to_string(termIndex));
+
+        auto typeToken = lowerCopy(trimCopy(lhs.substr(0, colonPos)));
+        auto valueToken = trimCopy(lhs.substr(colonPos + 1));
+        if (valueToken.empty())
+            return fail("missing value in grouped term " + std::to_string(termIndex));
+
+        GroupedTerm term;
+        term.offset = offset;
+
+        if (typeToken == "byte" || typeToken == "i8" || typeToken == "int8" || typeToken == "1") {
+            term.valueType = ValueType::Byte;
+            if (!parseInt64Token(valueToken, term.intValue))
+                return fail("invalid byte value in grouped term " + std::to_string(termIndex));
+        } else if (typeToken == "i16" || typeToken == "int16" || typeToken == "short" || typeToken == "word" || typeToken == "2") {
+            term.valueType = ValueType::Int16;
+            if (!parseInt64Token(valueToken, term.intValue))
+                return fail("invalid i16 value in grouped term " + std::to_string(termIndex));
+        } else if (typeToken == "i32" || typeToken == "int32" || typeToken == "dword" || typeToken == "int" || typeToken == "4") {
+            term.valueType = ValueType::Int32;
+            if (!parseInt64Token(valueToken, term.intValue))
+                return fail("invalid i32 value in grouped term " + std::to_string(termIndex));
+        } else if (typeToken == "i64" || typeToken == "int64" || typeToken == "long" || typeToken == "qword" || typeToken == "8") {
+            term.valueType = ValueType::Int64;
+            if (!parseInt64Token(valueToken, term.intValue))
+                return fail("invalid i64 value in grouped term " + std::to_string(termIndex));
+        } else if (typeToken == "pointer" || typeToken == "ptr") {
+            term.valueType = ValueType::Pointer;
+            if (!parseInt64Token(valueToken, term.intValue))
+                return fail("invalid pointer value in grouped term " + std::to_string(termIndex));
+        } else if (typeToken == "float" || typeToken == "single") {
+            term.valueType = ValueType::Float;
+            if (!parseDoubleToken(valueToken, term.floatValue))
+                return fail("invalid float value in grouped term " + std::to_string(termIndex));
+        } else if (typeToken == "double") {
+            term.valueType = ValueType::Double;
+            if (!parseDoubleToken(valueToken, term.floatValue))
+                return fail("invalid double value in grouped term " + std::to_string(termIndex));
+        } else if (typeToken == "string" || typeToken == "str") {
+            term.valueType = ValueType::String;
+            term.stringValue = unquoteCopy(valueToken);
+            if (term.stringValue.empty())
+                return fail("empty string in grouped term " + std::to_string(termIndex));
+        } else if (typeToken == "unicode" || typeToken == "utf16" || typeToken == "wstring") {
+            term.valueType = ValueType::UnicodeString;
+            term.stringValue = unquoteCopy(valueToken);
+            if (term.stringValue.empty())
+                return fail("empty unicode string in grouped term " + std::to_string(termIndex));
+        } else if (typeToken == "aob" || typeToken == "bytearray") {
+            term.valueType = ValueType::ByteArray;
+            ScanConfig temp;
+            temp.parseAOB(valueToken);
+            term.byteArray = std::move(temp.byteArray);
+            term.byteArrayMask = std::move(temp.byteArrayMask);
+            if (term.byteArray.empty())
+                return fail("empty AOB pattern in grouped term " + std::to_string(termIndex));
+        } else if (typeToken == "binary" || typeToken == "bin") {
+            term.valueType = ValueType::Binary;
+            ScanConfig temp;
+            temp.parseBinary(valueToken);
+            term.byteArray = std::move(temp.byteArray);
+            term.byteMask = std::move(temp.byteMask);
+            term.byteArrayMask = std::move(temp.byteArrayMask);
+            if (term.byteArray.empty())
+                return fail("empty binary pattern in grouped term " + std::to_string(termIndex));
+        } else {
+            return fail("unknown grouped value type '" + typeToken + "' in term " + std::to_string(termIndex));
+        }
+
+        size_t termSize = groupedTermValueSize(term);
+        if (termSize == 0)
+            return fail("unsupported grouped value type in term " + std::to_string(termIndex));
+        if (term.offset > std::numeric_limits<size_t>::max() - termSize)
+            return fail("offset overflow in grouped term " + std::to_string(termIndex));
+
+        groupedTerms.push_back(std::move(term));
+    }
+
+    if (groupedTerms.empty())
+        return fail("grouped expression produced no terms");
+
+    if (error)
+        error->clear();
+    return true;
+}
+
+size_t ScanConfig::groupedValueSize() const {
+    size_t blockSize = 0;
+    for (const auto& term : groupedTerms) {
+        size_t termSize = groupedTermValueSize(term,pointerWidth ? pointerWidth : sizeof(uintptr_t));
+        if (termSize == 0) continue;
+        if (term.offset > std::numeric_limits<size_t>::max() - termSize)
+            return 0;
+        blockSize = std::max(blockSize, term.offset + termSize);
+    }
+    return blockSize;
+}
+
+// ── ScanResult ──
+
+ScanResult::~ScanResult() {
+    if (allTypeFd_>=0) close(allTypeFd_);
+    if (offsetFd_ >= 0) close(offsetFd_);
+    if (valueFd_ >= 0) close(valueFd_);
+    if (firstValueFd_ >= 0) close(firstValueFd_);
+    if (!ownedRoot_.empty()) {
+        std::error_code ignored;
+        std::filesystem::remove_all(ownedRoot_, ignored);
+    }
+    if (lockFd_ >= 0) close(lockFd_);
+}
+
+void ScanResult::swap(ScanResult& other) noexcept {
+    using std::swap;
+    swap(dir_, other.dir_);
+    swap(ownedRoot_, other.ownedRoot_);
+    swap(lockFd_, other.lockFd_);
+    swap(count_, other.count_);
+    swap(valueSize_, other.valueSize_);
+    swap(hasDataFormat_,other.hasDataFormat_);swap(byteOrder_,other.byteOrder_);swap(pointerWidth_,other.pointerWidth_);
+    swap(hasAllTypes_,other.hasAllTypes_);swap(allTypeBuf_,other.allTypeBuf_);swap(allTypeFd_,other.allTypeFd_);
+    swap(writeError_, other.writeError_);
+    swap(storeFirst_, other.storeFirst_);
+    swap(finalized_, other.finalized_);
+    swap(offsetBuf_, other.offsetBuf_);
+    swap(valueBuf_, other.valueBuf_);
+    swap(firstValueBuf_, other.firstValueBuf_);
+    swap(offsetFd_, other.offsetFd_);
+    swap(valueFd_, other.valueFd_);
+    swap(firstValueFd_, other.firstValueFd_);
+    swap(curFrameBase_, other.curFrameBase_);
+    swap(curFrameCount_, other.curFrameCount_);
+    swap(haveFrame_, other.haveFrame_);
+    swap(frames_, other.frames_);
+    swap(shards_, other.shards_);
+}
+
+ScanResult::ScanResult(ScanResult&& other) noexcept { swap(other); }
+ScanResult& ScanResult::operator=(ScanResult&& other) noexcept {
+    if (this != &other) {
+        ScanResult moved(std::move(other));
+        swap(moved);
+    }
+    return *this;
+}
+
+ScanResult::ScanResult(const std::filesystem::path& dir, bool storeFirst)
+    : dir_(dir), storeFirst_(storeFirst) {
+    auto offPath  = dir / "offsets.bin";
+    auto valPath  = dir / "values.bin";
+    auto firstValPath = dir / "first_values.bin";
+
+    if (std::filesystem::exists(dir / "shards.txt") || std::filesystem::exists(offPath)) {
+        // Loading existing scan results (read-only mode): either a shards.txt
+        // manifest of worker directories, or a single result directory.
+        loadShards();loadDataFormat();
+        offsetFd_ = -1;
+        valueFd_ = -1;
+        firstValueFd_ = -1;
+    } else {
+        // Creating new scan results (write mode)
+        finalized_ = false;
+        std::filesystem::create_directories(dir);
+        offsetBuf_.reserve(8192);
+        valueBuf_.reserve(8192 * 8);
+        if (storeFirst_) firstValueBuf_.reserve(8192 * 8);
+        offsetFd_ = open(offPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        valueFd_ = open(valPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        // A first scan (storeFirst == false) has firstValue == value, so it does
+        // not write first_values.bin at all; firstValue(i) falls back to value(i).
+        firstValueFd_ = storeFirst_
+            ? open(firstValPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644) : -1;
+        writeError_ = offsetFd_ < 0 || valueFd_ < 0 || (storeFirst_ && firstValueFd_ < 0);
+    }
+}
+
+void ScanResult::setDataFormat(ByteOrder order,uint8_t width) {
+    if ((order!=ByteOrder::Unknown && order!=ByteOrder::Little && order!=ByteOrder::Big) ||
+        (width!=0 && width!=4 && width!=8)) {writeError_=true;return;}
+    hasDataFormat_=true;byteOrder_=order;pointerWidth_=width;
+    std::ofstream file(dir_/"format.txt",std::ios::trunc);
+    file<<"CE_SCAN_FORMAT 1 "<<static_cast<unsigned>(order)<<" "<<static_cast<unsigned>(width)<<"\n";
+    file.close();if (!file) writeError_=true;
+}
+void ScanResult::enableAllTypeCandidates() {
+    if (hasAllTypes_) return;
+    if (finalized_ || count_) {writeError_=true;return;}
+    hasAllTypes_=true;allTypeBuf_.reserve(8192);
+    allTypeFd_=open((dir_/"all_types.bin").c_str(),O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0644);
+    if (allTypeFd_<0) writeError_=true;
+}
+static int openAllTypeCandidates(const std::filesystem::path& directory,size_t count,bool validate=false) {
+    int fd=open((directory/"all_types.bin").c_str(),O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK);
+    if (fd<0) return -1;
+    struct stat info{};
+    if (fstat(fd,&info) || !S_ISREG(info.st_mode) || info.st_size<0 || static_cast<uintmax_t>(info.st_size)!=count) {
+        close(fd);errno=EINVAL;return -1;
+    }
+    if (validate) {
+        std::array<uint8_t,65536> buffer{};
+        for (size_t offset=0;offset<count;) {
+            const size_t size=std::min(buffer.size(),count-offset);
+            if (!preadFull(fd,buffer.data(),size,static_cast<off_t>(offset)) ||
+                std::any_of(buffer.begin(),buffer.begin()+size,[](uint8_t mask){return !mask || (mask&0xc0);})) {
+                close(fd);errno=EINVAL;return -1;
+            }
+            offset+=size;
+        }
+    }
+    return fd;
+}
+uint8_t ScanResult::allTypeCandidates(size_t i) const {
+    const auto* shard=shardAt(i);if (!hasAllTypes_ || !shard) return 0;
+    int fd=openAllTypeCandidates(shard->dir,shard->count);if (fd<0) return 0;
+    uint8_t mask=0;const bool read=preadFull(fd,&mask,1,static_cast<off_t>(i-shard->cum));close(fd);
+    return read && mask && !(mask&0xc0) ? mask : 0;
+}
+size_t ScanResult::allTypeValueSize(size_t i) const {return allCandidateReadSize(allTypeCandidates(i));}
+void ScanResult::addAllTypeResult(uintptr_t addr,const void* value,uint8_t mask) {
+    addAllTypeResult(addr,value,value,mask);
+}
+void ScanResult::addAllTypeResult(uintptr_t addr,const void* value,const void* firstValue,uint8_t mask) {
+    enableAllTypeCandidates();
+    if (!mask || (mask&0xc0) || finalized_ || writeError_) {writeError_=true;return;}
+    allTypeBuf_.push_back(mask);addResult(addr,value,firstValue,8);
+}
+void ScanResult::loadDataFormat() {
+    const auto path=dir_/"format.txt";
+    int fd=open(path.c_str(),O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK);
+    if (fd<0) {if (errno!=ENOENT) writeError_=true;return;}
+    struct stat info{};char bytes[65]{};
+    const bool bounded=!fstat(fd,&info) && S_ISREG(info.st_mode) && info.st_size>0 && info.st_size<=64;
+    ssize_t size=-1;if (bounded) do {size=pread(fd,bytes,static_cast<size_t>(info.st_size),0);} while (size<0 && errno==EINTR);
+    close(fd);
+    if (!bounded || size!=info.st_size) {writeError_=true;return;}
+    std::istringstream input(std::string(bytes,static_cast<size_t>(size)));
+    std::string magic,versionToken,orderToken,widthToken,extra;unsigned version=0,order=0,width=0;
+    auto number=[](const std::string& token,unsigned& value) {
+        const auto parsed=std::from_chars(token.data(),token.data()+token.size(),value);
+        return parsed.ec==std::errc{} && parsed.ptr==token.data()+token.size();
+    };
+    if (!(input>>magic>>versionToken>>orderToken>>widthToken) || magic!="CE_SCAN_FORMAT" ||
+        !number(versionToken,version) || !number(orderToken,order) || !number(widthToken,width) || version!=1 ||
+        order>static_cast<unsigned>(ByteOrder::Big) || (width!=0 && width!=4 && width!=8) || (input>>extra)) {
+        writeError_=true;return;
+    }
+    hasDataFormat_=true;byteOrder_=static_cast<ByteOrder>(order);pointerWidth_=static_cast<uint8_t>(width);
+}
+
+std::vector<ScanResult::Frame> ScanResult::loadFrames(const std::filesystem::path& dir) {
+    // frames.bin: repeated (uint64 base, uint64 count), in address order.
+    std::vector<Frame> frames;
+    std::error_code ec;
+    auto path = dir / "frames.bin";
+    auto bytes = std::filesystem::file_size(path, ec);
+    if (ec || bytes < 16 || bytes % 16 != 0) return frames;
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) return frames;
+    size_t n = bytes / 16;
+    std::vector<uint64_t> raw(n * 2);
+    if (readFull(fd, raw.data(), n * 16)) {
+        size_t start = 0;
+        for (size_t k = 0; k < n; ++k) {
+            uint64_t base = raw[k * 2], cnt = raw[k * 2 + 1];
+            if (base > UINTPTR_MAX || cnt == 0 || cnt > SIZE_MAX - start) {
+                frames.clear();
+                break;
+            }
+            frames.push_back({ base, start, static_cast<size_t>(cnt) });
+            start += static_cast<size_t>(cnt);
+        }
+    }
+    close(fd);
+    return frames;
+}
+
+uintptr_t ScanResult::reconstruct(const std::vector<Frame>& frames, size_t local, uint32_t offset) {
+    // Find the frame owning local index `local` (frames partition [0,count) into
+    // contiguous [start, start+count) runs, ascending). Few frames → linear.
+    for (const auto& f : frames)
+        if (local >= f.start && local - f.start < f.count)
+            return offset <= UINTPTR_MAX - f.base ? static_cast<uintptr_t>(f.base) + offset : 0;
+    return 0;
+}
+
+void ScanResult::loadShards() {
+    shards_.clear();
+    count_ = 0;
+    std::error_code ec;
+    std::optional<bool> candidateFormat;
+    auto manifestPath = dir_ / "shards.txt";
+    auto addShard = [&](const std::filesystem::path& d, std::optional<size_t> expected) {
+        std::error_code e;
+        auto bytes = std::filesystem::file_size(d / "offsets.bin", e);
+        if (e || bytes % sizeof(uint32_t) || bytes / sizeof(uint32_t) > SIZE_MAX) return false;
+        size_t c = bytes / sizeof(uint32_t);
+        if ((expected && *expected != c) || c > SIZE_MAX - count_) return false;
+        auto frames = loadFrames(d);
+        if (c && (frames.empty() || frames.back().start > c || frames.back().count != c - frames.back().start)) return false;
+        auto vb = std::filesystem::file_size(d / "values.bin", e);
+        if (e || (c == 0 ? vb != 0 : vb == 0 || vb % c != 0 || vb / c > SIZE_MAX)) return false;
+        size_t stride = c ? vb / c : 0;
+        const int candidates=openAllTypeCandidates(d,c,true);
+        const bool all=candidates>=0;
+        if (candidates>=0) close(candidates);
+        else if (errno!=ENOENT) return false;
+        if ((all && c && stride!=8) || (candidateFormat && *candidateFormat!=all)) return false;
+        candidateFormat=all;hasAllTypes_=all;
+        if (stride && valueSize_ && stride != valueSize_) return false;
+        if (std::filesystem::exists(d / "first_values.bin", e)) {
+            auto fb = std::filesystem::file_size(d / "first_values.bin", e);
+            if (e || fb != vb) return false;
+        } else if (e) return false;
+        if (stride) valueSize_ = stride;
+        shards_.push_back({ d, c, count_, std::move(frames) });
+        count_ += c;
+        return true;
+    };
+    if (std::filesystem::exists(manifestPath, ec)) {
+        // Manifest lines: "<count> <shard directory>". The shard directories hold
+        // the actual offsets/frames/values/first_values files (written once by
+        // the scan workers — never copied into a merged file).
+        std::ifstream in(manifestPath);
+        if (!in) writeError_ = true;
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.empty()) continue;
+            size_t sp = line.find(' ');
+            if (sp == std::string::npos || sp + 1 == line.size()) { writeError_ = true; break; }
+            size_t c = 0;
+            auto parsed = std::from_chars(line.data(), line.data() + sp, c);
+            if (parsed.ec != std::errc{} || parsed.ptr != line.data() + sp) { writeError_ = true; break; }
+            std::filesystem::path sdir(line.substr(sp + 1));
+            if (!addShard(sdir, c)) { writeError_ = true; break; }
+        }
+        if (in.bad()) writeError_ = true;
+    } else if (std::filesystem::exists(dir_ / "offsets.bin", ec)) {
+        // Single result directory: it is the one shard.
+        if (!addShard(dir_, std::nullopt)) writeError_ = true;
+    }
+    if (writeError_) { shards_.clear(); count_ = 0; valueSize_ = 0; }
+}
+
+const ScanResult::Shard* ScanResult::shardAt(size_t i) const {
+    // Few shards (one per scan worker), so a linear walk is fine.
+    for (const auto& s : shards_)
+        if (i >= s.cum && i < s.cum + s.count) return &s;
+    return nullptr;
+}
+
+std::vector<ScanResult::ShardInfo> ScanResult::shardLayout() const {
+    std::vector<ShardInfo> out;
+    if (!shards_.empty()) {
+        out.reserve(shards_.size());
+        for (const auto& s : shards_) out.push_back({ s.dir, s.count });
+    } else if (count_ > 0) {
+        // A write-mode result read before finalize (not expected in practice).
+        out.push_back({ dir_, count_ });
+    }
+    return out;
+}
+
+size_t ScanResult::recordStride() const {
+    auto strideOf = [](const std::filesystem::path& d, size_t cnt) -> size_t {
+        if (cnt == 0) return 0;
+        std::error_code ec;
+        auto vb = std::filesystem::file_size(d / "values.bin", ec);
+        return (ec || vb == 0 || vb % cnt != 0) ? 0 : vb / cnt;
+    };
+    size_t stride = 0;
+    for (const auto& s : shards_) {
+        if (!s.count) continue;
+        size_t st = strideOf(s.dir, s.count);
+        if (!st || (stride && stride != st)) return 0;
+        stride = st;
+    }
+    if (shards_.empty())
+        return strideOf(dir_, count_);
+    return stride;
+}
+
+void ScanResult::addResult(uintptr_t addr, const void* value, size_t valueSize) {
+    addResult(addr, value, value, valueSize);
+}
+
+void ScanResult::addResult(uintptr_t addr, const void* value, const void* firstValue, size_t valueSize) {
+    if (finalized_ || writeError_ || !value || (storeFirst_ && !firstValue) ||
+        !valueSize || (valueSize_ && valueSize != valueSize_) ||
+        (hasAllTypes_ && (valueSize!=8 || allTypeBuf_.size()!=offsetBuf_.size()+1))) {
+        writeError_ = true;
+        return;
+    }
+    // Encode the address as a 4-byte offset from the current frame base. Matches
+    // arrive in ascending order, so a new frame is needed only when the address
+    // runs past the base by 2^32 (a big VA gap, e.g. heap -> stack), which is
+    // rare — usually one frame per region.
+    if (!haveFrame_ || addr < curFrameBase_ || addr - curFrameBase_ >= (1ull << 32)) {
+        if (haveFrame_) frames_.emplace_back(curFrameBase_, curFrameCount_);
+        curFrameBase_ = addr;
+        curFrameCount_ = 0;
+        haveFrame_ = true;
+    }
+    offsetBuf_.push_back(static_cast<uint32_t>(addr - curFrameBase_));
+    ++curFrameCount_;
+
+    // insert() copies the bytes once; resize()+memcpy would first zero-fill the
+    // new region and then overwrite it, a wasted write per matched byte, which
+    // adds up for dense scans emitting millions of results.
+    const auto* v  = static_cast<const uint8_t*>(value);
+    valueBuf_.insert(valueBuf_.end(), v, v + valueSize);
+    if (storeFirst_) {
+        const auto* fv = static_cast<const uint8_t*>(firstValue);
+        firstValueBuf_.insert(firstValueBuf_.end(), fv, fv + valueSize);
+    }
+    valueSize_ = valueSize;
+    ++count_;
+
+    if (offsetBuf_.size() >= 8192)
+        flush();
+}
+
+// Write all `len` bytes, retrying on EINTR and short writes. A bare ::write can
+// return fewer bytes than requested (signal, nearly-full disk); if that happened
+// on the addresses file but not the values file, the two would end at mismatched
+// lengths and every result past that point would pair the wrong address+value.
+static bool writeAll(int fd, const void* data, size_t len) {
+    const char* p = static_cast<const char*>(data);
+    while (len > 0) {
+        ssize_t n = ::write(fd, p, len);
+        if (n < 0) { if (errno == EINTR) continue; return false; }
+        if (n == 0) return false;
+        p += n;
+        len -= static_cast<size_t>(n);
+    }
+    return true;
+}
+
+// Assemble a sharded result: write a shards.txt manifest under `mergedDir`
+// referencing each worker's directory in worker order (which is address order,
+// since each worker owns a contiguous ascending slice), WITHOUT copying the
+// record files. The old design concatenated every worker file into one merged
+// file, doubling result-data disk traffic; here the worker files ARE the result.
+// Any worker's write-error flag is propagated. Shared by firstScan/nextScan.
+static ScanResult assembleShardedResult(const std::filesystem::path& mergedDir,
+                                        std::vector<ScanResult>& parts) {
+    std::filesystem::create_directories(mergedDir);
+    int fd = open((mergedDir / "shards.txt").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    bool writeError = (fd < 0);
+    if (fd >= 0) {
+        for (auto& tr : parts) {
+            if (tr.hasWriteError()) writeError = true;
+            std::string line = std::to_string(tr.count()) + " " + tr.directory().string() + "\n";
+            if (!writeAll(fd, line.data(), line.size())) writeError = true;
+        }
+        close(fd);
+    }
+    ScanResult merged(mergedDir); // loads the manifest (read mode)
+    if (!parts.empty() && parts.front().hasDataFormat()) {
+        merged.setDataFormat(parts.front().byteOrder(),parts.front().pointerWidth());
+        for (const auto& part:parts) if (!part.hasDataFormat() || part.byteOrder()!=merged.byteOrder() || part.pointerWidth()!=merged.pointerWidth()) writeError=true;
+    }
+    if (writeError) merged.markWriteError();
+    return merged;
+}
+
+// Reads a global record range from a (possibly sharded) previous result. Each
+// nextScan worker builds its own so positional reads don't share a file offset.
+// Holds every shard's three files open (few shards → few fds).
+struct ShardReader {
+    struct S {
+        int ofd = -1, vfd = -1, ffd = -1;
+        int candidatesFd = -1;
+        size_t count = 0, cum = 0;
+        std::vector<ScanResult::Frame> frames;
+    };
+    std::vector<S> shards;
+    std::vector<uint32_t> offTmp; // scratch for decoding a batch's offsets
+    bool ok = true;
+
+    explicit ShardReader(const std::vector<ScanResult::ShardInfo>& layout,bool all=false) {
+        size_t cum = 0;
+        for (const auto& si : layout) {
+            S s;
+            s.count = si.count;
+            s.cum = cum;
+            cum += si.count;
+            s.ofd = open((si.dir / "offsets.bin").c_str(), O_RDONLY);
+            s.vfd = open((si.dir / "values.bin").c_str(), O_RDONLY);
+            s.ffd = open((si.dir / "first_values.bin").c_str(), O_RDONLY);
+            if (s.ffd < 0 && errno != ENOENT) ok = false;
+            if (all) {s.candidatesFd=openAllTypeCandidates(si.dir,si.count);if (s.candidatesFd<0) ok=false;}
+            s.frames = ScanResult::loadFrames(si.dir);
+            if (s.ofd < 0 || s.vfd < 0) ok = false;
+            if (s.count && (s.frames.empty() || s.frames.back().start > s.count ||
+                           s.frames.back().count != s.count - s.frames.back().start)) ok = false;
+            shards.push_back(std::move(s));
+        }
+    }
+    ~ShardReader() {
+        for (auto& s : shards) {
+            if (s.ofd >= 0) close(s.ofd);
+            if (s.vfd >= 0) close(s.vfd);
+            if (s.ffd >= 0) close(s.ffd);
+            if (s.candidatesFd>=0) close(s.candidatesFd);
+        }
+    }
+    ShardReader(const ShardReader&) = delete;
+    ShardReader& operator=(const ShardReader&) = delete;
+
+    // Read n records at global [begin, begin+n) into the buffers (addresses +
+    // old values + first values), spanning shard boundaries as needed. Addresses
+    // are reconstructed from the shard's 4-byte offsets + frame table. Where a
+    // shard has no first_values.bin, first values fall back to the old values.
+    // Returns true iff every read succeeded.
+    bool read(size_t begin, size_t n, uintptr_t* addrs, uint8_t* oldVals,
+              uint8_t* firstVals, size_t valueSize,uint8_t* candidates=nullptr) {
+        size_t got = 0;
+        while (got < n) {
+            size_t gi = begin + got;
+            S* sh = nullptr;
+            for (auto& s : shards)
+                if (gi >= s.cum && gi < s.cum + s.count) { sh = &s; break; }
+            if (!sh) return false;
+            size_t local = gi - sh->cum;
+            size_t take = std::min(sh->count - local, n - got);
+            if (offTmp.size() < take) offTmp.resize(take);
+            if (!preadFull(sh->ofd, offTmp.data(), take * sizeof(uint32_t),
+                           (off_t)(local * sizeof(uint32_t))))
+                return false;
+            // Reconstruct addr = frameBase + offset, advancing the frame as the
+            // local index crosses frame boundaries (frames are contiguous ranges).
+            size_t fi = 0;
+            for (size_t j = 0; j < take; ++j) {
+                size_t li = local + j;
+                while (fi < sh->frames.size() && li >= sh->frames[fi].start + sh->frames[fi].count) ++fi;
+                if (fi == sh->frames.size() || offTmp[j] > UINTPTR_MAX - sh->frames[fi].base)
+                    return false;
+                addrs[got + j] = static_cast<uintptr_t>(sh->frames[fi].base) + offTmp[j];
+            }
+            if (!preadFull(sh->vfd, oldVals + got * valueSize, take * valueSize,
+                           (off_t)(local * valueSize)))
+                return false;
+            if (sh->ffd < 0)
+                std::memcpy(firstVals + got * valueSize, oldVals + got * valueSize, take * valueSize);
+            else if (!preadFull(sh->ffd, firstVals + got * valueSize, take * valueSize,
+                                (off_t)(local * valueSize))) return false;
+            if (candidates && (sh->candidatesFd<0 ||
+                !preadFull(sh->candidatesFd,candidates+got,take,static_cast<off_t>(local)) ||
+                std::any_of(candidates+got,candidates+got+take,[](uint8_t mask){return !mask || (mask&0xc0);}))) return false;
+            got += take;
+        }
+        return true;
+    }
+};
+
+static uint8_t nextAllTypeCandidates(const ScanConfig& config,uint8_t candidates,
+                                    const uint8_t* current,const uint8_t* old,const uint8_t* first) {
+    const auto* reference=config.compareType==ScanCompare::SameAsFirst ? first : old;
+    uint8_t kept=0;
+    auto candidate=[&]<typename T>(size_t bit) {
+        if (!(candidates&(1u<<bit))) return;
+        const T value=readScanScalar<T>(current,config.byteOrder),previous=readScanScalar<T>(reference,config.byteOrder);
+        bool match;
+        if constexpr (std::is_floating_point_v<T>) {
+            const bool literal = config.compareType == ScanCompare::Exact || config.compareType == ScanCompare::Greater ||
+                config.compareType == ScanCompare::Less || config.compareType == ScanCompare::Between;
+            match = literal && !(config.percentageScan && supportsPercentageCompare(config.compareType)) ?
+                compareAllFloatingLiteral(config,value) : compareNextNumericValues(config,value,previous);
+        }
+        else {
+            match=compareNextAllInteger(config,static_cast<int64_t>(value),static_cast<int64_t>(previous));
+            if (!match && config.compareType==ScanCompare::Exact && sizeof(T)<8)   // see the first scan
+                match=compareNextAllInteger(config,otherSignedness(value),otherSignedness(previous));
+            if (!match && sizeof(T)==8) match=matchesUnsigned64(config,static_cast<uint64_t>(value));
+        }
+        if (match) kept|=static_cast<uint8_t>(1u<<bit);
+    };
+    candidate.template operator()<uint8_t>(0);candidate.template operator()<int16_t>(1);
+    candidate.template operator()<int32_t>(2);candidate.template operator()<int64_t>(3);
+    candidate.template operator()<float>(4);candidate.template operator()<double>(5);
+    return kept;
+}
+
+// One next-scan predicate for one address: does the freshly-read `currentVal`
+// still match, given the previous scan's `oldVal` and the first scan's
+// `firstVal`? Pulled out of nextScan so the single- and multi-threaded paths
+// share exactly one copy of the comparison logic. Needles are precomputed once
+// by the caller; `customEval` is per-thread (lua_State is not thread-safe).
+static bool nextScanCompare(const ScanConfig& config, size_t valueSize,
+                            const uint8_t* currentVal, const uint8_t* oldVal,
+                            const uint8_t* firstVal,
+                            const std::vector<uint8_t>& stringNeedle,
+                            const std::vector<uint8_t>& unicodeNeedle,
+                            CustomFormulaEvaluator& customEval) {
+    const uint8_t* compareVal =
+        config.compareType == ScanCompare::SameAsFirst ? firstVal : oldVal;
+    bool match = false;
+    switch (config.valueType) {
+        case ValueType::Byte:
+            match = compareNextNumeric<uint8_t>(config, currentVal, compareVal); break;
+        case ValueType::Int16:
+            match = compareNextNumeric<int16_t>(config, currentVal, compareVal); break;
+        case ValueType::Int32:
+            match = compareNextNumeric<int32_t>(config, currentVal, compareVal); break;
+        case ValueType::Int64:
+            match = compareNextNumeric<int64_t>(config, currentVal, compareVal); break;
+        case ValueType::Pointer:
+            match=config.pointerWidth==4 ? compareNextNumeric<uint32_t>(config,currentVal,compareVal) :
+                                          compareNextNumeric<uint64_t>(config,currentVal,compareVal);break;
+        case ValueType::Float:
+            match = compareNextNumeric<float>(config, currentVal, compareVal); break;
+        case ValueType::Double:
+            match = compareNextNumeric<double>(config, currentVal, compareVal); break;
+        case ValueType::String: {
+            if (config.compareType == ScanCompare::SameAsFirst)
+                match = std::memcmp(currentVal, firstVal, valueSize) == 0;
+            else if (config.compareType >= ScanCompare::Changed)
+                match = (std::memcmp(currentVal, oldVal, valueSize) != 0) ==
+                        (config.compareType == ScanCompare::Changed ||
+                         config.compareType == ScanCompare::Increased ||
+                         config.compareType == ScanCompare::Decreased);
+            else if (config.compareType == ScanCompare::Exact)
+                match = stringNeedle.size() == valueSize &&
+                        stringBytesMatch(currentVal, stringNeedle.data(), valueSize, config.caseSensitive);
+            else if (config.compareType == ScanCompare::Unknown)
+                match = true;
+            break;
+        }
+        case ValueType::UnicodeString: {
+            if (config.compareType == ScanCompare::SameAsFirst)
+                match = std::memcmp(currentVal, firstVal, valueSize) == 0;
+            else if (config.compareType >= ScanCompare::Changed)
+                match = (std::memcmp(currentVal, oldVal, valueSize) != 0) ==
+                        (config.compareType == ScanCompare::Changed ||
+                         config.compareType == ScanCompare::Increased ||
+                         config.compareType == ScanCompare::Decreased);
+            else if (config.compareType == ScanCompare::Exact)
+                match = unicodeNeedle.size() == valueSize &&
+                        stringBytesMatch(currentVal, unicodeNeedle.data(), valueSize, config.caseSensitive, true,config.byteOrder);
+            else if (config.compareType == ScanCompare::Unknown)
+                match = true;
+            break;
+        }
+        case ValueType::ByteArray:
+            if (config.compareType == ScanCompare::SameAsFirst)
+                match = std::memcmp(currentVal, firstVal, valueSize) == 0;
+            else if (config.compareType >= ScanCompare::Changed)
+                match = (std::memcmp(currentVal, oldVal, valueSize) != 0) ==
+                        (config.compareType == ScanCompare::Changed ||
+                         config.compareType == ScanCompare::Increased ||
+                         config.compareType == ScanCompare::Decreased);
+            else if (config.compareType == ScanCompare::Exact)
+                match = compareMaskedBytes(currentVal, config.byteArray, config.byteArrayMask);
+            else if (config.compareType == ScanCompare::Unknown)
+                match = true;
+            break;
+        case ValueType::Binary:
+            if (config.compareType == ScanCompare::SameAsFirst)
+                match = std::memcmp(currentVal, firstVal, valueSize) == 0;
+            else if (config.compareType >= ScanCompare::Changed)
+                match = (std::memcmp(currentVal, oldVal, valueSize) != 0) ==
+                        (config.compareType == ScanCompare::Changed ||
+                         config.compareType == ScanCompare::Increased ||
+                         config.compareType == ScanCompare::Decreased);
+            else if (config.compareType == ScanCompare::Exact) {
+                match = !config.byteArray.empty() &&
+                        config.byteMask.size() == config.byteArray.size();
+                for (size_t j = 0; match && j < config.byteArray.size(); ++j)
+                    if ((currentVal[j] & config.byteMask[j]) !=
+                        (config.byteArray[j] & config.byteMask[j]))
+                        match = false;
+            } else if (config.compareType == ScanCompare::Unknown)
+                match = true;
+            break;
+        case ValueType::Grouped:
+            if (config.compareType == ScanCompare::Unknown)
+                match = true;
+            else if (config.compareType == ScanCompare::Changed)
+                match = std::memcmp(currentVal, oldVal, valueSize) != 0;
+            else if (config.compareType == ScanCompare::Unchanged ||
+                     config.compareType == ScanCompare::SameAsFirst)
+                match = std::memcmp(currentVal, compareVal, valueSize) == 0;
+            else if (config.compareType == ScanCompare::Exact)
+                match = groupedBlockMatches(currentVal, valueSize, config);
+            break;
+        case ValueType::Custom:
+            if (config.compareType == ScanCompare::Unknown)
+                match = true;
+            else if (config.compareType == ScanCompare::Changed)
+                match = std::memcmp(currentVal, oldVal, valueSize) != 0;
+            else if (config.compareType == ScanCompare::Unchanged ||
+                     config.compareType == ScanCompare::SameAsFirst)
+                match = std::memcmp(currentVal, compareVal, valueSize) == 0;
+            else if (config.compareType == ScanCompare::Exact)
+                customEval.eval(currentVal, compareVal, valueSize, true, match);
+            break;
+        default:
+            if (config.compareType == ScanCompare::SameAsFirst)
+                match = std::memcmp(currentVal, firstVal, valueSize) == 0;
+            else
+                match = (std::memcmp(currentVal, oldVal, valueSize) != 0) ==
+                        (config.compareType == ScanCompare::Changed);
+            break;
+    }
+    return match;
+}
+
+void ScanResult::flush() {
+    if (offsetBuf_.empty()) return;
+    // A short/failed write (e.g. ENOSPC) truncates the backing file below count_,
+    // so mark the result unreliable rather than silently reading back zeroes later.
+    if (offsetFd_ >= 0 && !writeAll(offsetFd_, offsetBuf_.data(), offsetBuf_.size() * sizeof(uint32_t)))
+        writeError_ = true;
+    if (valueFd_ >= 0 && !writeAll(valueFd_, valueBuf_.data(), valueBuf_.size()))
+        writeError_ = true;
+    if (firstValueFd_ >= 0 && !writeAll(firstValueFd_, firstValueBuf_.data(), firstValueBuf_.size()))
+        writeError_ = true;
+    if (hasAllTypes_ && (allTypeFd_<0 || allTypeBuf_.size()!=offsetBuf_.size() ||
+        !writeAll(allTypeFd_,allTypeBuf_.data(),allTypeBuf_.size()))) writeError_=true;
+    offsetBuf_.clear();
+    valueBuf_.clear();
+    firstValueBuf_.clear();
+    allTypeBuf_.clear();
+}
+
+void ScanResult::finalize() {
+    if (finalized_) return;
+    flush();
+    if (allTypeFd_>=0) {close(allTypeFd_);allTypeFd_=-1;}
+    // Close the open frame and write the frame table (base + count per frame).
+    if (haveFrame_) { frames_.emplace_back(curFrameBase_, curFrameCount_); haveFrame_ = false; }
+    if (offsetFd_ >= 0 && !frames_.empty()) {
+        // Allocate before opening the extra descriptor: allocation failure
+        // must leave only descriptors owned by ScanResult's destructor.
+        std::vector<uint64_t> raw;
+        raw.reserve(frames_.size() * 2);
+        for (const auto& fr : frames_) { raw.push_back(fr.first); raw.push_back(fr.second); }
+        int ffd = open((dir_ / "frames.bin").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (ffd >= 0) {
+            if (!writeAll(ffd, raw.data(), raw.size() * sizeof(uint64_t))) writeError_ = true;
+            close(ffd);
+        } else {
+            writeError_ = true;
+        }
+    }
+    if (offsetFd_ >= 0) { close(offsetFd_); offsetFd_ = -1; }
+    if (valueFd_ >= 0) { close(valueFd_); valueFd_ = -1; }
+    if (firstValueFd_ >= 0) { close(firstValueFd_); firstValueFd_ = -1; }
+    // A written result is a single implicit shard (its own directory), so the
+    // read paths work the same whether it came straight from a scan or was
+    // reconstructed from disk. Carry the in-memory frame table into the shard.
+    std::vector<Frame> shardFrames;
+    shardFrames.reserve(frames_.size());
+    size_t start = 0;
+    for (const auto& fr : frames_) {
+        shardFrames.push_back({ fr.first, start, static_cast<size_t>(fr.second) });
+        start += static_cast<size_t>(fr.second);
+    }
+    shards_.assign(1, Shard{ dir_, count_, 0, std::move(shardFrames) });
+    finalized_ = true;
+}
+
+uintptr_t ScanResult::address(size_t i) const {
+    const Shard* s = shardAt(i);
+    if (!s) return 0;
+    size_t local = i - s->cum;
+    uint32_t offset = 0;
+    int fd = open((s->dir / "offsets.bin").c_str(), O_RDONLY);
+    if (fd < 0) return 0;
+    if (!preadFull(fd, &offset, sizeof(offset), local * sizeof(uint32_t))) { close(fd); return 0; }
+    close(fd);
+    return reconstruct(s->frames, local, offset);
+}
+
+void ScanResult::value(size_t i, void* buf, size_t valueSize) const {
+    std::memset(buf, 0, valueSize);
+    if (writeError_ || !valueSize_ || valueSize > valueSize_) return;
+    const Shard* s = shardAt(i);
+    if (!s) return;
+    int fd = open((s->dir / "values.bin").c_str(), O_RDONLY);
+    if (fd < 0) return;
+    if (!preadFull(fd, buf, valueSize, (i - s->cum) * valueSize_))
+        std::memset(buf, 0, valueSize);
+    close(fd);
+}
+
+void ScanResult::firstValue(size_t i, void* buf, size_t valueSize) const {
+    std::memset(buf, 0, valueSize);
+    if (writeError_ || !valueSize_ || valueSize > valueSize_) return;
+    const Shard* s = shardAt(i);
+    if (!s) return;
+    int fd = open((s->dir / "first_values.bin").c_str(), O_RDONLY);
+    if (fd < 0) {
+        std::error_code ec;
+        if (!std::filesystem::exists(s->dir / "first_values.bin", ec) && !ec)
+            value(i, buf, valueSize);
+        return;
+    }
+    if (!preadFull(fd, buf, valueSize, (i - s->cum) * valueSize_))
+        std::memset(buf, 0, valueSize);
+    close(fd);
+}
+
+void ScanResult::forEach(std::function<void(uintptr_t, const void*, size_t)> callback, size_t valueSize) const {
+    if (writeError_ || !valueSize || valueSize > valueSize_) return;
+    constexpr size_t BATCH = 4096;
+    if (valueSize_ > SIZE_MAX / BATCH) return;
+    std::vector<uint32_t> offs(BATCH);
+    std::vector<uint8_t> vals(BATCH * valueSize_);
+
+    // Stream each shard in address order, reconstructing addresses from the
+    // shard's frame table as the local index crosses frame boundaries.
+    for (const auto& s : shards_) {
+        if (s.count == 0) continue;
+        int ofd = open((s.dir / "offsets.bin").c_str(), O_RDONLY);
+        int vfd = open((s.dir / "values.bin").c_str(), O_RDONLY);
+        if (ofd < 0 || vfd < 0) {
+            if (ofd >= 0) close(ofd);
+            if (vfd >= 0) close(vfd);
+            continue; // skip an unreadable shard rather than aborting the rest
+        }
+        size_t local = 0;
+        size_t fi = 0; // current frame index
+        while (local < s.count) {
+            size_t n = std::min(s.count - local, BATCH);
+            // A short/truncated read here would pair addresses with the wrong
+            // values; treat this shard's files as truncated and stop it.
+            if (!readFull(ofd, offs.data(), n * sizeof(uint32_t)) ||
+                !readFull(vfd, vals.data(), n * valueSize_))
+                break;
+            for (size_t i = 0; i < n; ++i) {
+                size_t gi = local + i;
+                while (fi < s.frames.size() && gi >= s.frames[fi].start + s.frames[fi].count) ++fi;
+                callback(reconstruct(s.frames, gi, offs[i]), vals.data() + i * valueSize_, valueSize);
+            }
+            local += n;
+        }
+        close(ofd);
+        close(vfd);
+    }
+}
+
+// ── MemoryScanner ──
+
+MemoryScanner::MemoryScanner(int threadCount)
+    : threadCount_(threadCount > 0 ? threadCount : std::thread::hardware_concurrency())
+{
+    if (threadCount_ < 1) threadCount_ = 1;
+}
+
+// This host's name as it goes into a scan directory name: a home directory on
+// NFS is shared between machines, and a pid means something only on its own.
+static const std::string& scanHostTag() {
+    static const std::string tag = [] {
+        char name[256] = {};
+        std::string text = ::gethostname(name, sizeof(name) - 1) == 0 ? name : "";
+        for (auto& c : text)
+            if (!std::isalnum(static_cast<unsigned char>(c)) && c != '.' && c != '_') c = '_';
+        return text.empty() ? std::string("localhost") : text;
+    }();
+    return tag;
+}
+
+// The newest modification time of a scan directory or anything in it,
+// without following links. A scan writes its shards and results inside, which
+// does not change the directory's own time. Past kMaxEntries entries the
+// directory counts as in use (nullopt): no scan writes that many files.
+static std::optional<std::filesystem::file_time_type> newestScanWrite(const std::filesystem::path& dir) {
+    namespace fs = std::filesystem;
+    constexpr size_t kMaxEntries = 16384;
+    std::error_code ec;
+    auto newest = fs::symlink_status(dir, ec).type() == fs::file_type::directory ? fs::last_write_time(dir, ec)
+                                                                               : fs::file_time_type::min();
+    if (ec) return std::nullopt;
+    size_t seen = 0;
+    for (fs::recursive_directory_iterator it(dir, fs::directory_options::none, ec), end; !ec && it != end;
+         it.increment(ec)) {
+        if (++seen > kMaxEntries) return std::nullopt;
+        std::error_code ignored;
+        if (it->is_symlink(ignored)) {
+            it.disable_recursion_pending();
+            continue;
+        }
+        const auto written = fs::last_write_time(it->path(), ignored);
+        if (!ignored && written > newest) newest = written;
+    }
+    if (ec) return std::nullopt;
+    return newest;
+}
+
+// Whether a live ScanResult (of any instance, on any host that shares the
+// directory) holds the directory's .lock. Over NFS Linux maps flock to a
+// byte-range lock the server arbitrates; with local_lock=flock, or no lock
+// manager, the lock is local only and the modification time rule decides.
+static bool scanDirectoryLocked(const std::filesystem::path& dir) {
+    const int fd = ::open((dir / ".lock").c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) return false;
+    const bool held = ::flock(fd, LOCK_EX | LOCK_NB) != 0 && errno == EWOULDBLOCK;
+    ::close(fd);
+    return held;
+}
+
+// Scan directories are named ce-scan-<host>-<pid>-XXXXXX. Remove this host's
+// whose process is gone (a crash or kill skipped their cleanup), and kept ones
+// (see ScanResult::keepFiles) once they are a week old. Another host's pids
+// cannot be checked from here, so its directories are removed once nothing in
+// them has changed for a week and no live scan holds their .lock; that also
+// clears this machine's own from before a hostname change, and the
+// ce-scan-<pid>-XXXXXX directories of earlier versions, which name no host.
+void pruneStaleScanDirectories(const std::filesystem::path& root) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const auto weekAgo = fs::file_time_type::clock::now() - std::chrono::hours(24 * 7);
+    const std::string ours = "ce-scan-" + scanHostTag() + "-";
+    // "<digits>-" and six more characters, as mkdtemp leaves them.
+    auto pidOf = [](const std::string& rest) -> long {
+        const char* digits = rest.c_str();
+        char* after = nullptr;
+        const long pid = std::strtol(digits, &after, 10);
+        if (after == digits || !std::isdigit(static_cast<unsigned char>(*digits)) || *after != '-' ||
+            std::strlen(after + 1) != 6 || pid <= 0)
+            return 0;
+        return pid;
+    };
+    for (fs::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        if (!name.starts_with("ce-scan-") || !it->is_directory(ec)) continue;
+        std::error_code ignored;
+        if (fs::exists(it->path() / ".kept", ignored)) {
+            const auto written = fs::last_write_time(it->path() / ".kept", ignored);
+            if (!ignored && written < weekAgo && !scanDirectoryLocked(it->path())) fs::remove_all(it->path(), ignored);
+            continue;
+        }
+        if (name.starts_with(ours)) {
+            const long pid = pidOf(name.substr(ours.size()));
+            if (pid > 0 && ::kill(static_cast<pid_t>(pid), 0) != 0 && errno == ESRCH) fs::remove_all(it->path(), ignored);
+            continue;
+        }
+        const auto written = newestScanWrite(it->path());
+        if (written && *written < weekAgo && !scanDirectoryLocked(it->path())) fs::remove_all(it->path(), ignored);
+    }
+}
+
+// Where scan results go. /tmp is RAM-backed (tmpfs) on many desktops, and an
+// unknown-initial-value scan writes several times the scanned memory, so the
+// default is the disk-backed cache directory. CE_SCAN_DIR, or an explicitly
+// set TMPDIR, still decide.
+static std::filesystem::path scanRoot() {
+    namespace fs = std::filesystem;
+    static std::once_flag pruned;
+    fs::path root;
+    if (const char* dir = std::getenv("CE_SCAN_DIR"); dir && *dir) root = dir;
+    else if (const char* tmp = std::getenv("TMPDIR"); tmp && *tmp) root = fs::temp_directory_path();
+    else {
+        fs::path cache;
+        if (const char* xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg == '/') cache = xdg;
+        else if (const char* home = std::getenv("HOME"); home && *home == '/') cache = fs::path(home) / ".cache";
+        std::error_code ec;
+        if (!cache.empty()) {
+            // Results hold game memory: the directories are the user's alone.
+            const fs::path app = cache / "neversnooze-ce";
+            fs::create_directories(app / "scans", ec);
+            if (!ec) {
+                fs::permissions(app, fs::perms::owner_all, ec);
+                fs::permissions(app / "scans", fs::perms::owner_all, ec);
+            }
+            if (!ec) root = app / "scans";
+        }
+        if (root.empty()) root = fs::temp_directory_path();
+    }
+    std::call_once(pruned, [&] { pruneStaleScanDirectories(root); });
+    return root;
+}
+
+static std::filesystem::path makeScanDir() {
+    std::string pattern =
+        (scanRoot() / ("ce-scan-" + scanHostTag() + "-" + std::to_string(::getpid()) + "-XXXXXX")).string();
+    if (!mkdtemp(pattern.data()))
+        throw std::system_error(errno, std::generic_category(), "create scan directory");
+    // The lock file the owning ScanResult holds (see adoptDirectory).
+    const std::filesystem::path dir = pattern;
+    if (const int fd = ::open((dir / ".lock").c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600); fd >= 0)
+        ::close(fd);
+    return dir;
+}
+
+void ScanResult::adoptDirectory(const std::filesystem::path& root) {
+    ownedRoot_ = root;
+    if (lockFd_ >= 0) { close(lockFd_); lockFd_ = -1; }
+    if (root.empty()) return;
+    lockFd_ = ::open((root / ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (lockFd_ >= 0 && ::flock(lockFd_, LOCK_SH | LOCK_NB) != 0) {
+        close(lockFd_);
+        lockFd_ = -1;
+    }
+}
+
+void ScanResult::keepFiles() {
+    if (!ownedRoot_.empty()) std::ofstream(ownedRoot_ / ".kept");
+    ownedRoot_.clear();
+}
+
+namespace {
+// Only a successfully returned scan transfers ownership of its files to the
+// caller. Failed scans must not accumulate potentially large partial snapshots.
+struct ScanFailureCleanup {
+    const std::filesystem::path& directory;
+    int exceptions = std::uncaught_exceptions();
+    ~ScanFailureCleanup() noexcept {
+        if (std::uncaught_exceptions() <= exceptions) return;
+        try {
+            std::error_code ignored;
+            std::filesystem::remove_all(directory, ignored);
+        } catch (...) {} // Preserve the original failure, including bad_alloc.
+    }
+};
+
+[[noreturn]] void rethrowScanFailure(const std::exception_ptr& error) {
+    try { std::rethrow_exception(error); }
+    catch (const std::exception&) { throw; }
+    catch (...) { throw std::runtime_error("Scan worker failed with an unknown exception"); }
+}
+
+template<typename Worker>
+void runScanWorkers(int count, Worker&& worker) {
+    std::vector<std::exception_ptr> errors(count);
+    std::atomic<bool> failed{false};
+    // Declared last so every thread joins before its captured state unwinds,
+    // including when the operating system rejects a later thread creation.
+    std::vector<std::jthread> threads;
+    threads.reserve(count);
+    try {
+        for (int index = 0; index < count; ++index) {
+            threads.emplace_back([&, index] {
+                try { worker(index, failed); }
+                catch (...) {
+                    errors[index] = std::current_exception();
+                    failed.store(true, std::memory_order_relaxed);
+                }
+            });
+        }
+    } catch (...) {
+        failed.store(true, std::memory_order_relaxed);
+        throw;
+    }
+    for (auto& thread : threads) thread.join();
+    for (const auto& error : errors) if (error) rethrowScanFailure(error);
+}
+} // namespace
+
+std::unique_ptr<ScanResult> pruneScanResult(const ScanResult& src, size_t valueSize,
+                                            const std::vector<bool>& remove) {
+    if (src.hasWriteError() || !valueSize || (src.count() && src.recordStride() != valueSize))
+        throw std::invalid_argument("cannot prune incomplete results or change their value size");
+    // storeFirst=true so the pruned copy keeps a first-scan-value stream: a survivor's
+    // firstValue is carried across, letting a later "same as first scan" / directional
+    // Next Scan compare correctly. Matches arrive (and are re-emitted) in ascending
+    // address order, which the frame encoding in addResult requires.
+    const auto pruneDir = makeScanDir();
+    auto out = std::make_unique<ScanResult>(pruneDir / "results", /*storeFirst=*/true);
+    out->adoptDirectory(pruneDir);
+    if (src.hasDataFormat()) out->setDataFormat(src.byteOrder(),src.pointerWidth());
+    const bool all=src.hasAllTypeCandidates();
+    if (all) out->enableAllTypeCandidates();
+    const size_t n=src.count();
+    if (src.hasWriteError() || (n && (!valueSize || src.recordStride()!=valueSize))) {
+        out->markWriteError();out->finalize();return out;
+    }
+    ShardReader reader(src.shardLayout(),all);
+    const size_t batch=std::max<size_t>(1,std::min<size_t>(4096,65536/std::max<size_t>(1,valueSize)));
+    std::vector<uintptr_t> addresses(batch);
+    std::vector<uint8_t> values(batch*valueSize),first(batch*valueSize),masks(all ? batch : 0);
+    for (size_t begin=0;begin<n;) {
+        const size_t count=std::min(batch,n-begin);
+        if (!reader.ok || !reader.read(begin,count,addresses.data(),values.data(),first.data(),valueSize,all ? masks.data() : nullptr)) {
+            out->markWriteError();break;
+        }
+        for (size_t j=0;j<count;++j) {
+            if (begin+j<remove.size() && remove[begin+j]) continue;
+            if (all) out->addAllTypeResult(addresses[j],values.data()+j*valueSize,first.data()+j*valueSize,masks[j]);
+            else out->addResult(addresses[j],values.data()+j*valueSize,first.data()+j*valueSize,valueSize);
+        }
+        begin+=count;
+    }
+    out->finalize();
+    return out;
+}
+
+static bool scanNeedsByteOrder(const ScanConfig& config) {
+    if (config.valueType==ValueType::Grouped) {
+        for (const auto& term:config.groupedTerms) if (term.valueType!=ValueType::Byte && term.valueType!=ValueType::ByteArray &&
+            term.valueType!=ValueType::String && term.valueType!=ValueType::Binary) return true;
+        return false;
+    }
+    return config.valueType!=ValueType::Byte && config.valueType!=ValueType::ByteArray &&
+           config.valueType!=ValueType::Binary && config.valueType!=ValueType::String && config.valueType!=ValueType::Custom;
+}
+static bool scanNeedsPointerWidth(const ScanConfig& config) {
+    if (config.valueType==ValueType::Pointer) return true;
+    for (const auto& term:config.groupedTerms) if (term.valueType==ValueType::Pointer) return true;
+    return false;
+}
+// An integer search value must fit its type: the scan casts it to the type's
+// width, so Byte 300 would find 44 and 2 Bytes "bigger than 40000" would
+// compare against -25536. Exact takes the signed or unsigned reading of the
+// same bits; ordered compares use the type's own (Byte unsigned, 2 and 4
+// Bytes signed); an amount changed by may span the whole type.
+static void checkIntegerRange(const ScanConfig& config) {
+    int bits = 0;
+    bool unsignedCompare = false;
+    const char* name = "";
+    switch (config.valueType) {
+        case ValueType::Byte:  bits = 8;  unsignedCompare = true; name = "Byte"; break;
+        case ValueType::Int16: bits = 16; name = "2 Bytes"; break;
+        case ValueType::Int32: bits = 32; name = "4 Bytes"; break;
+        default: return;
+    }
+    const int64_t signedMin = -(int64_t(1) << (bits - 1)), signedMax = (int64_t(1) << (bits - 1)) - 1;
+    const int64_t unsignedMax = (int64_t(1) << bits) - 1;
+    int64_t low = 0, high = 0;
+    switch (config.compareType) {
+        case ScanCompare::Exact: low = signedMin; high = unsignedMax; break;
+        case ScanCompare::Greater: case ScanCompare::Less: case ScanCompare::Between:
+            low = unsignedCompare ? 0 : signedMin;
+            high = unsignedCompare ? unsignedMax : signedMax;
+            break;
+        case ScanCompare::IncreasedBy: case ScanCompare::DecreasedBy: low = -unsignedMax; high = unsignedMax; break;
+        default: return;
+    }
+    auto check = [&](int64_t value) {
+        if (value < low || value > high)
+            throw std::invalid_argument(std::to_string(value) + " does not fit in " + name + " for this scan (" +
+                                        std::to_string(low) + " to " + std::to_string(high) + ")");
+    };
+    check(config.intValue);
+    if (config.compareType == ScanCompare::Between) check(config.intValue2);
+}
+
+static ScanConfig targetScanConfig(ProcessHandle& proc,const ScanConfig& requested,bool& gdbTarget) {
+    checkIntegerRange(requested);
+    // GDB and ceserver targets can disconnect mid-scan: their failed reads look
+    // like unreadable memory, so liveness is re-checked and a scan that lost
+    // its target fails instead of presenting partial results.
+    const auto description=proc.targetDescription();
+    gdbTarget=description.transport==TargetTransport::Gdb || description.transport==TargetTransport::CEServer;
+    if (!description.live) throw std::runtime_error("Scan target disconnected or exited");
+    if (requested.startAddress>requested.stopAddress) throw std::invalid_argument("Scan From must not exceed To");
+    ScanConfig config=requested;
+    if (config.byteOrder==ByteOrder::Unknown) config.byteOrder=description.program.byteOrder;
+    if (config.byteOrder!=ByteOrder::Unknown && config.byteOrder!=ByteOrder::Little && config.byteOrder!=ByteOrder::Big)
+        throw std::invalid_argument("Invalid scan data byte order");
+    if (scanNeedsByteOrder(config) && config.byteOrder==ByteOrder::Unknown)
+        throw std::invalid_argument("Target data byte order is unknown; select the scan byte order explicitly");
+    if (!config.pointerWidth) config.pointerWidth=description.program.pointerWidth;
+    if (config.pointerWidth && config.pointerWidth!=4 && config.pointerWidth!=8)
+        throw std::invalid_argument("Scan pointer width must be 4 or 8 bytes");
+    if (scanNeedsPointerWidth(config) && !config.pointerWidth)
+        throw std::invalid_argument("Target pointer width is unknown; select the scan pointer width explicitly");
+    for (auto& term:config.groupedTerms) if (term.valueType==ValueType::UnicodeString)
+        term.byteArray=utf16Bytes(term.stringValue,config.byteOrder);
+    // "Increased by -5" is "decreased by 5" (new == old + value). The compares
+    // only take a non-negative amount, so a negative one never matched.
+    if (config.compareType==ScanCompare::IncreasedBy || config.compareType==ScanCompare::DecreasedBy) {
+        const auto flip=[&] {
+            config.compareType=config.compareType==ScanCompare::IncreasedBy ? ScanCompare::DecreasedBy : ScanCompare::IncreasedBy;
+        };
+        if (config.valueType==ValueType::Float || config.valueType==ValueType::Double) {
+            if (config.floatValue<0) { config.floatValue=-config.floatValue; flip(); }
+        } else if (config.intValue<0) {
+            if (config.intValue==std::numeric_limits<int64_t>::min())
+                throw std::invalid_argument("The amount changed by is out of range");
+            config.intValue=-config.intValue;
+            if (config.valueType==ValueType::All && config.floatValue<0) config.floatValue=-config.floatValue;
+            flip();
+        }
+    }
+    // A 4-byte pointer scan compares 32-bit values: a larger search value would
+    // be cut to its low 32 bits and find unrelated values.
+    if (config.valueType==ValueType::Pointer && config.pointerWidth==4) {
+        const auto fits=[](int64_t value) { return static_cast<uint64_t>(value)<=UINT32_MAX; };
+        const bool ordered=config.compareType==ScanCompare::Exact || config.compareType==ScanCompare::Greater ||
+                           config.compareType==ScanCompare::Less || config.compareType==ScanCompare::Between;
+        if (ordered && (!fits(config.intValue) || (config.compareType==ScanCompare::Between && !fits(config.intValue2))))
+            throw std::invalid_argument("The search value does not fit a 4-byte pointer (0 to 0xFFFFFFFF)");
+    }
+    return config;
+}
+ScanResult MemoryScanner::firstScan(ProcessHandle& proc, const ScanConfig& requested) {
+    bool gdbTarget=false;const ScanConfig config=targetScanConfig(proc,requested,gdbTarget);
+    cancelled_.store(false);
+    progress_.store(0);
+
+    // These compare against the previous scan's values. A first scan has none;
+    // they used to fall through to Exact on whatever the value box held.
+    switch (config.compareType) {
+        case ScanCompare::Changed: case ScanCompare::Unchanged: case ScanCompare::Increased:
+        case ScanCompare::Decreased: case ScanCompare::IncreasedBy: case ScanCompare::DecreasedBy:
+        case ScanCompare::SameAsFirst:
+            throw std::invalid_argument("This compare needs a previous scan: run a first scan (Exact or Unknown initial value) first");
+        default: break;
+    }
+
+    if (config.valueType == ValueType::Grouped) {
+        if (config.groupedTerms.empty())
+            throw std::invalid_argument("ValueType::Grouped requires grouped terms (use parseGrouped)");
+        if (config.groupedValueSize() == 0)
+            throw std::invalid_argument("ValueType::Grouped has invalid grouped terms");
+        if (config.compareType != ScanCompare::Exact && config.compareType != ScanCompare::Unknown)
+            throw std::invalid_argument("ValueType::Grouped first scan supports only Exact or Unknown compare");
+    }
+
+    if (config.valueType == ValueType::Custom) {
+        if (config.customValueSize == 0)
+            throw std::invalid_argument("ValueType::Custom requires customValueSize > 0");
+        if (config.compareType == ScanCompare::Exact && config.customFormula.empty())
+            throw std::invalid_argument("ValueType::Custom exact scan requires customFormula");
+        if (config.compareType != ScanCompare::Exact && config.compareType != ScanCompare::Unknown)
+            throw std::invalid_argument("ValueType::Custom first scan supports only Exact or Unknown compare");
+    }
+
+    // Get memory regions
+    auto regions = proc.queryRegions();
+    if (gdbTarget && regions.empty()) {
+        if (!proc.targetDescription().live) throw std::runtime_error("The remote target disconnected before scanning");
+        throw std::invalid_argument("The target reported no memory map; for a GDB stub supply explicit guest ranges before scanning");
+    }
+
+    // Filter regions
+    auto protAllowed = [](ProtMatch m, bool has) {
+        return m == ProtMatch::Any || (m == ProtMatch::Yes) == has;
+    };
+    std::vector<MemoryRegion> scanRegions;
+    for (auto& r : regions) {
+        if (r.state != MemState::Committed) continue;
+        if (!(r.protection & MemProt::Read)) continue;
+        if (!protAllowed(config.writableMatch,   (r.protection & MemProt::Write) != 0)) continue;
+        if (!protAllowed(config.executableMatch, (r.protection & MemProt::Exec) != 0)) continue;
+        if (!memoryTypeAllowed(config, r.type)) continue;
+
+        if (!r.size) continue;
+        if (r.size-1>UINTPTR_MAX-r.base) throw std::invalid_argument("Target memory region overflows the address space");
+        uintptr_t scanStart=std::max(r.base,config.startAddress);
+        // Scanners step from the start of each span, so a From address off the
+        // alignment grid would shift every candidate in the region off it too.
+        size_t grid=1;
+        switch (config.valueType) {
+            case ValueType::Byte: case ValueType::Int16: case ValueType::Int32: case ValueType::Int64:
+            case ValueType::Float: case ValueType::Double: case ValueType::Pointer: case ValueType::All:
+                grid=std::max<size_t>(config.alignment,1); break;
+            case ValueType::UnicodeString: grid=2; break;
+            default: break;
+        }
+        if (grid>1 && scanStart%grid) {
+            const uintptr_t add=grid-scanStart%grid;
+            if (scanStart>UINTPTR_MAX-add) continue;
+            scanStart+=add;
+        }
+        if (scanStart>config.stopAddress || scanStart-r.base>=r.size) continue;
+        const size_t remaining=r.size-(scanStart-r.base);
+        const uintptr_t distance=config.stopAddress-scanStart;
+        MemoryRegion clipped=r;
+        clipped.base=scanStart;
+        // Keep spans as base/length so an inclusive last byte at UINTPTR_MAX
+        // never requires constructing an unrepresentable exclusive end.
+        clipped.size=distance<remaining-1 ? distance+1 : remaining;
+        scanRegions.push_back(clipped);
+    }
+
+    auto resultDir = makeScanDir();
+    ScanFailureCleanup cleanup{resultDir};
+
+    size_t totalMem = 0;
+    for (const auto& r:scanRegions) {
+        if (r.size>SIZE_MAX-totalMem) throw std::invalid_argument("Total scan span exceeds the frontend size limit");
+        totalMem+=r.size;
+    }
+    if (totalMem == 0) { ScanResult empty(resultDir / "results", false); empty.adoptDirectory(resultDir); empty.setDataFormat(config.byteOrder,config.pointerWidth);if (config.valueType==ValueType::All) empty.enableAllTypeCandidates();empty.finalize(); return empty; }
+
+    // Scan dispatch lambda (reused by each thread). `customEval` is a
+    // per-thread evaluator for ValueType::Custom (null for other types).
+    auto scanRegion = [&](const uint8_t* buf, size_t bytesRead, uintptr_t base,
+                          ScanResult& res, CustomFormulaEvaluator* customEval,
+                          size_t emitLimit) {
+        switch (config.valueType) {
+            case ValueType::Byte:
+                scanIntegerTarget<uint8_t>(buf, bytesRead, base, config.alignment,
+                    (uint8_t)config.intValue, (uint8_t)config.intValue2, config.compareType, res,config.byteOrder); break;
+            case ValueType::Int16:
+                scanIntegerTarget<int16_t>(buf, bytesRead, base, config.alignment,
+                    (int16_t)config.intValue, (int16_t)config.intValue2, config.compareType, res,config.byteOrder); break;
+            case ValueType::Int32:
+                scanIntegerTarget<int32_t>(buf, bytesRead, base, config.alignment,
+                    (int32_t)config.intValue, (int32_t)config.intValue2, config.compareType, res,config.byteOrder); break;
+            case ValueType::Int64:
+                scanIntegerTarget<int64_t>(buf, bytesRead, base, config.alignment,
+                    config.intValue, config.intValue2, config.compareType, res,config.byteOrder); break;
+            case ValueType::Pointer:
+                if (config.pointerWidth==4) scanIntegerTarget<uint32_t>(buf,bytesRead,base,config.alignment,
+                    static_cast<uint32_t>(config.intValue),static_cast<uint32_t>(config.intValue2),config.compareType,res,config.byteOrder);
+                else scanIntegerTarget<uint64_t>(buf,bytesRead,base,config.alignment,
+                    static_cast<uint64_t>(config.intValue),static_cast<uint64_t>(config.intValue2),config.compareType,res,config.byteOrder);
+                break;
+            case ValueType::Float:
+                if (config.byteOrder!=nativeScanByteOrder || !tryScanExactFloat<float>(buf, bytesRead, base, config.alignment, config, res))
+                    scanBufferFloating<float>(buf, bytesRead, base, config.alignment, config, res);
+                break;
+            case ValueType::Double:
+                if (config.byteOrder!=nativeScanByteOrder || !tryScanExactFloat<double>(buf, bytesRead, base, config.alignment, config, res))
+                    scanBufferFloating<double>(buf, bytesRead, base, config.alignment, config, res);
+                break;
+            case ValueType::String:
+                scanBufferString(buf, bytesRead, base,
+                    encodeStringBytes(config.stringValue, config.stringEncoding), res,
+                    !config.caseSensitive); break;
+            case ValueType::UnicodeString:
+                scanBufferUnicode(buf, bytesRead, base, config.stringValue, res,
+                    !config.caseSensitive,config.byteOrder); break;
+            case ValueType::ByteArray:
+                scanBufferAOB(buf, bytesRead, base, config.byteArray, config.byteArrayMask, res); break;
+            case ValueType::Binary: {
+                scanBufferBinary(buf, bytesRead, base, config.byteArray, config.byteMask, config.alignment, res);
+                break;
+            }
+            case ValueType::All:
+                scanBufferAllTypes(buf,bytesRead,base,config.alignment,config,res,emitLimit); break;
+            case ValueType::Grouped:
+                if (config.compareType == ScanCompare::Unknown)
+                    scanBufferUnknown(buf, bytesRead, base, config.alignment, config.groupedValueSize(), res);
+                else
+                    scanBufferGrouped(buf, bytesRead, base, config.alignment, config, res);
+                break;
+            case ValueType::Custom: {
+                size_t customSize = std::max<size_t>(1, config.customValueSize);
+                if (bytesRead < customSize) break;
+                size_t limit = bytesRead - customSize + 1;
+                size_t alignment = std::max<size_t>(1, config.alignment);
+                for (size_t offset = 0; offset < limit; offset += alignment) {
+                    if (config.compareType == ScanCompare::Unknown) {
+                        res.addResult(base + offset, buf + offset, customSize);
+                        continue;
+                    }
+                    bool match = false;
+                    if (customEval &&
+                        customEval->eval(buf + offset, buf + offset, customSize, false, match) && match)
+                        res.addResult(base + offset, buf + offset, customSize);
+                }
+                break;
+            }
+            default: break;
+        }
+    };
+
+    // Split every region into fixed-size chunks, then hand each thread a
+    // contiguous run of chunks. Splitting means one huge region (a common case:
+    // a game's main heap can be the bulk of scanned memory) is shared across all
+    // threads instead of pinning a single core (the old per-region split left a
+    // process with one big region single-threaded). A contiguous run per thread
+    // keeps each thread's output address-ordered, so concatenating thread files
+    // in order still yields a globally sorted result (nextScan relies on nothing
+    // here, but the GUI shows results in address order).
+    //
+    // Each chunk "owns" `owned` start positions and reads an extra `overlap`
+    // (maxMatchSize-1) lookahead bytes so a value straddling the chunk boundary
+    // is fully readable and is emitted exactly once (by the chunk that owns its
+    // start). `owned` is a multiple of alignment so the scan stride grid is
+    // preserved across boundaries, so there are no duplicates and no gaps.
+    // Per-chunk owned span. Kept small enough that a chunk the thread just read
+    // via process_vm_readv is still hot in cache when it is scanned (read and
+    // scan run back-to-back on the same thread), instead of being evicted and
+    // re-fetched from RAM — worth ~3x on a first scan. The measured optimum is
+    // about half the L2, so size it from the detected L2 (clamped), falling back
+    // to 128 KiB. CE_SCAN_CHUNK_KB overrides for tuning.
+    size_t kChunkBytes = 128u * 1024;
+#ifdef _SC_LEVEL2_CACHE_SIZE
+    if (long l2 = sysconf(_SC_LEVEL2_CACHE_SIZE); l2 > 0)
+        kChunkBytes = std::clamp<size_t>(static_cast<size_t>(l2) / 2, 64u * 1024, 1024u * 1024);
+#endif
+    if (const char* e = std::getenv("CE_SCAN_CHUNK_KB")) {
+        char* end = nullptr;
+        errno=0;const unsigned long kb=std::strtoul(e,&end,10);
+        if (!errno && end!=e && !*end && kb>0 && kb<=SIZE_MAX/1024)
+            kChunkBytes=static_cast<size_t>(kb)*1024;
+    }
+    size_t alignment = std::max<size_t>(1, config.alignment);
+    size_t maxMatchSize = std::max<size_t>(1, valueSizeForConfig(config));
+    size_t overlap = maxMatchSize - 1;
+    size_t ownedLen = (kChunkBytes / alignment) * alignment;
+    if (ownedLen == 0) ownedLen = alignment;
+
+    struct Chunk { uintptr_t base; size_t owned; size_t readLen; };
+    std::vector<Chunk> chunks;
+    chunks.reserve(totalMem / ownedLen + scanRegions.size());
+
+    // Decide whether non-resident (demand-zero) pages of anonymous regions can
+    // be skipped. Safe only when an all-zero window can't match this search: an
+    // untouched page reads back as zeros, so if zeros never match it can hold no
+    // result. Probe the real scan predicate on a zero buffer (correct for every
+    // value type — Unknown/zero-value searches emit and so disable the skip),
+    // never for Custom (its Lua predicate is opaque here), and honour an override.
+    bool skipNonResident = false;
+    {
+        const char* env = std::getenv("CE_SCAN_PAGEMAP");
+        bool disabled = env && (!std::strcmp(env, "off") || !std::strcmp(env, "0"));
+        // Skip only when a candidate value cannot straddle a page boundary, i.e.
+        // the stride keeps every window inside one page (alignment >= value size
+        // and alignment divides the page). Otherwise a value starting in a
+        // resident page could reach into a skipped one (or vice versa) and be
+        // missed. Aligned numeric scans (the default) satisfy this; unaligned or
+        // wide-stride scans just read everything.
+        long ps = sysconf(_SC_PAGESIZE);
+        // Text and byte patterns are matched at every byte whatever the
+        // configured alignment, so their real stride is 1.
+        const bool bytewise = config.valueType == ValueType::String || config.valueType == ValueType::UnicodeString ||
+                              config.valueType == ValueType::ByteArray || config.valueType == ValueType::Binary;
+        const size_t stride = bytewise ? 1 : alignment;
+        bool cannotStraddle = ps > 0 && stride >= maxMatchSize &&
+                              (static_cast<size_t>(ps) % stride == 0);
+        if (!disabled && cannotStraddle && config.valueType != ValueType::Custom) {
+            std::vector<uint8_t> zeroWindow(std::max<size_t>(maxMatchSize * 4, 64), 0);
+            ScanResult probe(resultDir / "probe");
+            scanRegion(zeroWindow.data(), zeroWindow.size(), 0x1000, probe, nullptr, zeroWindow.size());
+            probe.finalize();
+            skipNonResident = (probe.count() == 0);
+            std::filesystem::remove_all(resultDir / "probe");
+        }
+    }
+
+    // Build chunks from each region's scan ranges. For an anonymous (Private)
+    // region when skipping applies, that is only its resident/swapped page runs
+    // — skipping the large reserved-but-never-touched address space a process
+    // maps; otherwise the whole region. File-backed regions are never skipped (a
+    // non-resident page there still holds file data); tiny regions aren't worth
+    // a pagemap query.
+    constexpr size_t kPagemapMinRegion = 256u * 1024;
+    for (const auto& region : scanRegions) {
+        std::vector<std::pair<uintptr_t,size_t>> ranges;
+        if (skipNonResident && region.type==MemType::Private && region.size>=kPagemapMinRegion &&
+            region.size<=UINTPTR_MAX-region.base) {
+            for (const auto& [begin,end]:proc.residentRanges(region.base,region.size)) {
+                if (begin<region.base || end<=begin || end>region.base+region.size)
+                    throw std::invalid_argument("Resident memory span exceeds its target region");
+                ranges.emplace_back(begin,end-begin);
+            }
+        } else ranges.emplace_back(region.base,region.size);
+        for (const auto& [rbase,rsize]:ranges) {
+            for (size_t offset=0;offset<rsize;) {
+                const size_t owned=std::min(ownedLen,rsize-offset);
+                const size_t readLen=owned+std::min(overlap,rsize-offset-owned);
+                chunks.push_back({rbase+offset,owned,readLen});
+                offset+=owned;
+            }
+        }
+    }
+
+    // Bytes actually scanned (skipping shrinks this below the region total).
+    // Drives the thread partition and the progress denominator below.
+    totalMem = 0;
+    for (const auto& c : chunks) totalMem += c.owned;
+    if (totalMem == 0) { ScanResult empty(resultDir / "results", false); empty.adoptDirectory(resultDir); empty.setDataFormat(config.byteOrder,config.pointerWidth);empty.finalize(); return empty; }
+
+    // Only fan out across cores when the handle tolerates concurrent reads
+    // (process_vm_readv does; a socket-backed ceserver handle does not).
+    int maxThreads = proc.supportsConcurrentReads() ? threadCount_ : 1;
+    int nThreads = std::min(maxThreads, std::max<int>(1, (int)chunks.size()));
+
+    // Partition chunk indices into nThreads contiguous runs of ~equal owned
+    // bytes (chunks are uniform except region tails, so this balances well).
+    std::vector<size_t> chunkBegin(nThreads), chunkEnd(nThreads);
+    {
+        size_t perThread = (totalMem + nThreads - 1) / nThreads; // ceil
+        if (perThread == 0) perThread = 1;
+        size_t ci = 0;
+        for (int t = 0; t < nThreads; ++t) {
+            chunkBegin[t] = ci;
+            size_t acc = 0;
+            while (ci < chunks.size() && (acc < perThread || t == nThreads - 1)) {
+                acc += chunks[ci].owned;
+                ++ci;
+            }
+            chunkEnd[t] = ci;
+        }
+    }
+
+    // Launch threads; each writes to its own ScanResult
+    std::vector<ScanResult> threadResults;
+    threadResults.reserve(nThreads);
+    for (int t = 0; t < nThreads; ++t)
+        // storeFirst=false: a first scan's firstValue equals its value, so the
+        // duplicate first_values stream is skipped (readers fall back to values).
+        threadResults.emplace_back(resultDir / ("t" + std::to_string(t)), false);
+
+    std::atomic<size_t> scannedBytes{0};
+    runScanWorkers(nThreads, [&](int t, const std::atomic<bool>& failed) {
+        auto& res = threadResults[t];res.setDataFormat(config.byteOrder,config.pointerWidth);
+        if (config.valueType==ValueType::All) res.enableAllTypeCandidates();
+        std::vector<uint8_t> buf;
+        // One Lua evaluator per worker (lua_State is not thread-safe);
+        // the formula is compiled once and reused across all offsets.
+        CustomFormulaEvaluator customEval(config.valueType == ValueType::Custom
+                                          ? config.customFormula : std::string{});
+        for (size_t ci = chunkBegin[t];
+             ci < chunkEnd[t] && !cancelled_.load(std::memory_order_relaxed) &&
+             !failed.load(std::memory_order_relaxed); ++ci) {
+            const Chunk& c = chunks[ci];
+            buf.resize(c.readLen);
+            auto readResult = proc.read(c.base, buf.data(), c.readLen);
+            size_t bytesRead = (readResult && *readResult > 0) ? *readResult : 0;
+            if (bytesRead == 0) continue;
+            // Owned start positions: everything up to `owned`; the
+            // trailing bytes are overlap lookahead only.
+            size_t emitLimit = std::min<size_t>(bytesRead, c.owned);
+            scanRegion(buf.data(), bytesRead, c.base, res, &customEval, emitLimit);
+            // Don't double-count the overlap lookahead in progress.
+            scannedBytes.fetch_add(std::min(bytesRead, c.owned), std::memory_order_relaxed);
+            progress_.store((float)scannedBytes.load(std::memory_order_relaxed) / totalMem, std::memory_order_relaxed);
+        }
+        res.finalize();
+    });
+    progress_.store(1.0f);
+
+    // Reference the worker files in place (in address order) — no merge copy.
+    if (gdbTarget && !proc.targetDescription().live) throw std::runtime_error("The remote target disconnected during scanning");
+    auto merged = assembleShardedResult(resultDir / "results", threadResults);
+    merged.adoptDirectory(resultDir);
+    return merged;
+}
+
+ScanResult MemoryScanner::nextScan(ProcessHandle& proc, const ScanConfig& requested, const ScanResult& previous) {
+    if (previous.hasWriteError()) throw std::invalid_argument("The previous scan has invalid backing files");
+    if (previous.count() && requested.valueType==ValueType::All && !previous.hasAllTypeCandidates())
+        throw std::invalid_argument("All-type scan candidates are missing; start a fresh All-type scan");
+    if (previous.count() && previous.hasAllTypeCandidates() && requested.valueType!=ValueType::All && !allCandidateFor(requested.valueType))
+        throw std::invalid_argument("Select one of the All-type numeric types or start a fresh scan");
+    bool gdbTarget=false;const ScanConfig config=targetScanConfig(proc,requested,gdbTarget);
+    if (previous.hasDataFormat()) {
+        if (requested.byteOrder==ByteOrder::Unknown && scanNeedsByteOrder(config) && previous.byteOrder()!=ByteOrder::Unknown && previous.byteOrder()!=config.byteOrder)
+            throw std::invalid_argument("The next scan data byte order differs from the captured samples");
+        if (!requested.pointerWidth && scanNeedsPointerWidth(config) && previous.pointerWidth() && previous.pointerWidth()!=config.pointerWidth)
+            throw std::invalid_argument("The next scan pointer width differs from the captured samples");
+    }
+    if (previous.hasWriteError())
+        throw std::invalid_argument("previous scan result has incomplete or invalid backing files");
+    cancelled_.store(false);
+    progress_.store(0);
+
+    if (config.valueType == ValueType::Grouped) {
+        if (config.groupedTerms.empty())
+            throw std::invalid_argument("ValueType::Grouped requires grouped terms (use parseGrouped)");
+        if (config.groupedValueSize() == 0)
+            throw std::invalid_argument("ValueType::Grouped has invalid grouped terms");
+        if (config.compareType != ScanCompare::Exact &&
+            config.compareType != ScanCompare::Changed &&
+            config.compareType != ScanCompare::Unchanged &&
+            config.compareType != ScanCompare::SameAsFirst &&
+            config.compareType != ScanCompare::Unknown) {
+            throw std::invalid_argument("ValueType::Grouped next scan supports exact/changed/unchanged/samefirst/unknown");
+        }
+    }
+
+    if (config.valueType == ValueType::Custom) {
+        if (config.customValueSize == 0)
+            throw std::invalid_argument("ValueType::Custom requires customValueSize > 0");
+        if (config.compareType == ScanCompare::Exact && config.customFormula.empty())
+            throw std::invalid_argument("ValueType::Custom exact next scan requires customFormula");
+        if (config.compareType != ScanCompare::Exact &&
+            config.compareType != ScanCompare::Changed &&
+            config.compareType != ScanCompare::Unchanged &&
+            config.compareType != ScanCompare::SameAsFirst &&
+            config.compareType != ScanCompare::Unknown) {
+            throw std::invalid_argument("ValueType::Custom next scan supports exact/changed/unchanged/samefirst/unknown");
+        }
+    }
+
+    // Strings, byte arrays and binary values have no order or amount: a
+    // bigger/smaller/between or changed-by compare used to drop every row or
+    // act as another compare.
+    if (config.valueType == ValueType::String || config.valueType == ValueType::UnicodeString ||
+        config.valueType == ValueType::ByteArray || config.valueType == ValueType::Binary) {
+        if (config.compareType == ScanCompare::Greater || config.compareType == ScanCompare::Less ||
+            config.compareType == ScanCompare::Between || config.compareType == ScanCompare::IncreasedBy ||
+            config.compareType == ScanCompare::DecreasedBy)
+            throw std::invalid_argument("Text, byte array and binary scans support exact, changed, unchanged and same as first");
+    }
+
+    size_t valueSize = valueSizeForConfig(config);
+    const size_t inputSize=previous.hasAllTypeCandidates() ? 8 : valueSize;
+    // The persisted addresses/values/first-values streams were written at the
+    // previous scan's record size. If the current config yields a different
+    // size (e.g. a variable-length string re-scan with a changed length), the
+    // valueSize stride would desync the value streams and pair addresses with
+    // the wrong bytes. Reject rather than silently produce wrong matches.
+    // (For fixed-width types the two sizes always agree, so this never fires.)
+    //
+    // Recheck the persisted stride to detect backing files truncated after load.
+    if (previous.count() > 0) {
+        size_t prevStride = previous.recordStride();
+        if (prevStride == 0 || prevStride != inputSize) {
+            throw std::invalid_argument(
+                "next scan value size differs from the previous scan; "
+                "the search length must stay constant across scans");
+        }
+    }
+    // Precompute the exact-match needles once for the whole scan (not per address).
+    std::vector<uint8_t> stringNeedle;
+    if (config.valueType == ValueType::String && config.compareType == ScanCompare::Exact)
+        stringNeedle = encodeStringBytes(config.stringValue, config.stringEncoding);
+    std::vector<uint8_t> unicodeNeedle;
+    if (config.valueType == ValueType::UnicodeString)
+        unicodeNeedle = utf16Bytes(config.stringValue,config.byteOrder);
+
+    auto resultDir = makeScanDir();
+    ScanFailureCleanup cleanup{resultDir};
+    size_t total = previous.count();
+    if (total == 0) {
+        ScanResult empty(resultDir / "results");
+        empty.adoptDirectory(resultDir);
+        if (config.valueType==ValueType::All) empty.enableAllTypeCandidates();
+        empty.setDataFormat(config.byteOrder,config.pointerWidth);empty.finalize();
+        return empty;
+    }
+
+    // The previous result may be split across worker shards; the reader hides
+    // that and serves any global index range (see ShardReader).
+    auto layout = previous.shardLayout();
+
+    constexpr size_t BATCH = 4096;
+    // Small result sets stay single-threaded: once reads are batched, spinning
+    // up per-worker result files costs more than the scan. Big sets fan out:
+    // each worker owns a contiguous, ascending index slice read positionally
+    // (pread) with no shared file offset, and referencing worker files in order
+    // keeps the output sorted.
+    constexpr size_t kMTFloor = 1u << 16; // 65536 results
+    int nThreads = (total < kMTFloor || !proc.supportsConcurrentReads())
+                       ? 1 : std::max(1, threadCount_);
+    nThreads = std::min<int>(nThreads, std::max<size_t>(1, total / BATCH));
+    if (nThreads < 1) nThreads = 1;
+
+    std::atomic<size_t> processed{0};
+
+    // Scan one previous-result index range [begin,end); write matches to `res`
+    // (a per-worker ScanResult, so the hot path needs no locking).
+    auto worker = [&](size_t begin, size_t end, ScanResult& res, const std::atomic<bool>& failed) {
+        res.setDataFormat(config.byteOrder,config.pointerWidth);
+        const bool all=config.valueType==ValueType::All;
+        if (all) res.enableAllTypeCandidates();
+        ShardReader reader(layout,previous.hasAllTypeCandidates()); // own fds → positional reads don't collide
+        if (!reader.ok) {
+            res.markWriteError();
+            res.finalize();
+            return;
+        }
+        // One Lua evaluator per worker (lua_State is not thread-safe).
+        CustomFormulaEvaluator customEval(config.valueType == ValueType::Custom
+                                          ? config.customFormula : std::string{});
+        std::vector<uintptr_t> addrs(BATCH);
+        std::vector<uint8_t> oldVals(BATCH * inputSize);
+        std::vector<uint8_t> firstVals(BATCH * inputSize);
+        // Batched current-value reads: one process_vm_readv per batch (see
+        // ProcessHandle::readMany) instead of a syscall per address, into a
+        // reused buffer instead of a per-address heap allocation.
+        std::vector<uint8_t> curVals(BATCH * valueSize);
+        std::vector<uint8_t> okFlags(BATCH);
+        std::vector<uintptr_t> selectedAddresses(BATCH);
+        std::vector<size_t> selectedIndexes(BATCH);
+        std::vector<uint8_t> previousCandidates(previous.hasAllTypeCandidates() ? BATCH : 0),selectedCandidates(all ? BATCH : 0);
+        std::vector<uint8_t> pendingCandidates(all ? BATCH : 0),readCandidates(all ? BATCH : 0);
+        std::vector<uintptr_t> readAddresses(all ? BATCH : 0);
+        std::vector<size_t> readIndexes(all ? BATCH : 0);
+        std::vector<uint8_t> readValues(all ? BATCH*8 : 0);
+
+        for (size_t idx = begin; idx < end && !cancelled_.load(std::memory_order_relaxed) &&
+             !failed.load(std::memory_order_relaxed); ) {
+            size_t n = std::min(BATCH, end - idx);
+            // Read this slice's addresses/old-values/first-values across shards.
+            // A short/interrupted read would desync the streams or feed garbage
+            // addresses into readMany; on truncation stop rather than emit wrong
+            // matches.
+            if (!reader.read(idx,n,addrs.data(),oldVals.data(),firstVals.data(),inputSize,
+                             previous.hasAllTypeCandidates() ? previousCandidates.data() : nullptr)) {
+                res.markWriteError();
+                break;
+            }
+
+            size_t selected=0;
+            for (size_t i=0;i<n;++i) {
+                const auto address=addrs[i];
+                if (previous.hasAllTypeCandidates() && !all && !(previousCandidates[i]&allCandidateFor(config.valueType))) continue;
+                if (address<config.startAddress || address>config.stopAddress) continue;
+                if (all) {
+                    selectedCandidates[selected]=allCandidatesFitting(previousCandidates[i],config.stopAddress-address);
+                    if (!selectedCandidates[selected]) continue;
+                } else if (valueSize-1>config.stopAddress-address) continue;
+                selectedAddresses[selected]=address;selectedIndexes[selected]=i;++selected;
+            }
+            if (all) {
+                std::fill(curVals.begin(),curVals.begin()+selected*8,0);
+                std::fill(readCandidates.begin(),readCandidates.begin()+selected,0);
+                std::copy_n(selectedCandidates.begin(),selected,pendingCandidates.begin());
+                // Group by actual candidate width. A failed wide read retries
+                // narrower surviving types, rather than losing a readable byte
+                // merely because a neighboring field/page became unavailable.
+                for (size_t width:{size_t(8),size_t(4),size_t(2),size_t(1)}) {
+                    size_t reads=0;
+                    for (size_t j=0;j<selected;++j) if (allCandidateReadSize(pendingCandidates[j])==width) {
+                        readAddresses[reads]=selectedAddresses[j];readIndexes[reads++]=j;
+                    }
+                    if (!reads) continue;
+                    proc.readMany(readAddresses.data(),reads,width,readValues.data(),okFlags.data());
+                    for (size_t k=0;k<reads;++k) {
+                        const size_t j=readIndexes[k];
+                        if (okFlags[k]) {
+                            std::memcpy(curVals.data()+j*8,readValues.data()+k*width,width);
+                            readCandidates[j]=pendingCandidates[j];pendingCandidates[j]=0;
+                        } else for (size_t bit=0;bit<allCandidateWidths.size();++bit)
+                            if (allCandidateWidths[bit]==width) pendingCandidates[j]&=static_cast<uint8_t>(~(1u<<bit));
+                    }
+                }
+            } else proc.readMany(selectedAddresses.data(),selected,valueSize,curVals.data(),okFlags.data());
+
+            for (size_t j=0;j<selected;++j) {
+                if (all ? !readCandidates[j] : !okFlags[j]) continue;
+                const size_t i=selectedIndexes[j];
+                const uint8_t* currentVal=curVals.data()+j*valueSize;
+                const uint8_t* oldVal     = oldVals.data() + i * inputSize;
+                const uint8_t* firstVal   = firstVals.data() + i * inputSize;
+                if (all) {
+                    const auto candidates=nextAllTypeCandidates(config,readCandidates[j],currentVal,oldVal,firstVal);
+                    if (candidates) res.addAllTypeResult(addrs[i],currentVal,firstVal,candidates);
+                } else if (nextScanCompare(config, valueSize, currentVal, oldVal, firstVal,
+                                    stringNeedle, unicodeNeedle, customEval))
+                    res.addResult(addrs[i], currentVal, firstVal, valueSize);
+            }
+
+            idx += n;
+            size_t done = processed.fetch_add(n, std::memory_order_relaxed) + n;
+            progress_.store((float)done / total, std::memory_order_relaxed);
+        }
+
+        res.finalize();
+    };
+
+    if (nThreads == 1) {
+        ScanResult result(resultDir / "results");
+        result.adoptDirectory(resultDir);
+        const std::atomic<bool> failed{false};
+        try { worker(0, total, result, failed); }
+        catch (...) { rethrowScanFailure(std::current_exception()); }
+        if (gdbTarget && !proc.targetDescription().live) throw std::runtime_error("The remote target disconnected during scanning");
+        return result;
+    }
+
+    // Fan out over contiguous, ascending index slices.
+    std::vector<ScanResult> parts;
+    parts.reserve(nThreads);
+    for (int t = 0; t < nThreads; ++t)
+        parts.emplace_back(resultDir / ("t" + std::to_string(t)));
+
+    size_t per = (total + nThreads - 1) / nThreads; // ceil
+    runScanWorkers(nThreads, [&](int t, const std::atomic<bool>& failed) {
+        size_t begin = std::min(total, (size_t)t * per);
+        size_t end   = std::min(total, begin + per);
+        worker(begin, end, parts[t], failed);
+    });
+
+    // Reference the worker files in place (in address order) — no merge copy.
+    if (gdbTarget && !proc.targetDescription().live) throw std::runtime_error("The remote target disconnected during scanning");
+    auto merged = assembleShardedResult(resultDir / "results", parts);
+    merged.adoptDirectory(resultDir);
+    return merged;
+}
+
+} // namespace ce

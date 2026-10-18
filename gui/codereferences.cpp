@@ -1,0 +1,256 @@
+#include "gui/codereferences.hpp"
+#include "gui/theme.hpp"
+#include "analysis/code_analysis.hpp"
+
+#include <QMessageBox>
+#include <QHeaderView>
+#include <QLabel>
+#include <QPushButton>
+#include <QTabWidget>
+#include <QVBoxLayout>
+#include <QHBoxLayout>
+#include <QProgressDialog>
+#include <QApplication>
+
+namespace ce::gui {
+
+CodeReferencesWindow::CodeReferencesWindow(ProcessHandle* proc, QWidget* parent)
+    : QMainWindow(parent), proc_(proc) {
+    setWindowTitle("Code References");
+    resize(900, 560);
+
+    auto* central = new QWidget;
+    auto* layout = new QVBoxLayout(central);
+
+    auto* top = new QHBoxLayout;
+    moduleCombo_ = new QComboBox;
+    minCaveSizeSpin_ = new QSpinBox;
+    minCaveSizeSpin_->setRange(4, 4096);
+    minCaveSizeSpin_->setValue(16);
+    assemblyPatternEdit_ = new QLineEdit;
+    assemblyPatternEdit_->setPlaceholderText("Instruction to find, e.g. mov eax,1");
+    auto* analyzeBtn = new QPushButton("Analyze");
+    top->addWidget(moduleCombo_, 1);
+    top->addWidget(new QLabel("Min cave bytes:"));
+    top->addWidget(minCaveSizeSpin_);
+    top->addWidget(assemblyPatternEdit_, 1);
+    top->addWidget(analyzeBtn);
+    layout->addLayout(top);
+
+    auto* tabs = new QTabWidget;
+    stringsTable_ = new QTableWidget;
+    functionsTable_ = new QTableWidget;
+    functionSummaryTable_ = new QTableWidget;
+    callGraphTable_ = new QTableWidget;
+    jumpsTable_ = new QTableWidget;
+    ripRelativeTable_ = new QTableWidget;
+    assemblyTable_ = new QTableWidget;
+    cavesTable_ = new QTableWidget;
+    for (auto* table : {stringsTable_, functionsTable_, jumpsTable_, ripRelativeTable_, assemblyTable_}) {
+        table->setColumnCount(3);
+        table->setHorizontalHeaderLabels({"Instruction", "Target", "Text"});
+        table->horizontalHeader()->setStretchLastSection(true);
+        // Instruction and Target are 16-digit hex addresses; fit them to content
+        // so they aren't clipped, and let the Text column take the slack.
+        table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+        table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+        table->setSelectionBehavior(QAbstractItemView::SelectRows);
+        styleDataTable(table);
+        setEmptyHint(table, table == assemblyTable_
+            ? "Type an instruction above (for example \"mov eax,1\") and click Analyze to find every place the module contains exactly it."
+            : "Pick a module and click Analyze.");
+        table->verticalHeader()->setVisible(false);
+        connect(table, &QTableWidget::cellDoubleClicked, this, [this, table](int row, int column) {
+            bool ok = false;
+            auto text = table->item(row, column == 1 ? 1 : 0)->text();
+            auto addr = text.toULongLong(&ok, 16);
+            if (ok) emit navigateTo(addr);
+        });
+    }
+    functionSummaryTable_->setColumnCount(2);
+    functionSummaryTable_->setHorizontalHeaderLabels({"Function", "References"});
+    functionSummaryTable_->horizontalHeader()->setStretchLastSection(true);
+    functionSummaryTable_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    functionSummaryTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
+    styleDataTable(functionSummaryTable_);
+    setEmptyHint(functionSummaryTable_, "Pick a module and click Analyze.");
+    functionSummaryTable_->verticalHeader()->setVisible(false);
+    connect(functionSummaryTable_, &QTableWidget::cellDoubleClicked, this, [this](int row, int) {
+        bool ok = false;
+        auto addr = functionSummaryTable_->item(row, 0)->text().toULongLong(&ok, 16);
+        if (ok) emit navigateTo(addr);
+    });
+    callGraphTable_->setColumnCount(3);
+    callGraphTable_->setHorizontalHeaderLabels({"Caller", "Callee", "Call Site"});
+    callGraphTable_->horizontalHeader()->setStretchLastSection(true);
+    callGraphTable_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    callGraphTable_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    callGraphTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
+    styleDataTable(callGraphTable_);
+    setEmptyHint(callGraphTable_, "Pick a module and click Analyze.");
+    callGraphTable_->verticalHeader()->setVisible(false);
+    connect(callGraphTable_, &QTableWidget::cellDoubleClicked, this, [this](int row, int column) {
+        bool ok = false;
+        int sourceColumn = column == 2 ? 2 : 1;
+        auto addr = callGraphTable_->item(row, sourceColumn)->text().toULongLong(&ok, 16);
+        if (ok) emit navigateTo(addr);
+    });
+    cavesTable_->setColumnCount(2);
+    cavesTable_->setHorizontalHeaderLabels({"Address", "Size"});
+    cavesTable_->horizontalHeader()->setStretchLastSection(true);
+    cavesTable_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    cavesTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
+    styleDataTable(cavesTable_);
+    setEmptyHint(cavesTable_, "Pick a module and click Analyze to list unused code space.");
+    cavesTable_->verticalHeader()->setVisible(false);
+    connect(cavesTable_, &QTableWidget::cellDoubleClicked, this, [this](int row, int) {
+        bool ok = false;
+        auto addr = cavesTable_->item(row, 0)->text().toULongLong(&ok, 16);
+        if (ok) emit navigateTo(addr);
+    });
+    tabs->addTab(stringsTable_, "Referenced Strings");
+    tabs->addTab(functionsTable_, "Referenced Functions");
+    tabs->addTab(functionSummaryTable_, "Functions");
+    tabs->addTab(callGraphTable_, "Call Graph");
+    tabs->addTab(jumpsTable_, "Jumps");
+    tabs->addTab(ripRelativeTable_, "RIP-relative");
+    tabs->addTab(assemblyTable_, "Assembly Scan");
+    tabs->addTab(cavesTable_, "Code Caves");
+    layout->addWidget(tabs, 1);
+
+    statusLabel_ = new QLabel;
+    layout->addWidget(statusLabel_);
+
+    setCentralWidget(central);
+    connect(analyzeBtn, &QPushButton::clicked, this, &CodeReferencesWindow::analyzeSelectedModule);
+
+    if (proc_) {
+        modules_ = proc_->modules();
+        for (const auto& module : modules_) {
+            auto label = QString("%1  %2")
+                .arg(module.base, 16, 16, QChar('0'))
+                .arg(QString::fromStdString(module.name.empty() ? module.path : module.name));
+            moduleCombo_->addItem(label);
+        }
+    }
+
+    statusLabel_->setText(QString("%1 modules available").arg(modules_.size()));
+}
+
+ModuleInfo CodeReferencesWindow::selectedModule() const {
+    auto index = moduleCombo_->currentIndex();
+    if (index < 0 || index >= (int)modules_.size()) return {};
+    return modules_[index];
+}
+
+void CodeReferencesWindow::analyzeSelectedModule() {
+    if (!proc_ || modules_.empty()) return;
+
+    auto module = selectedModule();
+    // The module's own instruction set (WoW64, ARM), and an error rather than an
+    // escaping exception when it cannot be disassembled.
+    auto architecture = disassemblerArchFor(*proc_, module.base);
+    if (!architecture) {
+        QMessageBox::warning(this, "Code references", QString::fromStdString(architecture.error()));
+        return;
+    }
+    CodeAnalyzer analyzer(*architecture);
+
+    // Each pass scans the whole module and can take a while on a big image (libc),
+    // so drive a cancelable progress dialog and update it between passes. This
+    // keeps the window painting and lets the user bail instead of it looking hung.
+    // (The scan only reads memory via process_vm_readv, so this stays on the UI
+    // thread safely; no ptrace-thread affinity to worry about.)
+    QProgressDialog progress(QString("Analyzing %1…")
+            .arg(QString::fromStdString(module.name.empty() ? module.path : module.name)),
+        "Cancel", 0, 8, this);
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(0);
+    int step = 0;
+    auto tick = [&](const char* what) {
+        progress.setLabelText(QString("Analyzing %1: %2…")
+            .arg(QString::fromStdString(module.name.empty() ? module.path : module.name))
+            .arg(what));
+        progress.setValue(step++);
+        QApplication::processEvents();
+        return !progress.wasCanceled();
+    };
+
+    if (!tick("referenced strings")) return;
+    auto strings = analyzer.findReferencedStrings(*proc_, module);
+    if (!tick("referenced functions")) return;
+    auto functions = analyzer.findReferencedFunctions(*proc_, module);
+    if (!tick("functions")) return;
+    auto functionSummary = analyzer.enumerateFunctions(*proc_, module);
+    if (!tick("call graph")) return;
+    auto callGraph = analyzer.buildCallGraph(*proc_, module);
+    if (!tick("jumps")) return;
+    auto jumps = analyzer.findJumps(*proc_, module);
+    if (!tick("RIP-relative")) return;
+    auto ripRelative = analyzer.findRipRelativeInstructions(*proc_, module);
+    if (!tick("assembly pattern")) return;
+    auto assembly = assemblyPatternEdit_->text().trimmed().isEmpty()
+        ? std::vector<CodeRef>{}
+        : analyzer.findAssemblyPattern(*proc_, module, assemblyPatternEdit_->text().toStdString());
+    if (!tick("code caves")) return;
+    auto caves = analyzer.findCodeCaves(*proc_, module, minCaveSizeSpin_->value());
+    progress.setValue(8);
+
+    fillTable(stringsTable_, strings);
+    fillTable(functionsTable_, functions);
+    fillFunctionsTable(functionSummary);
+    fillCallGraphTable(callGraph);
+    fillTable(jumpsTable_, jumps);
+    fillTable(ripRelativeTable_, ripRelative);
+    fillTable(assemblyTable_, assembly);
+    fillCavesTable(caves);
+    statusLabel_->setText(QString("%1: %2 strings, %3 calls, %4 functions, %5 jumps, %6 RIP-relative, %7 assembly, %8 caves")
+        .arg(QString::fromStdString(module.name))
+        .arg(strings.size())
+        .arg(functions.size())
+        .arg(functionSummary.size())
+        .arg(jumps.size())
+        .arg(ripRelative.size())
+        .arg(assembly.size())
+        .arg(caves.size()));
+}
+
+void CodeReferencesWindow::fillTable(QTableWidget* table, const std::vector<CodeRef>& refs) {
+    table->setRowCount((int)refs.size());
+    for (int row = 0; row < (int)refs.size(); ++row) {
+        const auto& ref = refs[row];
+        table->setItem(row, 0, new QTableWidgetItem(QString("%1").arg(ref.address, 16, 16, QChar('0'))));
+        table->setItem(row, 1, new QTableWidgetItem(QString("%1").arg(ref.target, 16, 16, QChar('0'))));
+        table->setItem(row, 2, new QTableWidgetItem(QString::fromStdString(ref.text)));
+    }
+}
+
+void CodeReferencesWindow::fillFunctionsTable(const std::vector<FunctionInfo>& functions) {
+    functionSummaryTable_->setRowCount((int)functions.size());
+    for (int row = 0; row < (int)functions.size(); ++row) {
+        const auto& fn = functions[row];
+        functionSummaryTable_->setItem(row, 0, new QTableWidgetItem(QString("%1").arg(fn.address, 16, 16, QChar('0'))));
+        functionSummaryTable_->setItem(row, 1, new QTableWidgetItem(QString::number(fn.references)));
+    }
+}
+
+void CodeReferencesWindow::fillCallGraphTable(const std::vector<CallGraphEdge>& graph) {
+    callGraphTable_->setRowCount((int)graph.size());
+    for (int row = 0; row < (int)graph.size(); ++row) {
+        const auto& edge = graph[row];
+        callGraphTable_->setItem(row, 0, new QTableWidgetItem(QString("%1").arg(edge.caller, 16, 16, QChar('0'))));
+        callGraphTable_->setItem(row, 1, new QTableWidgetItem(QString("%1").arg(edge.callee, 16, 16, QChar('0'))));
+        callGraphTable_->setItem(row, 2, new QTableWidgetItem(QString("%1").arg(edge.callSite, 16, 16, QChar('0'))));
+    }
+}
+
+void CodeReferencesWindow::fillCavesTable(const std::vector<CodeCave>& caves) {
+    cavesTable_->setRowCount((int)caves.size());
+    for (int row = 0; row < (int)caves.size(); ++row) {
+        const auto& cave = caves[row];
+        cavesTable_->setItem(row, 0, new QTableWidgetItem(QString("%1").arg(cave.address, 16, 16, QChar('0'))));
+        cavesTable_->setItem(row, 1, new QTableWidgetItem(QString::number(cave.size)));
+    }
+}
+
+} // namespace ce::gui

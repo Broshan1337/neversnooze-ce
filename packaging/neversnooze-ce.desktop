@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Neversnooze CE
+Comment=Memory scanner and debugger for Linux
+Exec=neversnooze-ce %f
+Icon=neversnooze-ce
+Categories=Development;Debugger;
+MimeType=application/x-cheat-engine-table;application/x-cheat-engine-trainer;
+Terminal=false

@@ -1,0 +1,77 @@
+name: ISA compatibility
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  isa-guest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - isa: riscv64
+            packages: g++-riscv64-linux-gnu qemu-system-misc opensbi
+            triplet: riscv64-linux-gnu
+            processor: riscv64
+          - isa: s390x     # big-endian
+            packages: g++-s390x-linux-gnu qemu-system-s390x
+            triplet: s390x-linux-gnu
+            processor: s390x
+          - isa: ppc64el
+            packages: g++-powerpc64le-linux-gnu qemu-system-ppc
+            triplet: powerpc64le-linux-gnu
+            processor: ppc64le
+          - isa: armhf     # Thumb-2 userland
+            packages: g++-arm-linux-gnueabihf qemu-system-arm
+            triplet: arm-linux-gnueabihf
+            processor: arm
+          - isa: x32       # ILP32 program, LP64 engine (and the host's own CLI)
+            packages: build-essential gcc-multilib libc6-dev-x32 qemu-system-x86 libcapstone-dev libdw-dev zlib1g-dev
+    name: ${{ matrix.isa }}-guest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the cross compiler and full-system emulator
+        run: |
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends ${{ matrix.packages }} cmake ninja-build curl python3
+      - name: Build the CLI for the guest (cross-compiled unless x32)
+        run: |
+          cross=()
+          if [ -n "${{ matrix.triplet }}" ]; then
+            t=${{ matrix.triplet }}
+            # cecore links zlib (CEServer compression): a static, position-independent target build.
+            zlib="$PWD/build/zlib-$t"
+            mkdir -p build
+            curl -fsSL --retry 3 -o build/zlib.tar.gz https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz
+            echo "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23  build/zlib.tar.gz" | sha256sum -c -
+            tar -xzf build/zlib.tar.gz -C build
+            (cd build/zlib-1.3.1 && CC=$t-gcc CFLAGS="-O2 -fPIC" ./configure --static --prefix="$zlib" && make -j"$(nproc)" && make install)
+            cross=(-DCMAKE_CXX_FLAGS=-I$zlib/include -DCMAKE_SHARED_LINKER_FLAGS=-L$zlib/lib -DCMAKE_EXE_LINKER_FLAGS=-L$zlib/lib
+                   -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.processor }}
+                   -DCMAKE_C_COMPILER=$t-gcc -DCMAKE_CXX_COMPILER=$t-g++ -DCMAKE_FIND_ROOT_PATH=/usr/$t
+                   -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
+                   -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
+                   -DCECORE_FORCE_FETCHCONTENT=ON)
+          fi
+          cmake -S . -B build/cli -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_DISABLE_FIND_PACKAGE_Qt6=ON "${cross[@]}"
+          cmake --build build/cli --target cescan -j"$(nproc)"
+      - name: Require process, scan, pointer, symbol, disassembly and frontend checks in a real guest
+        env:
+          CECORE_ISA_FRONTEND: ${{ github.workspace }}/build/cli/cescan
+          CECORE_ISA_FRONTEND_SYSROOT: ${{ matrix.triplet && format('/usr/{0}', matrix.triplet) || '/' }}
+        run: CECORE_CI_JOBS="$(nproc)" tools/check-isa-vm.sh ${{ matrix.isa }} build/isa-vm/${{ matrix.isa }}
+      - name: Save guest log and operation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.isa }}-guest-evidence
+          path: |
+            build/isa-vm/${{ matrix.isa }}/${{ matrix.isa }}-guest*.json
+            build/isa-vm/${{ matrix.isa }}/${{ matrix.isa }}-guest*.log
+          if-no-files-found: error

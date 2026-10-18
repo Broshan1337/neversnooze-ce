@@ -1,0 +1,252 @@
+#include "core/secure_exec.hpp"
+#include "gui/mainwindow.hpp"
+#include "gui/memorybrowser.hpp"
+#include "core/log.hpp"
+#include "gui/theme.hpp"
+#include <QFile>
+#include <QApplication>
+#include <QDialog>
+#include <QIcon>
+#include <cmath>
+#include <string>
+#include <QPalette>
+#include <QStyleHints>
+#ifdef CECORE_HAVE_WAYLAND_HOTKEYS
+#include <QDBusConnection>
+#include <QDBusMessage>
+#include <QDBusVariant>
+#endif
+#include <QPixmap>
+#include <QDir>
+#include <QFileInfo>
+#include <QLocale>
+#include <QTranslator>
+#include <QLibraryInfo>
+#include <unistd.h>
+#include <QSettings>
+#include <QTimer>
+#include <cstring>
+#include <cstdio>
+#include <cstdlib>
+
+// Sets QT_FONT_DPI from GNOME's text-scaling-factor on a Wayland session, unless
+// the user already chose a font DPI. Fixed command, no user input in it.
+static void applyGnomeTextScaling() {
+    const char* dpi = std::getenv("QT_FONT_DPI");
+    const char* wayland = std::getenv("WAYLAND_DISPLAY");
+    if ((dpi && *dpi) || !wayland || !*wayland) return;
+    const char* desktop = std::getenv("XDG_CURRENT_DESKTOP");
+    if (!desktop || !std::strstr(desktop, "GNOME")) return;
+    FILE* pipe = popen("gsettings get org.gnome.desktop.interface text-scaling-factor 2>/dev/null", "r");
+    if (!pipe) return;
+    char buffer[64] = {};
+    const bool read = std::fgets(buffer, sizeof buffer, pipe) != nullptr;
+    pclose(pipe);
+    if (!read) return;
+    const double factor = std::strtod(buffer, nullptr);
+    if (factor > 0.5 && factor < 3.0 && std::abs(factor - 1.0) > 0.01)
+        setenv("QT_FONT_DPI", std::to_string(static_cast<int>(std::lround(96.0 * factor))).c_str(), 1);
+}
+
+int main(int argc, char* argv[]) {
+    // Before Qt reads its plugin paths (see core/secure_exec.hpp).
+    ce::scrubSecureEnvironment();
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--version") == 0 || std::strcmp(argv[i], "-v") == 0) {
+            std::printf("neversnooze-ce %s\n", CECORE_VERSION);
+            return 0;
+        }
+    }
+
+    // Diagnostics: CE_LOG / CE_LOG_FILE turn on cecore logging with no rebuild.
+    ce::log::initFromEnv();
+
+    // GNOME's "Large text" / text-scaling-factor. GTK applies it everywhere and Qt
+    // on X11 receives it through Xft.dpi, but Qt on Wayland ignores it, so the
+    // window came out about a quarter smaller than the rest of a scaled desktop.
+    // Qt reads its font DPI before the application exists, so look it up first.
+    applyGnomeTextScaling();
+    QApplication app(argc, argv);
+    app.setApplicationName("Neversnooze CE");
+    app.setOrganizationName("Neversnooze");
+    app.setDesktopFileName("neversnooze-ce");
+    // The desktop's light/dark preference, used until a Theme is chosen in Settings.
+    // Qt's own GNOME title bar takes its colours from the portal's color-scheme, so
+    // read the same setting; the palette alone reports light under the GTK3 theme
+    // even when the desktop prefers dark, which gave a light window a dark frame.
+    {
+        bool systemDark = app.palette().color(QPalette::Window).lightness() < 128;
+#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
+        if (app.styleHints()->colorScheme() == Qt::ColorScheme::Dark) systemDark = true;
+#endif
+#ifdef CECORE_HAVE_WAYLAND_HOTKEYS   // Qt6::DBus is linked
+        QDBusMessage read = QDBusMessage::createMethodCall("org.freedesktop.portal.Desktop",
+            "/org/freedesktop/portal/desktop", "org.freedesktop.portal.Settings", "ReadOne");
+        read << QStringLiteral("org.freedesktop.appearance") << QStringLiteral("color-scheme");
+        const QDBusMessage reply = QDBusConnection::sessionBus().call(read, QDBus::Block, 500);
+        if (reply.type() == QDBusMessage::ReplyMessage && !reply.arguments().isEmpty()) {
+            const uint scheme = qvariant_cast<QDBusVariant>(reply.arguments().first()).variant().toUInt();
+            if (scheme == 1) systemDark = true;        // prefer dark
+            else if (scheme == 2) systemDark = false;  // prefer light
+        }
+#endif
+        app.setProperty("ceSystemDarkTheme", systemDark);
+    }
+    // Honor the Settings dialog's Theme choice; with none saved yet, follow the
+    // desktop's light or dark preference.
+    // The same helper is used by the Settings dialog so a toggle applies live.
+    ce::gui::applyStoredTheme();
+
+    // ── i18n ──
+    // Two translators: one for Qt's own strings (so dialogs etc. localise),
+    // and one for cecore's translations. The cecore .qm files live next to
+    // the binary under translations/neversnooze-ce_<locale>.qm. Translations
+    // aren't shipped yet, but the load is best-effort and silently skips
+    // when no file matches — the wiring is ready for translators to drop
+    // .qm files in.
+    QLocale locale;
+    {
+        QString locName = qEnvironmentVariable("LANG", locale.name());
+        // Strip ".UTF-8" etc. — Qt only wants "en_US" or "tr_TR".
+        locName = locName.section('.', 0, 0);
+        if (!locName.isEmpty()) locale = QLocale(locName);
+    }
+    QLocale::setDefault(locale);
+
+    auto* qtTranslator = new QTranslator(&app);
+    if (qtTranslator->load(locale, "qt", "_",
+            QLibraryInfo::path(QLibraryInfo::TranslationsPath))) {
+        app.installTranslator(qtTranslator);
+    }
+    auto* ceTranslator = new QTranslator(&app);
+    {
+        // Search a few likely locations for neversnooze-ce_<locale>.qm:
+        //   <exe-dir>/translations/, <exe-dir>/../translations/, current dir.
+        QStringList searchDirs;
+        char exeBufLocal[4096];
+        ssize_t exeLenLocal = readlink("/proc/self/exe", exeBufLocal, sizeof(exeBufLocal) - 1);
+        if (exeLenLocal > 0) {
+            exeBufLocal[exeLenLocal] = 0;
+            auto exeDir = QFileInfo(exeBufLocal).absolutePath();
+            searchDirs << (exeDir + "/translations")
+                       << (exeDir + "/../translations");
+        }
+        searchDirs << "translations";
+        for (const auto& dir : searchDirs) {
+            if (ceTranslator->load(locale, "neversnooze-ce", "_", dir)) {
+                app.installTranslator(ceTranslator);
+                break;
+            }
+        }
+    }
+
+    // Set application icon — resolve exe path via /proc/self/exe
+    QIcon appIcon;
+    char exeBuf[4096];
+    ssize_t exeLen = readlink("/proc/self/exe", exeBuf, sizeof(exeBuf) - 1);
+    if (exeLen > 0) {
+        exeBuf[exeLen] = 0;
+        auto exeDir = QFileInfo(exeBuf).absolutePath();
+        QStringList iconPaths = {
+            exeDir + "/neversnooze-ce.png",
+            exeDir + "/../packaging/neversnooze-ce.png",
+        };
+        for (auto& p : iconPaths) {
+            QPixmap pm(p);
+            if (!pm.isNull()) {
+                appIcon = QIcon(pm);
+                break;
+            }
+        }
+    }
+
+    // Fallback to embedded resource
+    if (appIcon.isNull()) {
+        QPixmap pm(":/icon.png");
+        if (!pm.isNull()) appIcon = QIcon(pm);
+    }
+
+    app.setWindowIcon(appIcon);
+
+    ce::gui::MainWindow w;
+    w.setWindowIcon(appIcon);
+    w.show();
+
+    // `--pid <N>` attaches to a running process on launch (no picker dialog);
+    // `--memview <addr>` then opens the Memory Viewer there.
+    const QStringList cliArgs = app.arguments();
+    uintptr_t memviewAddr = 0;
+    bool wantMemview = false, wantSettings = false, wantFindWrites = false;
+    uintptr_t findWritesAddr = 0;
+    QString wantPanel, wantSettingsPage;
+    for (int i = 1; i < cliArgs.size(); ++i) {
+        if (i + 1 < cliArgs.size() && cliArgs.at(i) == QLatin1String("--find-writes")) {
+            bool ok = false;
+            findWritesAddr = static_cast<uintptr_t>(cliArgs.at(i + 1).toULongLong(&ok, 0));
+            wantFindWrites = ok;
+        } else if (cliArgs.at(i) == QLatin1String("--settings")) {
+            wantSettings = true;
+        } else if (i + 1 < cliArgs.size() && cliArgs.at(i) == QLatin1String("--settings-page")) {
+            wantSettings = true;
+            wantSettingsPage = cliArgs.at(i + 1);
+        } else if (i + 1 < cliArgs.size() && cliArgs.at(i) == QLatin1String("--panel")) {
+            wantPanel = cliArgs.at(i + 1);
+        } else if (i + 1 < cliArgs.size() && cliArgs.at(i) == QLatin1String("--pid")) {
+            bool ok = false;
+            const long pid = cliArgs.at(i + 1).toLong(&ok);
+            if (ok && pid > 0) w.attachToPid(static_cast<pid_t>(pid), QString());
+        } else if (i + 1 < cliArgs.size() && cliArgs.at(i) == QLatin1String("--memview")) {
+            bool ok = false;
+            memviewAddr = static_cast<uintptr_t>(cliArgs.at(i + 1).toULongLong(&ok, 0));
+            wantMemview = ok;
+        }
+    }
+    QWidget* shotTarget = &w;
+    if (wantMemview) {
+        if (auto* mb = w.openMemoryView(memviewAddr))
+            shotTarget = mb;   // MemoryBrowser is-a QWidget (implicit upcast)
+    }
+    // `--settings` opens the Settings dialog on launch (jump straight to it).
+    if (wantSettings) {
+        if (auto* dlg = w.openSettingsDialog(wantSettingsPage))
+            shotTarget = dlg;
+    }
+    // `--panel <name>` opens the panel whose menu entry contains <name> (for
+    // screenshot/UI auditing), e.g. `--panel Dissect`, `--panel "Pointer scan"`.
+    if (!wantPanel.isEmpty()) {
+        if (auto* p = w.openPanelByName(wantPanel))
+            shotTarget = p;
+    }
+
+    // Test hook: `--find-writes <addr>` drives the real "find what writes" GUI path
+    // headlessly against a repro process, then quits after a fixed window (used to
+    // reproduce/debug the Wine/Proton watchpoint crash without the game).
+    if (wantFindWrites) {
+        w.startFindWritesForTest(findWritesAddr);
+        QTimer::singleShot(15000, []() { QApplication::quit(); });
+    }
+
+    // Dev hook: CE_SCREENSHOT=<path> grabs the target window shortly after it is
+    // shown and exits (used for UI/layout verification; no effect unless set).
+    // With --memview it grabs the Memory Viewer, otherwise the main window.
+    if (const char* shot = std::getenv("CE_SCREENSHOT")) {
+        const QString shotPath = QString::fromLocal8Bit(shot);
+        QTimer::singleShot(600, [shotTarget, shotPath]() {
+            shotTarget->grab().save(shotPath);
+            QApplication::quit();
+        });
+    }
+
+    // Open a cheat table passed on the command line (double-click a .CT / .json).
+    for (int i = 1; i < cliArgs.size(); ++i) {
+        const QString& arg = cliArgs.at(i);
+        // Flags that take a value consume it; that value is never a table path.
+        if (arg == QLatin1String("--pid") || arg == QLatin1String("--memview") ||
+            arg == QLatin1String("--find-writes") || arg == QLatin1String("--settings-page") ||
+            arg == QLatin1String("--panel")) { ++i; continue; }
+        if (arg.startsWith(QLatin1String("--"))) continue;      // other flags: no value
+        if (QFile::exists(arg)) { w.loadTableFromPath(arg); break; }
+    }
+
+    return app.exec();
+}

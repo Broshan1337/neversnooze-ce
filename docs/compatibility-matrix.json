@@ -1,0 +1,1317 @@
+{
+ "schema": 1,
+ "note": "Source of truth for the coverage matrix; render with tools/coverage_matrix.py --write. Seeded 2026-10-12 from existing gates.",
+ "capabilities": [
+  {
+   "id": "C1",
+   "name": "Attach and identify"
+  },
+  {
+   "id": "C2",
+   "name": "Read/write typed values, freeze"
+  },
+  {
+   "id": "C3",
+   "name": "Value scan"
+  },
+  {
+   "id": "C4",
+   "name": "Pointer scan and rescan"
+  },
+  {
+   "id": "C5",
+   "name": "Disassemble and assemble"
+  },
+  {
+   "id": "C6",
+   "name": "Allocate, inject, undo"
+  },
+  {
+   "id": "C7",
+   "name": "Native call"
+  },
+  {
+   "id": "C8",
+   "name": "Find what writes/accesses"
+  },
+  {
+   "id": "C9",
+   "name": "Debugger"
+  },
+  {
+   "id": "C10",
+   "name": "GUI, CLI and Lua frontends"
+  }
+ ],
+ "targets": [
+  {
+   "id": "native-x86-64",
+   "group": "Native Linux",
+   "name": "x86-64 glibc",
+   "cells": {
+    "C1": {
+     "state": "V",
+     "evidence": "native_syscall_gate SYSCALL_TARGET; elf_debug_gate debuglink symbols; gui_runtime_gate app+cescan info+Lua getTargetInfo"
+    },
+    "C2": {
+     "state": "V",
+     "evidence": "cecore_test test_write_memory; cli_usability read/write/freeze+bad-write unchanged; gui_lifecycle freeze; Lua writeValue"
+    },
+    "C3": {
+     "state": "V",
+     "evidence": "scan_test(root); cecore_test scans on forked child; cli_usability scan first/next+bad opts; gui_lifecycle allTypeGuiScan; Lua memscan"
+    },
+    "C4": {
+     "state": "B",
+     "evidence": "frontend_target_gate: cescan pointerscan on a live dynamic glibc program finds and resolves the static path; GUI dialog untested"
+    },
+    "C5": {
+     "state": "V",
+     "evidence": "cecore_test test_autoassembler_*(pid); cli_usability asm/autoasm; gui_injection_gate editor; gui_register_smoke Lua disassemble"
+    },
+    "C6": {
+     "state": "V",
+     "evidence": "autoasm_module_gate compatibility_integration inject/disable; gui_injection_gate conflict/repair; cli autoasm --disable-after"
+    },
+    "C7": {
+     "state": "B",
+     "evidence": "native_call_gate injector/parked; frontend_target_gate: Lua executeCode and injectLibrary (real libm) on a live glibc program, parked-thread refusal with its reason; no GUI native-call check"
+    },
+    "C8": {
+     "state": "B",
+     "evidence": "cecore_test test_multithread_watchpoint, test_lua_hw_breakpoint; CODEFINDER_BACKEND; GUI find-writes lifecycle only"
+    },
+    "C9": {
+     "state": "V",
+     "evidence": "native_syscall_gate DEBUG_SESSION/TRACE/DEBUG_RECOVERY; gui_debugger_smoke, gui_register_smoke; cescan lua debug_setBreakpoint"
+    },
+    "C10": {
+     "state": "V",
+     "evidence": "GUI gui_runtime_gate/gui_lifecycle/gui_injection; CLI cli_usability_test; Lua cescan lua + gui_luaconsole"
+    }
+   }
+  },
+  {
+   "id": "native-i386",
+   "group": "Native Linux",
+   "name": "i386",
+   "cells": {
+    "C1": {
+     "state": "B",
+     "evidence": "native_syscall_gate SYSCALL_TARGET abi=Linux i386; compatibility_integration desc; elf_debug_gate --require-i386"
+    },
+    "C2": {
+     "state": "B",
+     "evidence": "compatibility_integration typed write on compatibility_fixture32; gui_injection_gate width=4 valueIs"
+    },
+    "C3": {
+     "state": "B",
+     "evidence": "frontend_target_gate: whole-process first/next scans on i386 (static musl locally, dynamic glibc -m32 in CI)"
+    },
+    "C4": {
+     "state": "B",
+     "evidence": "frontend_target_gate: cescan pointerscan on i386 finds the 4-byte static pointer path"
+    },
+    "C5": {
+     "state": "B",
+     "evidence": "autoasm_module_gate compatibility_integration AA template (width 4); gui_injection_gate editor width=4"
+    },
+    "C6": {
+     "state": "B",
+     "evidence": "compatibility_integration alloc/protect/free+inject/restore; gui_injection_gate width=4 failure/repair; no CLI"
+    },
+    "C7": {
+     "state": "B",
+     "evidence": "native_call_gate --require-i386 NATIVE_INJECTOR/PARKED_NATIVE_CALL width=4"
+    },
+    "C8": {
+     "state": "B",
+     "evidence": "native_syscall_gate CODEFINDER_BACKEND architecture=x86-32"
+    },
+    "C9": {
+     "state": "B",
+     "evidence": "native_syscall_gate DEBUG_SESSION x86-32; cli_usability cescan lua breakpoint across exec on fixture32"
+    },
+    "C10": {
+     "state": "B",
+     "evidence": "GUI gui_injection_gate width=4; CLI frontend_target_gate (info/read/write/scan/pointerscan/autoasm/watch); Lua cli_usability + frontend_target_gate"
+    }
+   }
+  },
+  {
+   "id": "native-x32",
+   "group": "Native Linux",
+   "name": "x32",
+   "cells": {
+    "C1": {
+     "state": "B",
+     "evidence": "x32_vm_gate debug suite SYSCALL_TARGET abi=Linux x32 width=4 (Linux 6.1 guest)"
+    },
+    "C2": {
+     "state": "B",
+     "evidence": "x32_vm_gate debug/calls memory ops incl. four-byte pthread/loader handles"
+    },
+    "C3": {
+     "state": "B",
+     "evidence": "isa_vm_gate x32 guest (LP64 static driver, -mx32 static libc program, Debian 6.1 kernel with syscall.x32=y; CI): whole-process first and next scans of a 4-byte-pointer program"
+    },
+    "C4": {
+     "state": "B",
+     "evidence": "isa_vm_gate x32 guest (LP64 static driver, -mx32 static libc program, Debian 6.1 kernel with syscall.x32=y; CI): static 4-byte pointer path found and dereferenced"
+    },
+    "C5": {
+     "state": "B",
+     "evidence": "x32_vm_gate CODEFINDER/TRACE decode live x86-64 code; decode only, no AA"
+    },
+    "C6": {
+     "state": "B",
+     "evidence": "x32_vm_gate image/exec suites alloc/protect + recovery; no AA code cave"
+    },
+    "C7": {
+     "state": "B",
+     "evidence": "x32_vm_gate calls NATIVE_INJECTOR/X32_WIDE_CALL; exec suite 475 checks incl. recovery"
+    },
+    "C8": {
+     "state": "B",
+     "evidence": "x32_vm_gate CODEFINDER_BACKEND, SOFTWARE_CODEFINDER"
+    },
+    "C9": {
+     "state": "B",
+     "evidence": "x32_vm_gate DEBUG_SESSION, TRACE_BACKEND, DEBUG_RECOVERY"
+    },
+    "C10": {
+     "state": "B",
+     "evidence": "x32-guest on hosted CI: the host-built cescan runs inside the x32-enabled guest; cescan info (ABI), write, scan and a cescan lua script drive the x32 fixture (GUI not run)"
+    }
+   }
+  },
+  {
+   "id": "native-static-musl",
+   "group": "Native Linux",
+   "name": "x86-64 static libc / musl",
+   "cells": {
+    "C1": {
+     "state": "B",
+     "evidence": "frontend_target_gate (static musl locally; static glibc, static musl in CI): cescan info ABI, static symtab names, executable as module"
+    },
+    "C2": {
+     "state": "B",
+     "evidence": "frontend_target_gate (static musl locally; static glibc, static musl in CI): cescan write/read typed i32 observed by the program"
+    },
+    "C3": {
+     "state": "B",
+     "evidence": "frontend_target_gate (static musl locally; static glibc, static musl in CI): whole-process first and next scans"
+    },
+    "C4": {
+     "state": "B",
+     "evidence": "frontend_target_gate (static musl locally; static glibc, static musl in CI): cescan pointerscan finds the static pointer path"
+    },
+    "C5": {
+     "state": "B",
+     "evidence": "frontend_target_gate (static musl locally; static glibc, static musl in CI): Auto Assembler hook script with process-symbol names assembles"
+    },
+    "C6": {
+     "state": "B",
+     "evidence": "frontend_target_gate (static musl locally; static glibc, static musl in CI): code cave near the symbol, hook changes behavior, disable restores bytes"
+    },
+    "C7": {
+     "state": "X",
+     "evidence": "frontend_target_gate: executeCode on a static program without pthread_detach and injectLibrary without a dynamic loader return explicit reasons"
+    },
+    "C8": {
+     "state": "B",
+     "evidence": "frontend_target_gate (static musl locally; static glibc, static musl in CI): cescan watch names ce_writer as the writer"
+    },
+    "C9": {
+     "state": "B",
+     "evidence": "frontend_target_gate (static musl locally; static glibc, static musl in CI): Lua debug_setBreakpoint stops at the writer, call completes"
+    },
+    "C10": {
+     "state": "B",
+     "evidence": "frontend_target_gate --gui (static musl and glibc): GUI scan/next scan/address-list edit/debugger-window breakpoint; CLI info/read/write/scan/pointerscan/autoasm/watch; Lua breakpoint"
+    }
+   }
+  },
+  {
+   "id": "native-aarch64",
+   "group": "Native Linux",
+   "name": "AArch64",
+   "cells": {
+    "C1": {
+     "state": "B",
+     "evidence": "fullsystem_vm SYSCALL markers; gui_runtime_gate ARM64 runner cescan info + Lua getTargetInfo; symbols unverified"
+    },
+    "C2": {
+     "state": "B",
+     "evidence": "fullsystem_vm target_syscall_integration memory ops; gui_register_smoke memory write"
+    },
+    "C3": {
+     "state": "B",
+     "evidence": "frontend_target_gate on GitHub's native ARM64 runner: whole-process first and next scans of an ARM64 glibc program"
+    },
+    "C4": {
+     "state": "B",
+     "evidence": "frontend_target_gate on native ARM64: cescan pointerscan finds the static pointer path"
+    },
+    "C5": {
+     "state": "B",
+     "evidence": "gui_register_smoke GUI disasm + Lua disassemble live; aarch64_relocation_gate executes relocated code"
+    },
+    "C6": {
+     "state": "B",
+     "evidence": "code_write_gate + memory_image_gate (runner+4K/64K VMs) code patch + recovery; no AA cave"
+    },
+    "C7": {
+     "state": "B",
+     "evidence": "fullsystem_vm NATIVE_INJECTOR/PARKED w=8; native_call_image_gate, native_call_exec_gate"
+    },
+    "C8": {
+     "state": "B",
+     "evidence": "fullsystem_vm CODEFINDER_BACKEND/SOFTWARE_CODEFINDER architecture=ARM64"
+    },
+    "C9": {
+     "state": "B",
+     "evidence": "fullsystem_vm DEBUG_SESSION/TRACE; gui_runtime_gate GUI bp/register edit/death retire; no Lua/CLI debug"
+    },
+    "C10": {
+     "state": "B",
+     "evidence": "arm64-compatibility.yml gui_runtime_gate: GUI debugger+app, CLI info, Lua disassemble"
+    }
+   }
+  },
+  {
+   "id": "native-arm32",
+   "group": "Native Linux",
+   "name": "ARM32 / Thumb",
+   "cells": {
+    "C1": {
+     "state": "B",
+     "evidence": "arm32_register_gate arm32_memory_checks TargetMachine Arm32/LinuxArmEabi; no modules/symbols"
+    },
+    "C2": {
+     "state": "B",
+     "evidence": "isa_vm_gate armhf guest (static cecore driver as /init, Ubuntu 6.8 armhf kernel on QEMU virt, Thumb-2 program; CI): process write observed by the static libc program through the generic process API"
+    },
+    "C3": {
+     "state": "B",
+     "evidence": "isa_vm_gate armhf guest (static cecore driver as /init, Ubuntu 6.8 armhf kernel on QEMU virt, Thumb-2 program; CI): whole-process first and next scans"
+    },
+    "C4": {
+     "state": "B",
+     "evidence": "isa_vm_gate armhf guest (static cecore driver as /init, Ubuntu 6.8 armhf kernel on QEMU virt, Thumb-2 program; CI): static pointer path found and dereferenced"
+    },
+    "C5": {
+     "state": "B",
+     "evidence": "isa_vm_gate armhf guest (static cecore driver as /init, Ubuntu 6.8 armhf kernel on QEMU virt, Thumb-2 program; CI): Thumb decoding of the writer (EABI interworking bit); ARM/Thumb assembly via Keystone covered by unit checks"
+    },
+    "C6": {
+     "state": "B",
+     "evidence": "arm32_register_gate ARM32_MEM: product mmap2/protect/unmap ARM+Thumb; no code cave"
+    },
+    "C7": {
+     "state": "X",
+     "evidence": "isa_vm_gate in a real guest (hosted CI): the real API refuses with its capability reason (armhf): os::createRemoteThread refused; ARM32 call adapters pending"
+    },
+    "C8": {
+     "state": "X",
+     "evidence": "isa_vm_gate in a real guest (hosted CI): the real API refuses with its capability reason (armhf): CodeFinder::start refused; ARM32 hardware watchpoints pending"
+    },
+    "C9": {
+     "state": "B",
+     "evidence": "arm32_register_gate ARM32_REG: GP edit/rollback, SW breakpoint trap ARM/Thumb (ARMv7 + arm64-compat)"
+    },
+    "C10": {
+     "state": "B",
+     "evidence": "armhf-guest on hosted CI: a cross-built cescan (Qt-free, static target zlib) runs inside the full-system guest; cescan info (ABI), write, scan and a cescan lua script drive the static fixture (GUI not run)"
+    }
+   }
+  },
+  {
+   "id": "native-riscv64",
+   "group": "Native Linux",
+   "name": "RISC-V64",
+   "cells": {
+    "C1": {
+     "state": "B",
+     "evidence": "isa_vm_gate: static cecore driver as /init in a real RISC-V64 Linux 6.8 guest (QEMU virt; local container and CI): target description RISC-V64 / Linux RISC-V, module list, ELF symbols"
+    },
+    "C2": {
+     "state": "B",
+     "evidence": "isa_vm_gate: static cecore driver as /init in a real RISC-V64 Linux 6.8 guest (QEMU virt; local container and CI): process write observed by the static libc program"
+    },
+    "C3": {
+     "state": "B",
+     "evidence": "isa_vm_gate: static cecore driver as /init in a real RISC-V64 Linux 6.8 guest (QEMU virt; local container and CI): whole-process first and next scans"
+    },
+    "C4": {
+     "state": "B",
+     "evidence": "isa_vm_gate: static cecore driver as /init in a real RISC-V64 Linux 6.8 guest (QEMU virt; local container and CI): static pointer path found and dereferenced"
+    },
+    "C5": {
+     "state": "B",
+     "evidence": "isa_vm_gate: static cecore driver as /init in a real RISC-V64 Linux 6.8 guest (QEMU virt; local container and CI): Capstone RISC-V decodes the writer (decode only; Keystone has no RISC-V assembler, reported explicitly)"
+    },
+    "C6": {
+     "state": "X",
+     "evidence": "isa_vm_gate in a real guest (hosted CI): the real API refuses with its capability reason: LinuxProcessHandle::allocate -> 'Target syscall ABI has no backend yet'"
+    },
+    "C7": {
+     "state": "X",
+     "evidence": "isa_vm_gate in a real guest (hosted CI): the real API refuses with its capability reason: os::createRemoteThread -> 'No complete backend for this target/transport'"
+    },
+    "C8": {
+     "state": "X",
+     "evidence": "isa_vm_gate in a real guest (hosted CI): the real API refuses with its capability reason: CodeFinder::start -> hardware watchpoint 'No complete backend'"
+    },
+    "C9": {
+     "state": "X",
+     "evidence": "isa_vm_gate in a real guest (hosted CI): the real API refuses with its capability reason: DebugSession::attach -> debugger 'No complete backend'"
+    },
+    "C10": {
+     "state": "B",
+     "evidence": "riscv64-guest on hosted CI: a cross-built cescan (Qt-free, static target zlib) runs inside the full-system guest; cescan info (ABI), write, scan and a cescan lua script drive the static fixture (GUI not run)"
+    }
+   }
+  },
+  {
+   "id": "native-other-isa",
+   "group": "Native Linux",
+   "name": "MIPS / PPC64LE / s390x",
+   "cells": {
+    "C1": {
+     "state": "B",
+     "evidence": "isa_vm_gate: static cecore driver as /init in real s390x (big-endian) and ppc64el Linux 6.8 guests (local container and CI); MIPS not yet covered: target description (s390x / PowerPC64), module list, ELF symbols (host-order ELF)"
+    },
+    "C2": {
+     "state": "B",
+     "evidence": "isa_vm_gate: static cecore driver as /init in real s390x (big-endian) and ppc64el Linux 6.8 guests (local container and CI); MIPS not yet covered: process write observed by the static libc program"
+    },
+    "C3": {
+     "state": "B",
+     "evidence": "isa_vm_gate: static cecore driver as /init in real s390x (big-endian) and ppc64el Linux 6.8 guests (local container and CI); MIPS not yet covered: whole-process first and next scans, including big-endian data"
+    },
+    "C4": {
+     "state": "B",
+     "evidence": "isa_vm_gate: static cecore driver as /init in real s390x (big-endian) and ppc64el Linux 6.8 guests (local container and CI); MIPS not yet covered: static pointer path found and dereferenced on both"
+    },
+    "C5": {
+     "state": "B",
+     "evidence": "isa_vm_gate: static cecore driver as /init in real s390x (big-endian) and ppc64el Linux 6.8 guests (local container and CI); MIPS not yet covered: Capstone SystemZ and PowerPC decode the writer (decode only; no assembler backend, reported explicitly)"
+    },
+    "C6": {
+     "state": "X",
+     "evidence": "isa_vm_gate in a real guest (hosted CI): the real API refuses with its capability reason: LinuxProcessHandle::allocate -> 'Target syscall ABI has no backend yet'"
+    },
+    "C7": {
+     "state": "X",
+     "evidence": "isa_vm_gate in a real guest (hosted CI): the real API refuses with its capability reason: os::createRemoteThread -> 'No complete backend for this target/transport'"
+    },
+    "C8": {
+     "state": "X",
+     "evidence": "isa_vm_gate in a real guest (hosted CI): the real API refuses with its capability reason: CodeFinder::start -> hardware watchpoint 'No complete backend'"
+    },
+    "C9": {
+     "state": "X",
+     "evidence": "isa_vm_gate in a real guest (hosted CI): the real API refuses with its capability reason: DebugSession::attach -> debugger 'No complete backend'"
+    },
+    "C10": {
+     "state": "B",
+     "evidence": "s390x-guest (big-endian) and ppc64el-guest on hosted CI: a cross-built cescan (Qt-free, static target zlib) runs inside the full-system guest; cescan info (ABI), write, scan and a cescan lua script drive the static fixture (GUI not run)"
+    }
+   }
+  },
+  {
+   "id": "wine32-legacy",
+   "group": "Windows on Linux",
+   "name": "Wine legacy Wine32",
+   "cells": {
+    "C1": {
+     "state": "B",
+     "evidence": "wine_compatibility_test --require-legacy-wine32 (Wine 9): Wine runtime, WindowsI386, LinuxI386 loader"
+    },
+    "C2": {
+     "state": "B",
+     "evidence": "wine_integration typed pointer/int writes observed by PE32 fixture"
+    },
+    "C3": {
+     "state": "B",
+     "evidence": "wine_integration first/next Int32 scans; PE32 on the 32-bit Unix loader under Proton 9/11 and the CI Wine 9 job"
+    },
+    "C4": {
+     "state": "B",
+     "evidence": "wine_integration pointer scan of the static PE path; 32-bit Unix loader under Proton 9/11 and CI Wine 9"
+    },
+    "C5": {
+     "state": "B",
+     "evidence": "wine_integration AA injection at real PE32 function + arch selection"
+    },
+    "C6": {
+     "state": "B",
+     "evidence": "wine_integration inject/disable exact restore + busy alloc/free; no frontends"
+    },
+    "C7": {
+     "state": "X",
+     "evidence": "frontend_target_gate --wine-launcher: Lua injectLibrary and executeCode on the live PE program return nil plus the capability reason (Wine-safe loader calls and Windows thread initialization need a dedicated backend)"
+    },
+    "C8": {
+     "state": "B",
+     "evidence": "wine_integration main-thread HW watchpoint CodeFinder"
+    },
+    "C9": {
+     "state": "B",
+     "evidence": "wine_integration all-stop DebugSession: software breakpoint at the real PE writer, hit in the program's register mode, single step, removal, detach; break-and-trace from the writer on PE32 with the 32-bit loader (Proton 9/11; CI Wine 9 job)"
+    },
+    "C10": {
+     "state": "B",
+     "evidence": "frontend_target_gate --wine-launcher --gui: CLI info/modules/read/write/scan/pointerscan/autoasm/watch, Lua breakpoint, GUI scan/edit/debugger window on PE32 with the 32-bit loader (local Proton 9/11; CI Wine 9 CLI and Lua)"
+    }
+   }
+  },
+  {
+   "id": "wine64",
+   "group": "Windows on Linux",
+   "name": "Wine64",
+   "cells": {
+    "C1": {
+     "state": "B",
+     "evidence": "wine_compatibility_test PE32+ in Wine 9 (legacy job) and Wine 11 (wow64 job): WindowsX64"
+    },
+    "C2": {
+     "state": "B",
+     "evidence": "wine_integration width=8 typed writes"
+    },
+    "C3": {
+     "state": "B",
+     "evidence": "wine_integration first/next Int32 scans on the live PE fixture (local Wine 11 new WoW64; CI wow64 job)"
+    },
+    "C4": {
+     "state": "B",
+     "evidence": "wine_integration pointer scan finds the static PE pointer path (local Wine 11; CI wow64 job)"
+    },
+    "C5": {
+     "state": "B",
+     "evidence": "wine_integration AA injection PE32+"
+    },
+    "C6": {
+     "state": "B",
+     "evidence": "wine_integration inject/disable restore + busy alloc/free"
+    },
+    "C7": {
+     "state": "X",
+     "evidence": "frontend_target_gate --wine-launcher: Lua injectLibrary and executeCode on the live PE program return nil plus the capability reason (Wine-safe loader calls and Windows thread initialization need a dedicated backend)"
+    },
+    "C8": {
+     "state": "B",
+     "evidence": "wine_integration main-thread HW watchpoint"
+    },
+    "C9": {
+     "state": "B",
+     "evidence": "wine_integration all-stop DebugSession: software breakpoint at the real PE writer, hit in the program's register mode, single step, removal, detach; break-and-trace from the writer (local Wine 11; CI Wine 9/11 jobs)"
+    },
+    "C10": {
+     "state": "B",
+     "evidence": "frontend_target_gate --wine-launcher --gui: CLI info/modules/read/write/scan/pointerscan/autoasm/watch, Lua breakpoint, GUI scan/edit/debugger window (local Wine 11; CI CLI and Lua)"
+    }
+   }
+  },
+  {
+   "id": "wine-wow64",
+   "group": "Windows on Linux",
+   "name": "Wine new WoW64",
+   "cells": {
+    "C1": {
+     "state": "B",
+     "evidence": "wine_compatibility_test --require-wow64 (Wine 11 Fedora): PE32 with LinuxX86_64 loader"
+    },
+    "C2": {
+     "state": "B",
+     "evidence": "wine_integration width=4 typed writes"
+    },
+    "C3": {
+     "state": "B",
+     "evidence": "wine_integration first/next Int32 scans on the live PE fixture (local Wine 11 new WoW64; CI wow64 job)"
+    },
+    "C4": {
+     "state": "B",
+     "evidence": "wine_integration pointer scan finds the static PE pointer path (local Wine 11; CI wow64 job)"
+    },
+    "C5": {
+     "state": "B",
+     "evidence": "wine_integration AA injection PE32 under WoW64"
+    },
+    "C6": {
+     "state": "B",
+     "evidence": "wine_integration inject/restore + low-window alloc pressure"
+    },
+    "C7": {
+     "state": "X",
+     "evidence": "frontend_target_gate --wine-launcher: Lua injectLibrary and executeCode on the live PE program return nil plus the capability reason (Wine-safe loader calls and Windows thread initialization need a dedicated backend)"
+    },
+    "C8": {
+     "state": "B",
+     "evidence": "wine_integration main-thread HW watchpoint"
+    },
+    "C9": {
+     "state": "B",
+     "evidence": "wine_integration all-stop DebugSession: software breakpoint at the real PE writer, hit in the program's register mode, single step, removal, detach; break-and-trace from the writer on PE32 with the 64-bit loader (local Wine 11; CI wow64 job)"
+    },
+    "C10": {
+     "state": "B",
+     "evidence": "frontend_target_gate --wine-launcher --gui: CLI info/modules/read/write/scan/pointerscan/autoasm/watch, Lua breakpoint, GUI scan/edit/debugger window on PE32 with the 64-bit loader (local Wine 11; CI CLI and Lua)"
+    }
+   }
+  },
+  {
+   "id": "proton",
+   "group": "Windows on Linux",
+   "name": "Proton",
+   "cells": {
+    "C1": {
+     "state": "B",
+     "evidence": "proton_compatibility_gate (Valve Proton 9 + Experimental 11 locally, GE-Proton11-7 in CI): Wine runtime, PE program ABI, Unix loader ABI"
+    },
+    "C2": {
+     "state": "B",
+     "evidence": "proton_compatibility_gate (Valve Proton 9 + Experimental 11 locally, GE-Proton11-7 in CI): program-width pointer and typed writes observed by the PE fixture"
+    },
+    "C3": {
+     "state": "B",
+     "evidence": "proton_compatibility_gate (Valve Proton 9 + Experimental 11 locally, GE-Proton11-7 in CI): first and next Int32 scans over the whole live process"
+    },
+    "C4": {
+     "state": "B",
+     "evidence": "proton_compatibility_gate (Valve Proton 9 + Experimental 11 locally, GE-Proton11-7 in CI): depth-1 pointer scan finds the static PE path and resolves it"
+    },
+    "C5": {
+     "state": "B",
+     "evidence": "proton_compatibility_gate (Valve Proton 9 + Experimental 11 locally, GE-Proton11-7 in CI): Auto Assembler template at the real PE function, PE code-mode selection"
+    },
+    "C6": {
+     "state": "B",
+     "evidence": "proton_compatibility_gate (Valve Proton 9 + Experimental 11 locally, GE-Proton11-7 in CI): injection with exact byte/permission undo; busy-loop alloc/protect/free with register preservation"
+    },
+    "C7": {
+     "state": "X",
+     "evidence": "frontend_target_gate --wine-launcher: Lua injectLibrary and executeCode on the live PE program return nil plus the capability reason (Wine-safe loader calls and Windows thread initialization need a dedicated backend)"
+    },
+    "C8": {
+     "state": "B",
+     "evidence": "proton_compatibility_gate (Valve Proton 9 + Experimental 11 locally, GE-Proton11-7 in CI): main-thread hardware find-what-writes names the exact writer, 3 cycles"
+    },
+    "C9": {
+     "state": "B",
+     "evidence": "proton_compatibility_gate: all-stop DebugSession: software breakpoint at the real PE writer, hit in the program's register mode, single step, removal, detach; break-and-trace from the writer (Valve 9, Experimental 11; GE-Proton11-7 in CI)"
+    },
+    "C10": {
+     "state": "B",
+     "evidence": "frontend_target_gate --wine-launcher --gui: CLI info/modules/read/write/scan/pointerscan/autoasm/watch, Lua breakpoint, GUI scan/edit/debugger window through Proton 9 and Experimental 11 (CI GE-Proton CLI and Lua)"
+    }
+   }
+  },
+  {
+   "id": "proton-pressure-vessel",
+   "group": "Windows on Linux",
+   "name": "Proton in Steam Runtime",
+   "cells": {
+    "C1": {
+     "state": "B",
+     "evidence": "proton_compatibility_gate --in-steam-runtime (Proton 9 in sniper, Experimental 11 in SLR 4 locally; GE-Proton11-7 in SLR 4 in CI): target in the runtime's mount namespace, Wine/PE ABI identified from the host"
+    },
+    "C2": {
+     "state": "B",
+     "evidence": "proton_compatibility_gate --in-steam-runtime (Proton 9 in sniper, Experimental 11 in SLR 4 locally; GE-Proton11-7 in SLR 4 in CI): typed and program-width pointer writes observed by the PE fixture"
+    },
+    "C3": {
+     "state": "B",
+     "evidence": "proton_compatibility_gate --in-steam-runtime (Proton 9 in sniper, Experimental 11 in SLR 4 locally; GE-Proton11-7 in SLR 4 in CI): first/next Int32 scans of the containerized process"
+    },
+    "C4": {
+     "state": "B",
+     "evidence": "proton_compatibility_gate --in-steam-runtime (Proton 9 in sniper, Experimental 11 in SLR 4 locally; GE-Proton11-7 in SLR 4 in CI): static PE pointer path found and resolved"
+    },
+    "C5": {
+     "state": "B",
+     "evidence": "proton_compatibility_gate --in-steam-runtime (Proton 9 in sniper, Experimental 11 in SLR 4 locally; GE-Proton11-7 in SLR 4 in CI): Auto Assembler template at the real PE function"
+    },
+    "C6": {
+     "state": "B",
+     "evidence": "proton_compatibility_gate --in-steam-runtime (Proton 9 in sniper, Experimental 11 in SLR 4 locally; GE-Proton11-7 in SLR 4 in CI): injection with exact undo; busy-loop alloc/protect/free with exact registers"
+    },
+    "C7": {
+     "state": "X",
+     "evidence": "frontend_target_gate --wine-launcher: Lua injectLibrary and executeCode on the live PE program return nil plus the capability reason (Wine-safe loader calls and Windows thread initialization need a dedicated backend)"
+    },
+    "C8": {
+     "state": "B",
+     "evidence": "proton_compatibility_gate --in-steam-runtime (Proton 9 in sniper, Experimental 11 in SLR 4 locally; GE-Proton11-7 in SLR 4 in CI): main-thread hardware find-what-writes, 3 cycles"
+    },
+    "C9": {
+     "state": "B",
+     "evidence": "proton_compatibility_gate --in-steam-runtime: all-stop DebugSession: software breakpoint at the real PE writer, hit in the program's register mode, single step, removal, detach; break-and-trace from the writer inside sniper / SLR 4"
+    },
+    "C10": {
+     "state": "B",
+     "evidence": "frontend_target_gate --wine-launcher --gui: CLI info/modules/read/write/scan/pointerscan/autoasm/watch, Lua breakpoint, GUI scan/edit/debugger window inside sniper / SLR 4"
+    }
+   }
+  },
+  {
+   "id": "container-podman",
+   "group": "Sandboxes",
+   "name": "Podman / Docker",
+   "cells": {
+    "C1": {
+     "state": "B",
+     "evidence": "frontend_target_gate with dynamic musl in a rootless Alpine Podman container (local and CI): host PID resolved from NSpid; info ABI, symbols, module"
+    },
+    "C2": {
+     "state": "B",
+     "evidence": "frontend_target_gate with dynamic musl in a rootless Alpine Podman container (local and CI): typed write/read observed by the sandboxed program"
+    },
+    "C3": {
+     "state": "B",
+     "evidence": "frontend_target_gate with dynamic musl in a rootless Alpine Podman container (local and CI): whole-process first and next scans"
+    },
+    "C4": {
+     "state": "B",
+     "evidence": "frontend_target_gate with dynamic musl in a rootless Alpine Podman container (local and CI): pointer scan finds the static path"
+    },
+    "C5": {
+     "state": "B",
+     "evidence": "frontend_target_gate with dynamic musl in a rootless Alpine Podman container (local and CI): Auto Assembler hook script with process symbols"
+    },
+    "C6": {
+     "state": "B",
+     "evidence": "frontend_target_gate with dynamic musl in a rootless Alpine Podman container (local and CI): code cave hook changes behavior, disable restores bytes"
+    },
+    "C7": {
+     "state": "B",
+     "evidence": "frontend_target_gate: executeCode in the Alpine musl container runs the program's function; native_namespace_gate host pthread call (manual)"
+    },
+    "C8": {
+     "state": "B",
+     "evidence": "frontend_target_gate with dynamic musl in a rootless Alpine Podman container (local and CI): cescan watch names the writer"
+    },
+    "C9": {
+     "state": "B",
+     "evidence": "frontend_target_gate with dynamic musl in a rootless Alpine Podman container (local and CI): Lua breakpoint at the writer, call completes"
+    },
+    "C10": {
+     "state": "B",
+     "evidence": "frontend_target_gate --gui (dynamic musl in Alpine Podman): GUI scan/next scan/address-list edit/debugger-window breakpoint; CLI info/read/write/scan/pointerscan/autoasm/watch; Lua breakpoint"
+    }
+   }
+  },
+  {
+   "id": "flatpak",
+   "group": "Sandboxes",
+   "name": "Flatpak",
+   "cells": {
+    "C1": {
+     "state": "B",
+     "evidence": "frontend_target_gate under flatpak run org.freedesktop.Platform//25.08 (local): host PID resolved from NSpid; info ABI, symbols, module"
+    },
+    "C2": {
+     "state": "B",
+     "evidence": "frontend_target_gate under flatpak run org.freedesktop.Platform//25.08 (local): typed write/read observed by the sandboxed program"
+    },
+    "C3": {
+     "state": "B",
+     "evidence": "frontend_target_gate under flatpak run org.freedesktop.Platform//25.08 (local): whole-process first and next scans"
+    },
+    "C4": {
+     "state": "B",
+     "evidence": "frontend_target_gate under flatpak run org.freedesktop.Platform//25.08 (local): pointer scan finds the static path"
+    },
+    "C5": {
+     "state": "B",
+     "evidence": "frontend_target_gate under flatpak run org.freedesktop.Platform//25.08 (local): Auto Assembler hook script with process symbols"
+    },
+    "C6": {
+     "state": "B",
+     "evidence": "frontend_target_gate under flatpak run org.freedesktop.Platform//25.08 (local): code cave hook changes behavior, disable restores bytes"
+    },
+    "C7": {
+     "state": "X",
+     "evidence": "frontend_target_gate in flatpak run: static program; native calls refused with the explicit static-program and no-dlopen reasons"
+    },
+    "C8": {
+     "state": "B",
+     "evidence": "frontend_target_gate under flatpak run org.freedesktop.Platform//25.08 (local): cescan watch names the writer"
+    },
+    "C9": {
+     "state": "B",
+     "evidence": "frontend_target_gate under flatpak run org.freedesktop.Platform//25.08 (local): Lua breakpoint at the writer, call completes"
+    },
+    "C10": {
+     "state": "B",
+     "evidence": "frontend_target_gate --gui (inside flatpak run (local)): GUI scan/next scan/address-list edit/debugger-window breakpoint; CLI info/read/write/scan/pointerscan/autoasm/watch; Lua breakpoint"
+    }
+   }
+  },
+  {
+   "id": "snap",
+   "group": "Sandboxes",
+   "name": "Snap",
+   "cells": {
+    "C1": {
+     "state": "B",
+     "evidence": "frontend_target_gate in a strictly confined snap (snap run --shell hello-world: AppArmor profile, seccomp, mount namespace; hosted CI): identification, symbols, module"
+    },
+    "C2": {
+     "state": "B",
+     "evidence": "frontend_target_gate in a strictly confined snap (snap run --shell hello-world: AppArmor profile, seccomp, mount namespace; hosted CI): typed write/read observed by the confined program"
+    },
+    "C3": {
+     "state": "B",
+     "evidence": "frontend_target_gate in a strictly confined snap (snap run --shell hello-world: AppArmor profile, seccomp, mount namespace; hosted CI): first and next scans"
+    },
+    "C4": {
+     "state": "B",
+     "evidence": "frontend_target_gate in a strictly confined snap (snap run --shell hello-world: AppArmor profile, seccomp, mount namespace; hosted CI): static pointer path"
+    },
+    "C5": {
+     "state": "B",
+     "evidence": "frontend_target_gate in a strictly confined snap (snap run --shell hello-world: AppArmor profile, seccomp, mount namespace; hosted CI): Auto Assembler hook script with process symbols"
+    },
+    "C6": {
+     "state": "B",
+     "evidence": "frontend_target_gate in a strictly confined snap (snap run --shell hello-world: AppArmor profile, seccomp, mount namespace; hosted CI): code-cave hook changes behavior, disable restores bytes"
+    },
+    "C7": {
+     "state": "X",
+     "evidence": "frontend_target_gate in a strictly confined snap (snap run --shell hello-world: AppArmor profile, seccomp, mount namespace; hosted CI): static program refuses native calls and library injection with explicit reasons"
+    },
+    "C8": {
+     "state": "B",
+     "evidence": "frontend_target_gate in a strictly confined snap (snap run --shell hello-world: AppArmor profile, seccomp, mount namespace; hosted CI): cescan watch names the writer"
+    },
+    "C9": {
+     "state": "B",
+     "evidence": "frontend_target_gate in a strictly confined snap (snap run --shell hello-world: AppArmor profile, seccomp, mount namespace; hosted CI): Lua breakpoint at the writer, call completes"
+    },
+    "C10": {
+     "state": "B",
+     "evidence": "frontend_target_gate --gui in a strictly confined snap on hosted CI: CLI, Lua and the Qt main/debugger windows (17 checks)"
+    }
+   }
+  },
+  {
+   "id": "bubblewrap",
+   "group": "Sandboxes",
+   "name": "bubblewrap",
+   "cells": {
+    "C1": {
+     "state": "B",
+     "evidence": "frontend_target_gate under bwrap --unshare-all (local; CI as root): host PID resolved from NSpid; info ABI, symbols, module"
+    },
+    "C2": {
+     "state": "B",
+     "evidence": "frontend_target_gate under bwrap --unshare-all (local; CI as root): typed write/read observed by the sandboxed program"
+    },
+    "C3": {
+     "state": "B",
+     "evidence": "frontend_target_gate under bwrap --unshare-all (local; CI as root): whole-process first and next scans"
+    },
+    "C4": {
+     "state": "B",
+     "evidence": "frontend_target_gate under bwrap --unshare-all (local; CI as root): pointer scan finds the static path"
+    },
+    "C5": {
+     "state": "B",
+     "evidence": "frontend_target_gate under bwrap --unshare-all (local; CI as root): Auto Assembler hook script with process symbols"
+    },
+    "C6": {
+     "state": "B",
+     "evidence": "frontend_target_gate under bwrap --unshare-all (local; CI as root): code cave hook changes behavior, disable restores bytes"
+    },
+    "C7": {
+     "state": "B",
+     "evidence": "frontend_target_gate in bwrap --unshare-all: executeCode runs the dynamic glibc program's function on a new thread (via a thread in user code); parked-only programs refused with the reason"
+    },
+    "C8": {
+     "state": "B",
+     "evidence": "frontend_target_gate under bwrap --unshare-all (local; CI as root): cescan watch names the writer"
+    },
+    "C9": {
+     "state": "B",
+     "evidence": "frontend_target_gate under bwrap --unshare-all (local; CI as root): Lua breakpoint at the writer, call completes"
+    },
+    "C10": {
+     "state": "B",
+     "evidence": "frontend_target_gate --gui (inside bwrap --unshare-all): GUI scan/next scan/address-list edit/debugger-window breakpoint; CLI info/read/write/scan/pointerscan/autoasm/watch; Lua breakpoint"
+    }
+   }
+  },
+  {
+   "id": "mono-unity",
+   "group": "Managed runtimes",
+   "name": "Mono / Unity",
+   "cells": {
+    "C1": {
+     "state": "B",
+     "evidence": "mono_compatibility_gate (+--embedded) runtime detect, dissect, findMonoFunction JIT; plain Mono, not Unity"
+    },
+    "C2": {
+     "state": "B",
+     "evidence": "mono_integration pinned-object field read/write/restore across GC"
+    },
+    "C3": {
+     "state": "B",
+     "evidence": "runtime_target_gate on hosted CI (Mono 6.8 with --jitmap, C# fixture): marker scan and next scan isolate the off-heap value"
+    },
+    "C4": {
+     "state": "B",
+     "evidence": "runtime_target_gate on hosted CI (Mono 6.8 with --jitmap, C# fixture): non-static pointer scan path resolves to the off-heap value"
+    },
+    "C5": {
+     "state": "B",
+     "evidence": "runtime_target_gate on hosted CI (Mono 6.8 with --jitmap, C# fixture): disassembly of JIT code annotated with its --jitmap name"
+    },
+    "C6": {
+     "state": "B",
+     "evidence": "runtime_target_gate on hosted CI (Mono 6.8 with --jitmap, C# fixture): code-injection template at the JIT writer; the program computes through the cave; undo restores it"
+    },
+    "C7": {
+     "state": "B",
+     "evidence": "runtime_target_gate on hosted CI: executeCode and injectLibrary run inside the Mono process with a busy thread"
+    },
+    "C8": {
+     "state": "B",
+     "evidence": "runtime_target_gate on hosted CI (Mono 6.8 with --jitmap, C# fixture): find-what-writes names the JIT-compiled writer"
+    },
+    "C9": {
+     "state": "B",
+     "evidence": "runtime_target_gate on hosted CI (Mono 6.8 with --jitmap, C# fixture): Lua breakpoint on the reported JIT instruction stops the running code"
+    },
+    "C10": {
+     "state": "B",
+     "evidence": "runtime_target_gate on hosted CI (Mono 6.8 with --jitmap, C# fixture) --gui: CLI, Lua and the Qt main/debugger windows against a live Mono program"
+    }
+   }
+  },
+  {
+   "id": "il2cpp",
+   "group": "Managed runtimes",
+   "name": "IL2CPP",
+   "cells": {
+    "C1": {
+     "state": "X",
+     "evidence": "blocked (plan item 1.5): no legally redistributable IL2CPP Linux build exists for CI (Unity builds need a licensed editor); offline: a real Disco Elysium v27 global-metadata.dat (16187 types) parses and resolves field offsets from GameAssembly.dll (test_il2cpp_real_file, local only)"
+    },
+    "C2": {
+     "state": "X",
+     "evidence": "blocked (plan item 1.5): no legally redistributable IL2CPP Linux build exists for CI (Unity builds need a licensed editor); an IL2CPP game is a native process, so the native rows' generic evidence applies but is not claimed here"
+    },
+    "C3": {
+     "state": "X",
+     "evidence": "blocked (plan item 1.5): no legally redistributable IL2CPP Linux build exists for CI (Unity builds need a licensed editor); an IL2CPP game is a native process, so the native rows' generic evidence applies but is not claimed here"
+    },
+    "C4": {
+     "state": "X",
+     "evidence": "blocked (plan item 1.5): no legally redistributable IL2CPP Linux build exists for CI (Unity builds need a licensed editor); an IL2CPP game is a native process, so the native rows' generic evidence applies but is not claimed here"
+    },
+    "C5": {
+     "state": "X",
+     "evidence": "blocked (plan item 1.5): no legally redistributable IL2CPP Linux build exists for CI (Unity builds need a licensed editor); an IL2CPP game is a native process, so the native rows' generic evidence applies but is not claimed here"
+    },
+    "C6": {
+     "state": "X",
+     "evidence": "blocked (plan item 1.5): no legally redistributable IL2CPP Linux build exists for CI (Unity builds need a licensed editor); an IL2CPP game is a native process, so the native rows' generic evidence applies but is not claimed here"
+    },
+    "C7": {
+     "state": "X",
+     "evidence": "blocked (plan item 1.5): no legally redistributable IL2CPP Linux build exists for CI (Unity builds need a licensed editor); an IL2CPP game is a native process, so the native rows' generic evidence applies but is not claimed here"
+    },
+    "C8": {
+     "state": "X",
+     "evidence": "blocked (plan item 1.5): no legally redistributable IL2CPP Linux build exists for CI (Unity builds need a licensed editor); an IL2CPP game is a native process, so the native rows' generic evidence applies but is not claimed here"
+    },
+    "C9": {
+     "state": "X",
+     "evidence": "blocked (plan item 1.5): no legally redistributable IL2CPP Linux build exists for CI (Unity builds need a licensed editor); an IL2CPP game is a native process, so the native rows' generic evidence applies but is not claimed here"
+    },
+    "C10": {
+     "state": "X",
+     "evidence": "blocked (plan item 1.5): no legally redistributable IL2CPP Linux build exists for CI (Unity builds need a licensed editor); cescan il2cpp, the GUI dissector and Lua getIl2CppClasses are covered offline by test_il2cpp_locate and test_il2cpp_metadata"
+    }
+   }
+  },
+  {
+   "id": "jvm",
+   "group": "Managed runtimes",
+   "name": "JVM",
+   "cells": {
+    "C1": {
+     "state": "B",
+     "evidence": "runtime_target_gate (OpenJDK 21, jcmd Compiler.perfmap): cescan info names the runtime; the perf map names JIT code in cescan symbols and Lua"
+    },
+    "C2": {
+     "state": "B",
+     "evidence": "runtime_target_gate (OpenJDK 21, jcmd Compiler.perfmap): typed write to an off-heap value observed by the managed program"
+    },
+    "C3": {
+     "state": "B",
+     "evidence": "runtime_target_gate (OpenJDK 21, jcmd Compiler.perfmap): first scan for a marker, next scan after a real change isolates the value"
+    },
+    "C4": {
+     "state": "B",
+     "evidence": "runtime_target_gate: Lua pointerScan with staticOnly=false finds heap paths that resolve to the off-heap value"
+    },
+    "C5": {
+     "state": "B",
+     "evidence": "runtime_target_gate (OpenJDK 21, jcmd Compiler.perfmap): disassembly of generated code annotated with its JIT name"
+    },
+    "C6": {
+     "state": "B",
+     "evidence": "runtime_target_gate: generateCodeInjectionScript at the reported JIT writing instruction; the program computes through the cave; autoAssemble(script, disableInfo) restores the bytes"
+    },
+    "C7": {
+     "state": "B",
+     "evidence": "runtime_target_gate: with a busy runtime thread, Lua executeCode runs sched_yield on a new thread and injectLibrary loads libm into the runtime process"
+    },
+    "C8": {
+     "state": "B",
+     "evidence": "runtime_target_gate (OpenJDK 21, jcmd Compiler.perfmap): find-what-writes names the JIT-compiled writer through the perf map"
+    },
+    "C9": {
+     "state": "B",
+     "evidence": "runtime_target_gate (OpenJDK 21, jcmd Compiler.perfmap): Lua breakpoint on the reported JIT instruction stops the running code; the call completes"
+    },
+    "C10": {
+     "state": "B",
+     "evidence": "runtime_target_gate (OpenJDK 21, jcmd Compiler.perfmap) --gui: CLI info/symbols/scan/write/disasm/watch, Lua breakpoint, GUI scan/edit/debugger window"
+    }
+   }
+  },
+  {
+   "id": "coreclr",
+   "group": "Managed runtimes",
+   "name": "CoreCLR (.NET)",
+   "cells": {
+    "C1": {
+     "state": "B",
+     "evidence": "runtime_target_gate on hosted CI (.NET 8 SDK on the runner, DOTNET_PerfMapEnabled=1): cescan info names CoreCLR; the perf map names the JIT writer"
+    },
+    "C2": {
+     "state": "B",
+     "evidence": "runtime_target_gate on hosted CI (.NET 8 SDK on the runner, DOTNET_PerfMapEnabled=1): typed write to Marshal.AllocHGlobal memory observed by the program"
+    },
+    "C3": {
+     "state": "B",
+     "evidence": "runtime_target_gate on hosted CI (.NET 8 SDK on the runner, DOTNET_PerfMapEnabled=1): marker scan and next scan isolate the off-heap value"
+    },
+    "C4": {
+     "state": "B",
+     "evidence": "runtime_target_gate on hosted CI (.NET 8 SDK on the runner, DOTNET_PerfMapEnabled=1): non-static pointer scan path resolves to the value"
+    },
+    "C5": {
+     "state": "B",
+     "evidence": "runtime_target_gate on hosted CI (.NET 8 SDK on the runner, DOTNET_PerfMapEnabled=1): disassembly of JIT code annotated with its perf-map name"
+    },
+    "C6": {
+     "state": "B",
+     "evidence": "runtime_target_gate on hosted CI (.NET 8, default W^X, plus 3 repeat rounds): CE code-injection template at the JIT writer runs through the cave and disabling restores the bytes (patches go through the double mapping's backing file)"
+    },
+    "C7": {
+     "state": "B",
+     "evidence": "runtime_target_gate on hosted CI: executeCode and injectLibrary run inside the .NET process with a busy thread"
+    },
+    "C8": {
+     "state": "B",
+     "evidence": "runtime_target_gate on hosted CI (.NET 8 SDK on the runner, DOTNET_PerfMapEnabled=1): find-what-writes names the JIT-compiled writer"
+    },
+    "C9": {
+     "state": "B",
+     "evidence": "runtime_target_gate on hosted CI (.NET 8, default W^X, plus 3 repeat rounds): a Lua breakpoint at the find-what-writes writer stops in the JIT code that runs; the call completes"
+    },
+    "C10": {
+     "state": "B",
+     "evidence": "runtime_target_gate on hosted CI (.NET 8, default W^X, plus 3 repeat rounds): GUI main and debugger windows scan, edit and break in the JIT runtime (6 window checks), plus cescan and Lua"
+    }
+   }
+  },
+  {
+   "id": "go",
+   "group": "Managed runtimes",
+   "name": "Go",
+   "cells": {
+    "C1": {
+     "state": "B",
+     "evidence": "frontend_target_gate on a CGO-free Go 1.24 program (static, full symtab; built in Alpine locally): info ABI, Go symbol table (main.ce_writer), executable module; Lua getAddress by Go name"
+    },
+    "C2": {
+     "state": "B",
+     "evidence": "frontend_target_gate on a CGO-free Go 1.24 program (static, full symtab; built in Alpine locally): typed write/read observed by the Go program"
+    },
+    "C3": {
+     "state": "B",
+     "evidence": "frontend_target_gate on a CGO-free Go 1.24 program (static, full symtab; built in Alpine locally): whole-process first and next scans"
+    },
+    "C4": {
+     "state": "B",
+     "evidence": "frontend_target_gate on a CGO-free Go 1.24 program (static, full symtab; built in Alpine locally): pointer scan finds the package-level pointer path"
+    },
+    "C5": {
+     "state": "B",
+     "evidence": "frontend_target_gate on a CGO-free Go 1.24 program (static, full symtab; built in Alpine locally): Auto Assembler hook script naming main.ce_writer"
+    },
+    "C6": {
+     "state": "B",
+     "evidence": "frontend_target_gate on a CGO-free Go 1.24 program (static, full symtab; built in Alpine locally): code-cave hook changes the Go function's result, disable restores bytes"
+    },
+    "C7": {
+     "state": "X",
+     "evidence": "frontend_target_gate on a CGO-free Go 1.24 program (static, full symtab; built in Alpine locally): native calls refused explicitly (no pthread_detach or dlopen in a CGO-free static binary)"
+    },
+    "C8": {
+     "state": "B",
+     "evidence": "frontend_target_gate on a CGO-free Go 1.24 program (static, full symtab; built in Alpine locally): cescan watch names main.ce_writer"
+    },
+    "C9": {
+     "state": "B",
+     "evidence": "frontend_target_gate on a CGO-free Go 1.24 program (static, full symtab; built in Alpine locally): Lua breakpoint at main.ce_writer, call completes"
+    },
+    "C10": {
+     "state": "B",
+     "evidence": "frontend_target_gate on a CGO-free Go 1.24 program (static, full symtab; built in Alpine locally) --gui --ceserver: CLI, Lua, GUI windows and the ceserver transport"
+    }
+   }
+  },
+  {
+   "id": "v8",
+   "group": "Managed runtimes",
+   "name": "V8 (Node / Electron)",
+   "cells": {
+    "C1": {
+     "state": "B",
+     "evidence": "runtime_target_gate (Node 22 locally, Node 18 in CI, --perf-basic-prof): cescan info names the runtime; the perf map names JIT code in cescan symbols and Lua"
+    },
+    "C2": {
+     "state": "B",
+     "evidence": "runtime_target_gate (Node 22 locally, Node 18 in CI, --perf-basic-prof): typed write to an off-heap value observed by the managed program"
+    },
+    "C3": {
+     "state": "B",
+     "evidence": "runtime_target_gate (Node 22 locally, Node 18 in CI, --perf-basic-prof): first scan for a marker, next scan after a real change isolates the value"
+    },
+    "C4": {
+     "state": "B",
+     "evidence": "runtime_target_gate: Lua pointerScan with staticOnly=false finds heap paths that resolve to the off-heap value"
+    },
+    "C5": {
+     "state": "B",
+     "evidence": "runtime_target_gate (Node 22 locally, Node 18 in CI, --perf-basic-prof): disassembly of generated code annotated with its JIT name"
+    },
+    "C6": {
+     "state": "B",
+     "evidence": "runtime_target_gate: generateCodeInjectionScript at the reported JIT writing instruction; the program computes through the cave; autoAssemble(script, disableInfo) restores the bytes"
+    },
+    "C7": {
+     "state": "B",
+     "evidence": "runtime_target_gate: with a busy runtime thread, Lua executeCode runs sched_yield on a new thread and injectLibrary loads libm into the runtime process"
+    },
+    "C8": {
+     "state": "B",
+     "evidence": "runtime_target_gate (Node 22 locally, Node 18 in CI, --perf-basic-prof): find-what-writes names the JIT-compiled writer through the perf map"
+    },
+    "C9": {
+     "state": "B",
+     "evidence": "runtime_target_gate (Node 22 locally, Node 18 in CI, --perf-basic-prof): Lua breakpoint on the reported JIT instruction stops the running code; the call completes"
+    },
+    "C10": {
+     "state": "B",
+     "evidence": "runtime_target_gate (Node 22 locally, Node 18 in CI, --perf-basic-prof) --gui: CLI info/symbols/scan/write/disasm/watch, Lua breakpoint, GUI scan/edit/debugger window"
+    }
+   }
+  },
+  {
+   "id": "ceserver",
+   "group": "Remote and emulated",
+   "name": "CEServer",
+   "cells": {
+    "C1": {
+     "state": "B",
+     "evidence": "ceserver_compatibility_gate ceserver_integration: description, modules, threads, x86-64 to i386 exec"
+    },
+    "C2": {
+     "state": "B",
+     "evidence": "ceserver_integration typed/pointer writes, partial transfers, stale-handle failures"
+    },
+    "C3": {
+     "state": "B",
+     "evidence": "frontend_target_gate --ceserver: Lua client through cescan ceserver against a live glibc program: whole-address-space first and next scans"
+    },
+    "C4": {
+     "state": "B",
+     "evidence": "frontend_target_gate --ceserver: Lua client through cescan ceserver against a live glibc program: pointer scan finds the static path"
+    },
+    "C5": {
+     "state": "B",
+     "evidence": "frontend_target_gate --ceserver: Lua client through cescan ceserver against a live glibc program: Auto Assembler hook script assembles for the remote target"
+    },
+    "C6": {
+     "state": "B",
+     "evidence": "ceserver_integration remote alloc/protect/free; frontend_target_gate --ceserver: Lua client through cescan ceserver against a live glibc program: code-cave hook changes behavior, autoAssemble(script, disableInfo) restores it"
+    },
+    "C7": {
+     "state": "X",
+     "evidence": "frontend_target_gate --ceserver: Lua client through cescan ceserver against a live glibc program: executeCode is refused with the capability reason (no remote native-call backend)"
+    },
+    "C8": {
+     "state": "B",
+     "evidence": "ceserver_integration remote HW watchpoint reports write"
+    },
+    "C9": {
+     "state": "B",
+     "evidence": "ceserver_integration SW breakpoint/event/removal/restore; multiclient per-connection bps"
+    },
+    "C10": {
+     "state": "B",
+     "evidence": "frontend_target_gate --ceserver --gui: CLI serves the target (cescan ceserver), Lua client writes/scans/pointer-scans/assembles, GUI main window attachToCeserver scans and edits"
+    }
+   }
+  },
+  {
+   "id": "gdb-qemu-guest",
+   "group": "Remote and emulated",
+   "name": "GDB / QEMU system guest",
+   "cells": {
+    "C1": {
+     "state": "B",
+     "evidence": "gdb_transport_gate --require-qemu: XML desc on real ARM64 QEMU; Lua getTargetInfo; GUI label"
+    },
+    "C2": {
+     "state": "B",
+     "evidence": "gdb_transport_integration qemu RAM write/exact restore; gdb_gui_gate hex edit; gdb_lua_checks"
+    },
+    "C3": {
+     "state": "B",
+     "evidence": "gdb_transport_integration qemu byte scan; gdb_lua_checks MemScan first/next on QEMU"
+    },
+    "C4": {
+     "state": "B",
+     "evidence": "gdb_lua_checks on real QEMU: Lua pointerScan with staticOnly=false finds the absolute guest-RAM path (module-less bases)"
+    },
+    "C5": {
+     "state": "B",
+     "evidence": "gdb_transport_integration qemu arch selection + decode; no assemble"
+    },
+    "C6": {
+     "state": "X",
+     "evidence": "gdb_transport_integration: allocate/protect/free rejected on real QEMU with an explicit unsupported error"
+    },
+    "C7": {
+     "state": "X",
+     "evidence": "gdb_lua_checks (stub and real QEMU): executeCode refused with the capability reason (no guest native-call backend)"
+    },
+    "C8": {
+     "state": "X",
+     "evidence": "gdb_lua_checks (stub and real QEMU): findWhatWrites refused with the capability reason (guest watchpoint backend pending)"
+    },
+    "C9": {
+     "state": "B",
+     "evidence": "gdb_transport_integration qemu register edit + 2 real single steps; GUI register editor"
+    },
+    "C10": {
+     "state": "B",
+     "evidence": "gdb_transport_gate: CLI cescan gdb reg pc on the real QEMU CPU, Lua gdb_lua_checks on QEMU, GUI gdb_gui_gate on QEMU"
+    }
+   }
+  },
+  {
+   "id": "console-emulators",
+   "group": "Remote and emulated",
+   "name": "Console emulators",
+   "cells": {
+    "C1": {
+     "state": "B",
+     "evidence": "emulator_target_gate on hosted CI (real mGBA running a generated GBA ROM): cescan info identifies mGBA and lists guest-RAM candidates"
+    },
+    "C2": {
+     "state": "B",
+     "evidence": "emulator_target_gate on hosted CI (real mGBA running a generated GBA ROM): a typed host write to live guest RAM is copied by the guest program"
+    },
+    "C3": {
+     "state": "B",
+     "evidence": "emulator_target_gate on hosted CI (real mGBA running a generated GBA ROM): a value scan finds the guest's marker (live copy told apart from rewind snapshots) and a next scan follows a change"
+    },
+    "C4": {
+     "state": "B",
+     "evidence": "emulator_target_gate on hosted CI (real mGBA running a generated GBA ROM): a non-static pointer scan resolves a host path to the guest RAM buffer"
+    },
+    "C5": {
+     "state": "B",
+     "evidence": "emulator_target_gate on hosted CI (real mGBA running a generated GBA ROM): the guest's ARM code disassembles from the emulator's ROM image and reassembles (host view, no guest MMU adapter)"
+    },
+    "C6": {
+     "state": "n/a",
+     "evidence": "code caves in emulated guest RAM are not a meaningful operation"
+    },
+    "C7": {
+     "state": "n/a",
+     "evidence": "no native call into an emulated guest CPU"
+    },
+    "C8": {
+     "state": "B",
+     "evidence": "emulator_target_gate on hosted CI (real mGBA running a generated GBA ROM): find what writes reports mGBA's host store for a guest write (host instruction, not the guest's)"
+    },
+    "C9": {
+     "state": "B",
+     "evidence": "emulator_target_gate on hosted CI (real mGBA running a generated GBA ROM): a Lua breakpoint stops at that host store and the emulator keeps running after detach"
+    },
+    "C10": {
+     "state": "B",
+     "evidence": "emulator_target_gate on hosted CI (real mGBA running a generated GBA ROM): GUI main and debugger windows scan, edit and break in the emulator (6 window checks), plus cescan and Lua"
+    }
+   }
+  },
+  {
+   "id": "arm64ec",
+   "group": "Hybrid PE",
+   "name": "ARM64EC / ARM64X",
+   "cells": {
+    "C1": {
+     "state": "B",
+     "evidence": "arm64ec_target_gate on the hosted ARM64 runner (llvm-mingw ARM64EC fixture under Hangover 11.16 Wine): cescan info identifies a Wine-hosted ARM64EC program (PE load-config CHPE metadata)"
+    },
+    "C2": {
+     "state": "B",
+     "evidence": "arm64ec_target_gate on the hosted ARM64 runner (llvm-mingw ARM64EC fixture under Hangover 11.16 Wine): typed cescan write reaches the program and reads back"
+    },
+    "C3": {
+     "state": "B",
+     "evidence": "arm64ec_target_gate on the hosted ARM64 runner (llvm-mingw ARM64EC fixture under Hangover 11.16 Wine): first scan and a next scan after the program's own change isolate the value"
+    },
+    "C4": {
+     "state": "B",
+     "evidence": "arm64ec_target_gate on the hosted ARM64 runner (llvm-mingw ARM64EC fixture under Hangover 11.16 Wine): Lua static pointer scan resolves through the ARM64EC module"
+    },
+    "C5": {
+     "state": "X",
+     "evidence": "arm64ec_target_gate on the hosted ARM64 runner (llvm-mingw ARM64EC fixture under Hangover 11.16 Wine): cescan disasm refuses: ARM64EC mixes ARM64 and x64 code; the per-address CHPE code-range map is not implemented"
+    },
+    "C6": {
+     "state": "X",
+     "evidence": "arm64ec_target_gate on the hosted ARM64 runner (llvm-mingw ARM64EC fixture under Hangover 11.16 Wine): Lua injection template refuses: injection templates and hooks currently require x86"
+    },
+    "C7": {
+     "state": "X",
+     "evidence": "arm64ec_target_gate on the hosted ARM64 runner (llvm-mingw ARM64EC fixture under Hangover 11.16 Wine): Lua executeCode refuses: create remote thread has no complete backend for this target"
+    },
+    "C8": {
+     "state": "X",
+     "evidence": "arm64ec_target_gate on the hosted ARM64 runner (llvm-mingw ARM64EC fixture under Hangover 11.16 Wine): cescan watch refuses: hardware watchpoint has no complete backend for this target"
+    },
+    "C9": {
+     "state": "X",
+     "evidence": "arm64ec_target_gate on the hosted ARM64 runner (llvm-mingw ARM64EC fixture under Hangover 11.16 Wine): Lua debug_setBreakpoint returns the refusal: debugger has no complete backend for this target"
+    },
+    "C10": {
+     "state": "B",
+     "evidence": "arm64ec_target_gate on the hosted ARM64 runner (llvm-mingw ARM64EC fixture under Hangover 11.16 Wine): every check above goes through cescan and cescan lua; the program keeps running after all frontends detach (GUI not run)"
+    }
+   }
+  }
+ ]
+}

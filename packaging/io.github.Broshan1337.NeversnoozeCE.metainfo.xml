@@ -1,0 +1,137 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.Broshan1337.NeversnoozeCE</id>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Neversnooze CE</name>
+  <summary>Memory scanner, debugger, and injector for modding games and apps</summary>
+  <developer id="io.github.Broshan1337">
+    <name>Broshan1337</name>
+  </developer>
+  <description>
+    <p>
+      A Linux-native memory scanner, debugger and code injection toolkit in C++
+      and Qt6: memory scanning, pointer scanning, an auto-assembler, an interactive
+      multi-thread debugger, structure dissection, cheat tables, and Lua scripting.
+    </p>
+    <p>
+      Focused on single-player game modding and reverse engineering. It does not
+      target multiplayer anti-cheat.
+    </p>
+    <p>
+      Based on cheat-engine-linux by wleeaf, inspired by Cheat Engine by Dark Byte.
+    </p>
+  </description>
+  <launchable type="desktop-id">neversnooze-ce.desktop</launchable>
+  <provides>
+    <binary>neversnooze-ce</binary>
+    <binary>cescan</binary>
+  </provides>
+  <categories>
+    <category>Development</category>
+    <category>Debugger</category>
+  </categories>
+  <url type="homepage">https://github.com/Broshan1337/neversnooze-ce</url>
+  <url type="bugtracker">https://github.com/Broshan1337/neversnooze-ce/issues</url>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="1.1.0" date="2026-10-18">
+      <description>
+        <p>Neversnooze CE: the engine rebranded as a Neversnooze project with
+        the Neversnooze logo, periwinkle accent theme, new application id and
+        desktop integration, and .rpm packages alongside the .deb and AppImage.</p>
+      </description>
+    </release>
+    <release version="1.0.0" date="2026-10-13">
+      <description>
+        <p>First stable release. A redesigned, consistent interface in light and
+        dark themes that follows the desktop's theme, fonts and text scaling;
+        Settings whose every option takes effect; a sortable process picker;
+        and installs that run from any prefix.</p>
+        <p>Compatibility work across native, Wine and Proton, ARM64, ARM32,
+        x32, RISC-V, s390x and PowerPC guests, .NET, Mono and emulator targets,
+        with explicit errors where a feature is not supported.</p>
+      </description>
+    </release>
+    <release version="0.9.5" date="2026-10-03">
+      <description>
+        <p>Site-specific auto-assembler injection templates, consistent typed
+        memory operations across the GUI, CLI, and Lua, and extensive correctness
+        fixes for scanning, debugging, parsing, and scripting.</p>
+        <p>Improved GUI layouts, light and dark themes, scrolling, process
+        selection, live settings, and large form canvases.</p>
+      </description>
+    </release>
+    <release version="0.9.0" date="2026-09-29">
+      <description>
+        <p>Correctness, safety and portability fixes.</p>
+      </description>
+    </release>
+    <release version="0.8.0" date="2026-07-20">
+      <description>
+        <p>Global symbols, code pages and broader Lua support.</p>
+      </description>
+    </release>
+    <release version="0.7.0" date="2026-07-19">
+      <description>
+        <p>Emulator and sandboxed targets, obfuscated values, and scriptable find what writes.</p>
+      </description>
+    </release>
+    <release version="0.6.6" date="2026-07-18">
+      <description>
+        <p>Find what writes and code injection on Wine and Proton.</p>
+      </description>
+    </release>
+    <release version="0.6.5" date="2026-07-18">
+      <description>
+        <p>Whole-application interface overhaul and a deeper IL2CPP dissector.</p>
+      </description>
+    </release>
+    <release version="0.6.0" date="2026-07-16">
+      <description>
+        <p>Scanner performance overhaul.</p>
+      </description>
+    </release>
+    <release version="0.5.0" date="2026-07-14">
+      <description>
+        <p>Mono and Unity dissector, diagnostics, Lua table compatibility and debugger polish.</p>
+      </description>
+    </release>
+    <release version="0.4.1" date="2026-07-13">
+      <description>
+        <p>Bug-fix release: theme, diagnostics and packaging fixes.</p>
+      </description>
+    </release>
+    <release version="0.4.0" date="2026-07-13">
+      <description>
+        <p>Full CLI / headless parity through the Lua API and the cescan runner.</p>
+      </description>
+    </release>
+    <release version="0.3.0" date="2026-07-12">
+      <description>
+        <p>Complete interactive debugger; cecore as a ceserver; untrusted
+        cheat-table security hardening.</p>
+      </description>
+    </release>
+    <release version="0.2.1" date="2026-07-10">
+      <description>
+        <p>AOB-injection fix, 32-bit/WoW64/Wine support, cheat-table inline editing.</p>
+      </description>
+    </release>
+    <release version="0.2.0" date="2026-07-06">
+      <description>
+        <p>Real-time results and a hardened core.</p>
+      </description>
+    </release>
+    <release version="0.1.1" date="2026-05-21">
+      <description>
+        <p>PortProton, Lutris and Heroic support.</p>
+      </description>
+    </release>
+    <release version="0.1.0" date="2026-05-08">
+      <description>
+        <p>First tagged release.</p>
+      </description>
+    </release>
+  </releases>
+</component>

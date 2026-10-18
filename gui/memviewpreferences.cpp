@@ -1,0 +1,144 @@
+#include "gui/memviewpreferences.hpp"
+#include "gui/theme.hpp"
+
+#include <QVBoxLayout>
+#include <QHBoxLayout>
+#include <QFormLayout>
+#include <QGroupBox>
+#include <QLabel>
+#include <QLineEdit>
+#include <QPushButton>
+#include <QComboBox>
+#include <QDialogButtonBox>
+#include <QColorDialog>
+#include <QFontDialog>
+#include <QFontMetrics>
+#include <QSettings>
+#include <QScrollArea>
+#include <QGuiApplication>
+#include <QScreen>
+#include <algorithm>
+
+namespace ce::gui {
+
+// A color swatch button bound to a QSettings key (defaults match the current
+// disassembler palette). Clicking picks a new color; the swatch updates and the
+// value is written on Apply (the button carries the pending color in a property).
+QPushButton* MemviewPreferences::colorButton(const QString& key, const QColor& def) {
+    QSettings s;
+    QColor cur = QColor(s.value("disasm/" + key, def.name()).toString());
+    auto* btn = new QPushButton;
+    btn->setProperty("prefKey", key);
+    btn->setProperty("color", cur);
+    btn->setAccessibleName(key.mid(5) + " color");
+    auto paint = [btn]() {
+        QColor c = btn->property("color").value<QColor>();
+        btn->setStyleSheet(QString("background:%1; min-width:44px;").arg(c.name()));
+    };
+    paint();
+    connect(btn, &QPushButton::clicked, this, [this, btn, paint]() {
+        QColor c = QColorDialog::getColor(btn->property("color").value<QColor>(), this);
+        if (c.isValid()) { btn->setProperty("color", c); btn->setProperty("colorEdited", true); paint(); }
+    });
+    return btn;
+}
+
+MemviewPreferences::MemviewPreferences(QWidget* parent) : QDialog(parent) {
+    setWindowTitle("Disassembler Preferences");
+    resize(500, 620);
+    QSettings s;
+    font_.fromString(s.value("disasm/font", QFont("Monospace", 10).toString()).toString());
+
+    auto* root = new QVBoxLayout(this);
+    auto* content = new QWidget;
+    auto* v = new QVBoxLayout(content);
+    auto* scroll = new QScrollArea;
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    scroll->setWidget(content);
+    root->addWidget(scroll, 1);
+
+    // GroupBox2 "Disassembler": font + color group selector.
+    auto* gbDisasm = new QGroupBox("Disassembler");
+    auto* dl = new QFormLayout(gbDisasm);
+    fontBtn_ = new QPushButton("Change disassembler font");
+    connect(fontBtn_, &QPushButton::clicked, this, [this]() {
+        bool ok = false;
+        QFont f = QFontDialog::getFont(&ok, font_, this);
+        if (ok) font_ = f;
+    });
+    dl->addRow(fontBtn_);
+    colorGroup_ = new QComboBox;
+    colorGroup_->addItems({"Normal"});
+    dl->addRow("Color group:", colorGroup_);
+    v->addWidget(gbDisasm);
+
+    // Default swatches follow the theme so they match the actual disassembler
+    // colors (and, since these defaults get persisted on OK, so a light-theme user
+    // doesn't save dark-theme colors into the disassembler).
+    const bool dark = ce::gui::isDarkTheme();
+    auto def = [dark](QColor d, QColor l) { return dark ? d : l; };
+
+    // GroupBox1 "Normal": text colors.
+    auto* gbNormal = new QGroupBox("Normal");
+    auto* nl = new QFormLayout(gbNormal);
+    nl->addRow("Default color", colorButton("colorDefault", def(QColor(0xcd, 0xd6, 0xf4), QColor(0x00, 0x00, 0x00))));
+    nl->addRow("Register color", colorButton("colorRegister", def(QColor(0xcd, 0xd6, 0xf4), QColor(0x3a, 0x42, 0x52))));
+    nl->addRow("Symbol color", colorButton("colorSymbol", def(QColor(0xf9, 0xe2, 0xaf), QColor(0x80, 0x60, 0x00))));
+    nl->addRow("Hexadecimal color", colorButton("colorHex", def(QColor(0x89, 0xb4, 0xfa), QColor(0x00, 0x00, 0xc0))));
+    v->addWidget(gbNormal);
+
+    // GroupBox4 "Jumplines".
+    auto* gbJump = new QGroupBox("Jumplines");
+    auto* jl = new QFormLayout(gbJump);
+    jl->addRow("Conditional jump color", colorButton("colorCondJump", def(QColor(0xfa, 0xb3, 0x87), QColor(0xc0, 0x40, 0x00))));
+    jl->addRow("Unconditional jump color", colorButton("colorJump", def(QColor(0x89, 0xb4, 0xfa), QColor(0x00, 0x00, 0xc0))));
+    jl->addRow("Call color", colorButton("colorCall", def(QColor(0xcb, 0xa6, 0xf7), QColor(0x88, 0x39, 0xef))));
+    jlThickness_ = new QLineEdit(s.value("disasm/jlThickness", 1).toString());
+    jl->addRow("Thickness", jlThickness_);
+    // Lanes default to one character apart, as the disassembler draws them.
+    jlSpacing_ = new QLineEdit(s.value("disasm/jlSpacing", QFontMetrics(font_).horizontalAdvance('0')).toString());
+    jl->addRow("Spacing", jlSpacing_);
+    v->addWidget(gbJump);
+
+    // GroupBox5 "Space between lines".
+    auto* gbSpace = new QGroupBox("Space between lines");
+    auto* sl = new QFormLayout(gbSpace);
+    spaceAbove_ = new QLineEdit(s.value("disasm/spaceAbove", 0).toString());
+    sl->addRow("Above", spaceAbove_);
+    spaceBelow_ = new QLineEdit(s.value("disasm/spaceBelow", 0).toString());
+    sl->addRow("Below", spaceBelow_);
+    v->addWidget(gbSpace);
+
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Apply | QDialogButtonBox::Cancel);
+    connect(buttons->button(QDialogButtonBox::Apply), &QPushButton::clicked, this, [this]() {
+        apply();
+    });
+    connect(buttons, &QDialogButtonBox::accepted, this, [this]() {
+        apply();
+        accept();
+    });
+    connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
+    root->addWidget(buttons);
+    // Open tall enough to show every group without scrolling, within the screen.
+    int fit = content->sizeHint().height() + buttons->sizeHint().height() + 48;
+    if (auto* screen = QGuiApplication::primaryScreen()) fit = std::min(fit, screen->availableGeometry().height() - 80);
+    resize(520, std::max(620, fit));
+}
+
+void MemviewPreferences::apply() {
+    QSettings s;
+    s.setValue("disasm/font", font_.toString());
+    for (auto* btn : findChildren<QPushButton*>()) {
+        auto key = btn->property("prefKey").toString();
+        if (!key.isEmpty() && (btn->property("colorEdited").toBool() || s.contains("disasm/" + key)))
+            s.setValue("disasm/" + key, btn->property("color").value<QColor>().name());
+    }
+    s.setValue("disasm/jlThickness", jlThickness_->text().toInt());
+    s.setValue("disasm/jlSpacing", jlSpacing_->text().toInt());
+    s.setValue("disasm/spaceAbove", spaceAbove_->text().toInt());
+    s.setValue("disasm/spaceBelow", spaceBelow_->text().toInt());
+    emit applied();
+}
+
+}  // namespace ce::gui

@@ -1,0 +1,885 @@
+#include <cxxabi.h>
+#include <cstdlib>
+#include "symbols/elf_symbols.hpp"
+#include "platform/linux/target_syscall.hpp"
+#include "analysis/pe_exports.hpp"
+#include "core/module_files.hpp"
+#include "core/regular_file.hpp"
+
+#include <cerrno>
+#include <fcntl.h>
+#include <fstream>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <sstream>
+#include <cstring>
+#include <elf.h>
+#include <filesystem>
+#include <algorithm>
+#include <array>
+#include <set>
+
+namespace ce {
+namespace {
+// A NUL-terminated name at offset, at most 4 KiB long. Real symbol names are
+// far shorter; without the cap a file with one huge string and many symbols
+// naming it makes a copy of that string per symbol.
+constexpr size_t kMaxNameLength = 4096;
+bool terminated(const std::vector<char>& bytes, size_t offset) {
+    return offset < bytes.size() &&
+           std::memchr(bytes.data() + offset, 0, std::min(bytes.size() - offset, kMaxNameLength));
+}
+// Upper bounds for one ELF file. A real file has one .symtab and one .dynsym
+// (the ELF spec allows one of each), a handful of relocation and .plt
+// sections, and well under eight million symbols; a hostile file can declare
+// thousands of overlapping headers to multiply the work.
+constexpr size_t kMaxSymbolsPerTable = size_t(1) << 23;
+constexpr int kMaxRelocationSections = 32;
+constexpr int kMaxPltSections = 8;
+}
+
+
+void SymbolResolver::clear() {
+    symbols_.clear();
+    addrIndex_.clear();
+    nameIndex_.clear();
+    mangledIndex_.clear();
+}
+
+std::vector<const Symbol*> SymbolResolver::symbolsByRawName(const std::string& raw) const {
+    std::vector<const Symbol*> found;
+    auto [first, last] = mangledIndex_.equal_range(raw);
+    for (auto it = first; it != last; ++it) found.push_back(&symbols_[it->second]);
+    // Names that were not demangled are listed as they are spelled.
+    for (const auto& symbol : symbols_)
+        if (symbol.name == raw) found.push_back(&symbol);
+    return found;
+}
+
+// ELF structures are read in host byte order, so a symbol file must use it:
+// little-endian on x86/ARM/RISC-V hosts, big-endian on s390x (no swapping).
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+static constexpr unsigned char kHostElfData = ELFDATA2MSB;
+#else
+static constexpr unsigned char kHostElfData = ELFDATA2LSB;
+#endif
+
+void SymbolResolver::loadProcess(ProcessHandle& proc) {
+    clear();
+    const auto description = proc.targetDescription();
+    // Module paths of a remote target name files on the remote system; a
+    // local file at the same path is a different binary.
+    if (!moduleFilesAreLocal(proc)) return;
+    if (!description.live || proc.pid() <= 0) return;
+    auto task=os::processMemoryTask(proc.pid());
+    if (!task) return;
+    const std::string root = "/proc/" + std::to_string(*task) + "/root";
+    auto modules = proc.modules();
+    for (auto& m : modules) {
+        if (m.path.empty() || m.path[0] != '/') continue;
+        // The module inode may be shared with the host while its global debug
+        // directory is private to the target. Keep that filesystem context even
+        // when the ordinary module-file resolver can use the raw host pathname.
+        auto path = m.path;
+        if (path != root && !path.starts_with(root + "/"))
+            path = root + path;
+        std::error_code ec;
+        if (!std::filesystem::exists(path, ec)) continue;
+        loadModule(path, m.name, m.base);
+    }
+    // The runtime names its map with the PID it sees, which differs from the
+    // host PID inside a container's PID namespace.
+    std::string pid = std::to_string(proc.pid());
+    std::ifstream status("/proc/" + std::to_string(proc.pid()) + "/status");
+    for (std::string line; std::getline(status, line);)
+        if (line.starts_with("NSpid:")) {
+            std::istringstream ids(line.substr(6));
+            for (std::string id; ids >> id;) pid = id;
+            break;
+        }
+    loadPerfMap(root + "/tmp/perf-" + pid + ".map");
+}
+
+// JIT runtimes describe generated code in /tmp/perf-<pid>.map, one
+// "START SIZE name" line (hex) per function: HotSpot (`jcmd <pid>
+// Compiler.perfmap`), CoreCLR (DOTNET_PerfMapEnabled=1), V8/Node
+// (--perf-basic-prof) and LuaJIT. The file is written by the target, so it is
+// untrusted: bounded in size, entry count and line length. Code is recompiled
+// over time, so a later entry for the same address or name wins.
+void SymbolResolver::loadPerfMap(const std::string& path) {
+    // Anyone can create /tmp/perf-<pid>.map: open it without following a
+    // link or blocking on a FIFO, insist on a regular file and read a bounded
+    // amount, so no line can grow without limit.
+    constexpr size_t kMaxEntries = size_t(1) << 20;
+    constexpr size_t kMaxBytes = size_t(64) << 20;
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW);
+    if (fd < 0) return;
+    std::string contents;
+    if (struct stat st{}; ::fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) {
+        char buffer[65536];
+        while (contents.size() < kMaxBytes) {
+            const ssize_t got = ::read(fd, buffer, std::min(sizeof buffer, kMaxBytes - contents.size()));
+            if (got < 0 && errno == EINTR) continue;
+            if (got <= 0) break;
+            contents.append(buffer, static_cast<size_t>(got));
+        }
+    }
+    ::close(fd);
+    std::istringstream file(contents);
+    size_t added = 0;
+    for (std::string line; added < kMaxEntries && std::getline(file, line);) {
+        if (line.size() > 4096) continue;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const char* text = line.c_str();
+        char* end = nullptr;
+        errno = 0;
+        unsigned long long start = std::strtoull(text, &end, 16);
+        if (errno || end == text || *end != ' ') continue;
+        const char* sizeText = end + 1;
+        unsigned long long size = std::strtoull(sizeText, &end, 16);
+        if (errno || end == sizeText || *end != ' ' || !start || start > UINTPTR_MAX || size > (1ull << 30)) continue;
+        std::string name(end + 1);
+        if (name.empty()) continue;
+        const auto address = static_cast<uintptr_t>(start);
+        if (auto existing = addrIndex_.find(address); existing != addrIndex_.end()) {
+            symbols_[existing->second] = Symbol{name, address, static_cast<size_t>(size), "[jit]"};
+        } else {
+            addrIndex_[address] = symbols_.size();
+            symbols_.push_back(Symbol{name, address, static_cast<size_t>(size), "[jit]"});
+            ++added;
+        }
+        nameIndex_[name] = address;
+    }
+}
+
+void SymbolResolver::loadModule(const std::string& path, const std::string& moduleName, uintptr_t baseAddr) {
+    // Wine/Proton modules are PE images (MZ magic); their symbols live in the PE
+    // export table, not an ELF symtab. Dispatch on the file magic.
+    std::ifstream probe;
+    if (!openRegularFile(probe, path)) return;   // a device or FIFO could block the read
+    char magic[2] = {};
+    if (probe.read(magic, 2) && magic[0] == 'M' && magic[1] == 'Z') {
+        parsePeExports(path, moduleName, baseAddr);
+        return;
+    }
+    parseElfSymbols(path, moduleName, baseAddr);
+}
+
+void SymbolResolver::parsePeExports(const std::string& path, const std::string& moduleName,
+                                    uintptr_t baseAddr) {
+    for (const auto& e : ce::parsePEExports(path)) {
+        if (e.name.empty() || e.rva == 0 || e.rva > UINTPTR_MAX - baseAddr) continue;   // skip ordinal-only / forwarders
+        uintptr_t addr = baseAddr + e.rva;
+        if (addrIndex_.count(addr)) continue;          // first name at an address wins
+        size_t idx = symbols_.size();
+        symbols_.push_back(Symbol{e.name, addr, 0, moduleName});
+        addrIndex_[addr] = idx;
+        if (!nameIndex_.count(e.name)) nameIndex_[e.name] = addr;
+    }
+}
+
+// Demangle an Itanium C++ name ("_ZN3Foo3barEv" -> "Foo::bar()"). A symbol
+// version suffix ("@Qt_6", "@@GLIBC_2.34") is not part of the mangling, so it
+// is demangled without it and appended again. Returns the input on failure.
+static std::string demangleSymbol(const char* name) {
+    if (name[0] != '_' || name[1] != 'Z') return name;
+    std::string mangled = name, suffix;
+    if (auto at = mangled.find('@'); at != std::string::npos) {
+        suffix = mangled.substr(at);
+        mangled.resize(at);
+    }
+    int status = 0;
+    char* dem = abi::__cxa_demangle(mangled.c_str(), nullptr, nullptr, &status);
+    std::string result = (status == 0 && dem) ? std::string(dem) + suffix : std::string(name);
+    std::free(dem);
+    return result;
+}
+
+// GNU notes have the same layout in ELF32 and ELF64. Bound every padded field
+// before reading it, including notes from the separate file being validated.
+template<class Section>
+static std::vector<uint8_t> readBuildId(const std::vector<Section>& shdrs,
+                                       std::ifstream& f, uintmax_t fileSize) {
+    for (const auto& sh : shdrs) {
+        if (sh.sh_type != SHT_NOTE) continue;
+        if (sh.sh_offset > fileSize || sh.sh_size > fileSize - sh.sh_offset) continue;
+        if ((sh.sh_size) < sizeof(Elf64_Nhdr) || sh.sh_size > (1u << 20)) continue;
+        std::vector<char> buf(sh.sh_size);
+        f.clear(); f.seekg(sh.sh_offset); f.read(buf.data(), sh.sh_size);
+        if (!f) continue;
+        size_t off = 0;
+        while (off + sizeof(Elf64_Nhdr) <= buf.size()) {
+            Elf64_Nhdr nh;
+            std::memcpy(&nh, buf.data() + off, sizeof(nh));
+            size_t nameOff = off + sizeof(Elf64_Nhdr);
+            if (nh.n_namesz > buf.size() - nameOff) break;
+            size_t namePad = nh.n_namesz;
+            size_t padding = (4 - namePad % 4) % 4;
+            if (padding > buf.size() - nameOff - namePad) break;
+            namePad += padding;
+            size_t descOff = nameOff + namePad;
+            if (nh.n_descsz > buf.size() - descOff) break;
+            size_t descPad = nh.n_descsz;
+            padding = (4 - descPad % 4) % 4;
+            if (padding > buf.size() - descOff - descPad) break;
+            descPad += padding;
+            if (nh.n_type == NT_GNU_BUILD_ID && nh.n_namesz == 4 && nh.n_descsz >= 2 &&
+                std::memcmp(buf.data() + nameOff, "GNU\0", 4) == 0)
+                return {reinterpret_cast<const uint8_t*>(buf.data() + descOff),
+                        reinterpret_cast<const uint8_t*>(buf.data() + descOff + nh.n_descsz)};
+            size_t next = descOff + descPad;
+            if (next <= off) break;   // never stall
+            off = next;
+        }
+    }
+    return {};
+}
+
+template<class Header>
+static bool matchingDebugHeader(std::ifstream& f, const Header& original, Header& candidate) {
+    f.read(reinterpret_cast<char*>(&candidate), sizeof(candidate));
+    return f && std::memcmp(candidate.e_ident, ELFMAG, SELFMAG) == 0 &&
+           candidate.e_ident[EI_CLASS] == original.e_ident[EI_CLASS] &&
+           candidate.e_ident[EI_DATA] == original.e_ident[EI_DATA] &&
+           candidate.e_ident[EI_VERSION] == EV_CURRENT && candidate.e_version == EV_CURRENT &&
+           candidate.e_machine == original.e_machine && candidate.e_type == original.e_type &&
+           candidate.e_ehsize == sizeof(Header);
+}
+
+template<class Header, class Section>
+static bool matchingDebugBuildId(const std::filesystem::path& path, const Header& original,
+                                 const std::vector<uint8_t>& expected) {
+    std::ifstream f;
+    uint64_t size = 0;
+    if (!openRegularFile(f, path.string(), &size)) return false;
+    Header header{};
+    if (!matchingDebugHeader(f, original, header) || header.e_shnum == 0 ||
+        header.e_shentsize != sizeof(Section) || header.e_shoff > size ||
+        header.e_shnum > (size - header.e_shoff) / sizeof(Section)) return false;
+    std::vector<Section> sections(header.e_shnum);
+    f.seekg(header.e_shoff);
+    f.read(reinterpret_cast<char*>(sections.data()), sections.size() * sizeof(Section));
+    return f && readBuildId(sections, f, size) == expected;
+}
+
+// The GNU debuglink checksum is standard CRC32 of the entire debug file.
+// Streaming it avoids allocating an additional copy of large debug packages.
+template<class Header>
+static bool matchingDebugCrc(const std::filesystem::path& path, const Header& original,
+                             uint32_t expected) {
+    std::ifstream f;
+    if (!openRegularFile(f, path.string())) return false;
+    Header header{};
+    if (!matchingDebugHeader(f, original, header)) return false;
+    static constexpr auto table = [] {
+        std::array<uint32_t, 256> result{};
+        for (uint32_t i = 0; i < result.size(); ++i) {
+            uint32_t value = i;
+            for (int bit = 0; bit < 8; ++bit)
+                value = (value >> 1) ^ ((value & 1) ? 0xedb88320u : 0u);
+            result[i] = value;
+        }
+        return result;
+    }();
+    f.clear(); f.seekg(0);
+    uint32_t crc = 0xffffffffu;
+    std::array<char, 64 * 1024> bytes{};
+    while (f) {
+        f.read(bytes.data(), bytes.size());
+        for (std::streamsize i = 0; i < f.gcount(); ++i)
+            crc = table[(crc ^ static_cast<unsigned char>(bytes[i])) & 0xff] ^ (crc >> 8);
+    }
+    return !f.bad() && f.eof() && (crc ^ 0xffffffffu) == expected;
+}
+
+// Search the target's global debug directory before a host copy. Host copies
+// remain useful (for example host-installed debuginfo for a container), but must
+// independently match the module's build ID or full-file debuglink checksum.
+template<class Header, class Section>
+static std::string findSeparateDebugFile(const std::vector<Section>& shdrs,
+                                         const Header& ehdr, std::ifstream& f,
+                                         uintmax_t fileSize, const std::string& origPath) {
+    namespace fs = std::filesystem;
+    fs::path imagePath(origPath);
+    std::vector<fs::path> globalDirs;
+    if (origPath.starts_with("/proc/")) {
+        auto end = origPath.find('/', 6);
+        auto owner = origPath.substr(6, end == std::string::npos ? end : end - 6);
+        bool procOwner = owner == "self" || owner == "thread-self" ||
+            (!owner.empty() && owner.find_first_not_of("0123456789") == std::string::npos);
+        if (end != std::string::npos && procOwner && origPath.compare(end, 6, "/root/") == 0) {
+            globalDirs.emplace_back(fs::path(origPath.substr(0, end + 5)) / "usr/lib/debug");
+            imagePath = origPath.substr(end + 5);
+        }
+    }
+    globalDirs.emplace_back("/usr/lib/debug");
+    auto buildId = readBuildId(shdrs, f, fileSize);
+    if (!buildId.empty()) {
+        static const char* hx = "0123456789abcdef";
+        std::string id;
+        for (uint8_t byte : buildId) { id.push_back(hx[byte >> 4]); id.push_back(hx[byte & 0xf]); }
+        for (const auto& dir : globalDirs) {
+            auto candidate = dir / ".build-id" / id.substr(0, 2) / (id.substr(2) + ".debug");
+            if (matchingDebugBuildId<Header, Section>(candidate, ehdr, buildId)) return candidate.string();
+        }
+    }
+
+    // A debuglink carries a basename, aligned padding, and a mandatory CRC.
+    if (ehdr.e_shstrndx < shdrs.size()) {
+        const auto& shstr = shdrs[ehdr.e_shstrndx];
+        if (shstr.sh_offset <= fileSize && shstr.sh_size <= fileSize - shstr.sh_offset &&
+            shstr.sh_size > 0 && shstr.sh_size < (1u << 20)) {
+            std::vector<char> names(shstr.sh_size);
+            f.clear(); f.seekg(shstr.sh_offset); f.read(names.data(), shstr.sh_size);
+            if (f) {
+                for (const auto& sh : shdrs) {
+                    if (!terminated(names, sh.sh_name)) continue;
+                    if (std::strcmp(names.data() + sh.sh_name, ".gnu_debuglink") != 0) continue;
+                    if (sh.sh_offset > fileSize || sh.sh_size > fileSize - sh.sh_offset ||
+                        sh.sh_size < 5 || sh.sh_size > 4096) break;
+                    std::vector<char> dl(sh.sh_size);
+                    f.clear(); f.seekg(sh.sh_offset); f.read(dl.data(), sh.sh_size);
+                    if (!f) break;
+                    if (!terminated(dl, 0)) break;
+                    std::string debugName = dl.data();
+                    if (debugName.empty() || debugName == "." || debugName == ".." ||
+                        fs::path(debugName).filename() != fs::path(debugName)) break;
+                    size_t crcOffset = (debugName.size() + 4) & ~size_t{3};
+                    if (crcOffset > dl.size() || dl.size() - crcOffset != 4) break;
+                    uint32_t crc = 0;
+                    for (size_t i = 0; i < 4; ++i)
+                        crc |= uint32_t(static_cast<unsigned char>(dl[crcOffset + i])) << (8 * i);
+                    fs::path dir = fs::path(origPath).parent_path();
+                    std::vector<fs::path> candidates{dir / debugName, dir / ".debug" / debugName};
+                    for (const auto& global : globalDirs)
+                        candidates.emplace_back(global / imagePath.parent_path().relative_path() / debugName);
+                    for (const auto& candidate : candidates)
+                        if (matchingDebugCrc(candidate, ehdr, crc)) return candidate.string();
+                    break;
+                }
+            }
+        }
+    }
+    return "";
+}
+
+// The load bias of an image whose lowest mapping is at moduleBase. The loader
+// maps the first PT_LOAD at bias + its page-aligned p_vaddr: zero for ordinary
+// libraries and PIEs, but not for a prelinked library or a PIE linked at a
+// non-zero image base, where adding st_value to moduleBase would shift every
+// symbol. ET_EXEC symbols are absolute and do not use it.
+template<class Header, class Phdr>
+static uintptr_t elfLoadBias(std::ifstream& f, const Header& ehdr, uint64_t fileSize, uintptr_t moduleBase) {
+    if (ehdr.e_type != ET_DYN || ehdr.e_phoff == 0 || ehdr.e_phnum == 0 || ehdr.e_phnum > 256 ||
+        ehdr.e_phentsize != sizeof(Phdr) || ehdr.e_phoff > fileSize ||
+        ehdr.e_phnum > (fileSize - ehdr.e_phoff) / sizeof(Phdr)) return moduleBase;
+    std::vector<Phdr> phdrs(ehdr.e_phnum);
+    f.clear();
+    f.seekg(ehdr.e_phoff);
+    f.read(reinterpret_cast<char*>(phdrs.data()), phdrs.size() * sizeof(Phdr));
+    if (!f) { f.clear(); return moduleBase; }
+    uint64_t first = UINT64_MAX;
+    for (const auto& ph : phdrs)
+        if (ph.p_type == PT_LOAD) first = std::min<uint64_t>(first, ph.p_vaddr);
+    if (first == UINT64_MAX) return moduleBase;
+    long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) page = 4096;
+    const uint64_t start = first & ~static_cast<uint64_t>(page - 1);
+    return start <= moduleBase ? moduleBase - static_cast<uintptr_t>(start) : moduleBase;
+}
+
+// The .gnu.version entries for the dynamic symbol table at index `table`, one
+// per symbol, or empty when there are none. An entry with bit 15 set is a
+// hidden (non-default) version: glibc keeps old pthread_cond_wait, realpath
+// and others under the same name as the current one.
+template<class Section>
+static std::vector<uint16_t> readVersionTable(std::ifstream& f, const std::vector<Section>& shdrs,
+                                              size_t table, uint64_t fileSize, size_t symbolCount) {
+    for (const auto& sh : shdrs) {
+        if (sh.sh_type != SHT_GNU_versym || sh.sh_link != table || sh.sh_entsize != sizeof(uint16_t)) continue;
+        if (sh.sh_offset > fileSize || sh.sh_size > fileSize - sh.sh_offset ||
+            sh.sh_size / sizeof(uint16_t) != symbolCount) return {};
+        std::vector<uint16_t> versions(symbolCount);
+        f.clear();
+        f.seekg(sh.sh_offset);
+        f.read(reinterpret_cast<char*>(versions.data()), versions.size() * sizeof(uint16_t));
+        if (!f) { f.clear(); return {}; }
+        return versions;
+    }
+    return {};
+}
+
+void SymbolResolver::parseElfSymbols(const std::string& path, const std::string& moduleName,
+                                     uintptr_t baseAddr, bool followDebugLink) {
+    // Actual on-disk size. Every section offset/size taken from the (untrusted)
+    // ELF is bounded against this before any allocation or read, so a hostile
+    // header can't drive a giant allocation or an out-of-file read.
+    std::ifstream f;
+    uint64_t fileSize = 0;
+    if (!openRegularFile(f, path, &fileSize)) return;
+
+    // Read ELF header
+    Elf64_Ehdr ehdr;
+    f.read(reinterpret_cast<char*>(&ehdr), sizeof(ehdr));
+    if (!f) return;
+
+    // Verify ELF magic
+    if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 ||
+        ehdr.e_ident[EI_DATA] != kHostElfData || ehdr.e_ident[EI_VERSION] != EV_CURRENT) return;
+
+    // 32-bit (i386) ELFs go through the parallel Elf32 symbol path; the rest of
+    // this function is Elf64-typed.
+    if (ehdr.e_ident[EI_CLASS] == ELFCLASS32) {
+        parseElf32Symbols(path, moduleName, baseAddr, followDebugLink);
+        return;
+    }
+    if (ehdr.e_ident[EI_CLASS] != ELFCLASS64 || ehdr.e_version != EV_CURRENT ||
+        ehdr.e_ehsize != sizeof(Elf64_Ehdr) || ehdr.e_shentsize != sizeof(Elf64_Shdr)) return;
+
+    // Read section headers
+    if (ehdr.e_shoff == 0 || ehdr.e_shnum == 0) return;
+
+    if (ehdr.e_shoff > fileSize || ehdr.e_shnum > (fileSize - ehdr.e_shoff) / sizeof(Elf64_Shdr)) return;
+    std::vector<Elf64_Shdr> shdrs(ehdr.e_shnum);
+    f.clear();  // reset any prior failbit so this section read is independent
+    f.seekg(ehdr.e_shoff);
+    f.read(reinterpret_cast<char*>(shdrs.data()), ehdr.e_shnum * sizeof(Elf64_Shdr));
+    if (!f) return;
+
+    // Determine if this is a position-independent executable (PIE/shared lib)
+    // If ET_DYN, symbol addresses are relative to base and we need to add baseAddr
+    // If ET_EXEC, symbol addresses are absolute
+    bool isPIE = (ehdr.e_type == ET_DYN);
+    const uintptr_t moduleBase = baseAddr;   // the debug file computes its own bias
+    baseAddr = elfLoadBias<Elf64_Ehdr, Elf64_Phdr>(f, ehdr, fileSize, moduleBase);
+    // Names this file gave only a hidden symbol version so far: a default
+    // version of the same name later in the table replaces it.
+    std::set<std::string> hiddenNames;
+
+    // Find symbol tables (.dynsym and .symtab) and their string tables
+    auto processSymtab = [&](const Elf64_Shdr& symShdr, const Elf64_Shdr& strShdr, size_t tableIndex) {
+        // The symbol read below sizes its buffer from sh_entsize but must read
+        // exactly that many bytes per entry; only sizeof(Elf64_Sym) entries are
+        // safe. (A larger sh_entsize would otherwise read more bytes than the
+        // buffer holds — a heap overflow.) Real ELFCLASS64 symtabs use 24.
+        if (symShdr.sh_entsize != sizeof(Elf64_Sym)) return;
+
+        // Bound each section's [offset, offset+size) against the actual file
+        // size. Written so neither term can wrap a 64-bit add past UINT64_MAX.
+        if (strShdr.sh_offset > fileSize || strShdr.sh_size > fileSize - strShdr.sh_offset) return;
+        if (symShdr.sh_offset > fileSize || symShdr.sh_size > fileSize - symShdr.sh_offset) return;
+
+        // Read string table
+        std::vector<char> strtab(strShdr.sh_size);
+        f.clear();  // reset any prior failbit so this section read is independent
+        f.seekg(strShdr.sh_offset);
+        f.read(strtab.data(), strShdr.sh_size);
+        if (!f) return;
+        // Read symbol entries — exactly numSyms * sizeof(Elf64_Sym) bytes, never
+        // sh_size, so the destination buffer and the read length always match.
+        size_t numSyms = symShdr.sh_size / sizeof(Elf64_Sym);
+        if (numSyms > kMaxSymbolsPerTable) return;
+        std::vector<Elf64_Sym> syms(numSyms);
+        f.clear();  // reset any prior failbit so this section read is independent
+        f.seekg(symShdr.sh_offset);
+        f.read(reinterpret_cast<char*>(syms.data()), numSyms * sizeof(Elf64_Sym));
+        if (!f) return;
+        const auto versions = symShdr.sh_type == SHT_DYNSYM
+            ? readVersionTable(f, shdrs, tableIndex, fileSize, numSyms) : std::vector<uint16_t>{};
+
+        for (size_t symIndex = 0; symIndex < syms.size(); ++symIndex) {
+            const auto& sym = syms[symIndex];
+            // Skip undefined, no-name, and non-function/object symbols
+            if (sym.st_name == 0) continue;
+            if (sym.st_shndx == SHN_UNDEF) continue;
+            if (!terminated(strtab, sym.st_name)) continue;
+
+            uint8_t type = ELF64_ST_TYPE(sym.st_info);
+            if (type != STT_FUNC && type != STT_OBJECT && type != STT_NOTYPE) continue;
+
+            const char* name = strtab.data() + sym.st_name;
+            if (name[0] == '\0') continue;
+
+            uintptr_t addr = sym.st_value;
+            if (isPIE && sym.st_shndx != SHN_ABS) {
+                if (addr > UINTPTR_MAX - baseAddr) continue;
+                addr += baseAddr;
+            }
+
+            Symbol s;
+            // Demangle Itanium C++ names ("_Z...") for readability, like CE shows
+            // "Foo::bar()" rather than "_ZN3Foo3barEv". Keep the raw name on failure.
+            s.name = demangleSymbol(name);
+            s.address = addr;
+            s.size = sym.st_size;
+            s.module = moduleName;
+
+            size_t idx = symbols_.size();
+            if (s.name != name) mangledIndex_.emplace(name, idx);
+            symbols_.push_back(std::move(s));
+            // SHN_ABS values are constants, not addresses (the GLIBC_2.x version
+            // nodes are absolute 0): findable by name, but never a label for a value.
+            if (sym.st_shndx != SHN_ABS) addrIndex_[addr] = idx;
+            const bool hidden = symIndex < versions.size() && (versions[symIndex] & 0x8000);
+            if (auto known = nameIndex_.find(name); known == nameIndex_.end()) {
+                nameIndex_[std::string(name)] = addr;
+                if (hidden) hiddenNames.insert(name);
+            } else if (!hidden && hiddenNames.erase(name)) {
+                known->second = addr;
+            }
+        }
+    };
+
+    // One .symtab and one .dynsym, as the ELF spec allows: many section
+    // headers can name overlapping data, and reading each would multiply the
+    // symbols without limit.
+    bool hasSymtab = false, hasDynsym = false;
+    for (size_t i = 0; i < shdrs.size(); ++i) {
+        const auto type = shdrs[i].sh_type;
+        if ((type != SHT_DYNSYM && type != SHT_SYMTAB) || shdrs[i].sh_link >= shdrs.size()) continue;
+        bool& done = type == SHT_SYMTAB ? hasSymtab : hasDynsym;
+        if (done) continue;
+        done = true;
+        processSymtab(shdrs[i], shdrs[shdrs[i].sh_link], i);
+    }
+
+    // Stripped binary (only .dynsym): pull the full symbols from its separate
+    // debug file (build-id / .gnu_debuglink), as CE-on-Linux and gdb do. Most
+    // system libraries and release game binaries keep symbols in /usr/lib/debug.
+    if (!hasSymtab && followDebugLink) {
+        std::string dbg = findSeparateDebugFile(shdrs, ehdr, f, fileSize, path);
+        if (!dbg.empty() && dbg != path)
+            parseElfSymbols(dbg, moduleName, moduleBase, /*followDebugLink=*/false);
+    }
+
+    // Second pass: PLT/GOT relocations (.rela.plt / .rela.dyn) name the import
+    // slots. Each RELA r_offset is a GOT slot; ELF64_R_SYM(r_info) indexes the
+    // linked symtab. Naming the slot "<func>@got" lets a PLT stub's "jmp [got]"
+    // resolve to the imported function instead of "_GLOBAL_OFFSET_TABLE_+off".
+    // GOT slot file-vaddr -> imported function name, built by the reloc pass and
+    // consumed by the PLT pass to name stubs. Keyed by the unrelocated r_offset.
+    std::map<uintptr_t, std::string> gotSlotName;
+    auto processRelocations = [&](const Elf64_Shdr& relShdr) {
+        if (relShdr.sh_entsize != sizeof(Elf64_Rela)) return;
+        if (relShdr.sh_link >= shdrs.size()) return;
+        const Elf64_Shdr& symShdr = shdrs[relShdr.sh_link];
+        if (symShdr.sh_entsize != sizeof(Elf64_Sym) || symShdr.sh_link >= shdrs.size()) return;
+        const Elf64_Shdr& strShdr = shdrs[symShdr.sh_link];
+
+        // Bound every section against the real file size (untrusted headers).
+        if (relShdr.sh_offset > fileSize || relShdr.sh_size > fileSize - relShdr.sh_offset) return;
+        if (symShdr.sh_offset > fileSize || symShdr.sh_size > fileSize - symShdr.sh_offset) return;
+        if (strShdr.sh_offset > fileSize || strShdr.sh_size > fileSize - strShdr.sh_offset) return;
+
+        std::vector<char> strtab(strShdr.sh_size);
+        f.clear();  // reset any prior failbit so this section read is independent
+        f.seekg(strShdr.sh_offset);
+        f.read(strtab.data(), strShdr.sh_size);
+        if (!f) return;
+
+        size_t numSyms = symShdr.sh_size / sizeof(Elf64_Sym);
+        if (numSyms > kMaxSymbolsPerTable) return;
+        std::vector<Elf64_Sym> syms(numSyms);
+        f.clear();  // reset any prior failbit so this section read is independent
+        f.seekg(symShdr.sh_offset);
+        f.read(reinterpret_cast<char*>(syms.data()), numSyms * sizeof(Elf64_Sym));
+        if (!f) return;
+
+        size_t numRel = relShdr.sh_size / sizeof(Elf64_Rela);
+        std::vector<Elf64_Rela> rels(numRel);
+        f.clear();  // reset any prior failbit so this section read is independent
+        f.seekg(relShdr.sh_offset);
+        f.read(reinterpret_cast<char*>(rels.data()), numRel * sizeof(Elf64_Rela));
+        if (!f) return;
+
+        for (auto& rel : rels) {
+            uint32_t symIdx = ELF64_R_SYM(rel.r_info);
+            if (symIdx == 0 || symIdx >= numSyms) continue;
+            const Elf64_Sym& sym = syms[symIdx];
+            if (sym.st_name == 0 || !terminated(strtab, sym.st_name)) continue;
+            const char* name = strtab.data() + sym.st_name;
+            if (name[0] == '\0') continue;
+
+            std::string base = demangleSymbol(name);
+            gotSlotName[rel.r_offset] = base;   // for PLT-stub matching (file vaddr key)
+
+            uintptr_t slot = rel.r_offset;
+            if (isPIE) {
+                if (slot > UINTPTR_MAX - baseAddr) continue;
+                slot += baseAddr;
+            }
+            if (addrIndex_.count(slot)) continue;   // don't shadow a real symbol
+
+            Symbol s;
+            s.name = base + "@got";
+            s.address = slot;
+            s.size = sizeof(uintptr_t);   // a GOT slot is one pointer wide
+            s.module = moduleName;
+            size_t idx = symbols_.size();
+            if (!nameIndex_.count(s.name)) nameIndex_[s.name] = slot;  // navigable by name
+            symbols_.push_back(std::move(s));
+            addrIndex_[slot] = idx;
+        }
+    };
+
+    std::set<std::pair<uint64_t, uint64_t>> seenRelocations;
+    int relocationSections = 0;
+    for (size_t i = 0; i < shdrs.size() && relocationSections < kMaxRelocationSections; ++i) {
+        if (shdrs[i].sh_type == SHT_RELA && seenRelocations.insert({shdrs[i].sh_offset, shdrs[i].sh_size}).second) {
+            ++relocationSections;
+            processRelocations(shdrs[i]);
+        }
+    }
+
+    // Third pass: name PLT stubs "<func>@plt" so `call <stub>` resolves to the
+    // imported function (CE shows "call printf"). Each stub holds an indirect jmp
+    // (ff 25 disp32) to a GOT slot we just named; match by that target. The stub's
+    // entry start (= the call target) is sh_entsize-aligned within the PLT section.
+    if (ehdr.e_shstrndx < shdrs.size() && !gotSlotName.empty()) {
+        const Elf64_Shdr& shstr = shdrs[ehdr.e_shstrndx];
+        if (shstr.sh_offset <= fileSize && shstr.sh_size <= fileSize - shstr.sh_offset) {
+            std::vector<char> secNames(shstr.sh_size);
+            f.clear();  // reset any prior failbit so this section read is independent
+            f.seekg(shstr.sh_offset);
+            f.read(secNames.data(), shstr.sh_size);
+            if (f && !secNames.empty()) {
+                int pltSections = 0;
+                for (const auto& sh : shdrs) {
+                    if (sh.sh_type != SHT_PROGBITS || !terminated(secNames, sh.sh_name)) continue;
+                    std::string sname = secNames.data() + sh.sh_name;
+                    if (sname.rfind(".plt", 0) != 0) continue;   // .plt / .plt.sec / .plt.got
+                    if (sh.sh_offset > fileSize || sh.sh_size > fileSize - sh.sh_offset) continue;
+                    if (++pltSections > kMaxPltSections) break;
+                    size_t entsz = sh.sh_entsize >= 8 ? sh.sh_entsize : 16;
+
+                    std::vector<uint8_t> code(sh.sh_size);
+                    f.clear();  // reset any prior failbit so this section read is independent
+                    f.seekg(sh.sh_offset);
+                    f.read(reinterpret_cast<char*>(code.data()), sh.sh_size);
+                    if (!f) continue;
+
+                    for (size_t off = 0; off + entsz <= code.size(); off += entsz) {
+                        for (size_t j = 0; j + 6 <= entsz; ++j) {   // find the indirect jmp
+                            if (code[off + j] != 0xff || code[off + j + 1] != 0x25) continue;
+                            int32_t disp;
+                            std::memcpy(&disp, &code[off + j + 2], 4);
+                            if (off > UINTPTR_MAX - sh.sh_addr || j + 6 > UINTPTR_MAX - (sh.sh_addr + off)) continue;
+                            uintptr_t next = sh.sh_addr + off + j + 6;
+                            int64_t displacement = disp;
+                            if ((displacement < 0 && static_cast<uintptr_t>(-displacement) > next) ||
+                                (displacement >= 0 && static_cast<uintptr_t>(displacement) > UINTPTR_MAX - next)) continue;
+                            uintptr_t target = next + displacement;
+                            auto it = gotSlotName.find(target);
+                            if (it != gotSlotName.end()) {
+                                uintptr_t stub = sh.sh_addr + off;                  // entry start
+                                if (isPIE) {
+                                    if (stub > UINTPTR_MAX - baseAddr) continue;
+                                    stub += baseAddr;
+                                }
+                                if (!addrIndex_.count(stub)) {
+                                    Symbol s;
+                                    s.name = it->second + "@plt";
+                                    s.address = stub;
+                                    s.size = entsz;
+                                    s.module = moduleName;
+                                    size_t idx = symbols_.size();
+                                    if (!nameIndex_.count(s.name)) nameIndex_[s.name] = stub;
+                                    symbols_.push_back(std::move(s));
+                                    addrIndex_[stub] = idx;
+                                }
+                            }
+                            break;   // one jmp per entry
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+void SymbolResolver::parseElf32Symbols(const std::string& path, const std::string& moduleName,
+                                       uintptr_t baseAddr, bool followDebugLink) {
+    std::ifstream f;
+    uint64_t fileSize = 0;
+    if (!openRegularFile(f, path, &fileSize)) return;
+
+    Elf32_Ehdr ehdr;
+    f.read(reinterpret_cast<char*>(&ehdr), sizeof(ehdr));
+    if (!f) return;
+    if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 ||
+        ehdr.e_ident[EI_DATA] != kHostElfData || ehdr.e_ident[EI_VERSION] != EV_CURRENT) return;
+    if (ehdr.e_ident[EI_CLASS] != ELFCLASS32 || ehdr.e_version != EV_CURRENT ||
+        ehdr.e_ehsize != sizeof(Elf32_Ehdr) || ehdr.e_shentsize != sizeof(Elf32_Shdr)) return;
+    if (ehdr.e_shoff == 0 || ehdr.e_shnum == 0) return;
+
+    if (ehdr.e_shoff > fileSize || ehdr.e_shnum > (fileSize - ehdr.e_shoff) / sizeof(Elf32_Shdr)) return;
+    std::vector<Elf32_Shdr> shdrs(ehdr.e_shnum);
+    f.clear();
+    f.seekg(ehdr.e_shoff);
+    f.read(reinterpret_cast<char*>(shdrs.data()), ehdr.e_shnum * sizeof(Elf32_Shdr));
+    if (!f) return;
+
+    const bool isPIE = (ehdr.e_type == ET_DYN);
+    const uintptr_t moduleBase = baseAddr;
+    baseAddr = elfLoadBias<Elf32_Ehdr, Elf32_Phdr>(f, ehdr, fileSize, moduleBase);
+    std::set<std::string> hiddenNames;
+
+    // Mirror the Elf64 processSymtab, with 16-byte Elf32_Sym entries. Every
+    // section [offset, offset+size) is bounded against the real file size first.
+    auto processSymtab = [&](const Elf32_Shdr& symShdr, const Elf32_Shdr& strShdr, size_t tableIndex) {
+        if (symShdr.sh_entsize != sizeof(Elf32_Sym)) return;
+        if (strShdr.sh_offset > fileSize || strShdr.sh_size > fileSize - strShdr.sh_offset) return;
+        if (symShdr.sh_offset > fileSize || symShdr.sh_size > fileSize - symShdr.sh_offset) return;
+
+        std::vector<char> strtab(strShdr.sh_size);
+        f.clear();
+        f.seekg(strShdr.sh_offset);
+        f.read(strtab.data(), strShdr.sh_size);
+        if (!f) return;
+
+        size_t numSyms = symShdr.sh_size / sizeof(Elf32_Sym);
+        if (numSyms > kMaxSymbolsPerTable) return;
+        std::vector<Elf32_Sym> syms(numSyms);
+        f.clear();
+        f.seekg(symShdr.sh_offset);
+        f.read(reinterpret_cast<char*>(syms.data()), numSyms * sizeof(Elf32_Sym));
+        if (!f) return;
+        const auto versions = symShdr.sh_type == SHT_DYNSYM
+            ? readVersionTable(f, shdrs, tableIndex, fileSize, numSyms) : std::vector<uint16_t>{};
+
+        for (size_t symIndex = 0; symIndex < syms.size(); ++symIndex) {
+            const auto& sym = syms[symIndex];
+            if (sym.st_name == 0 || sym.st_shndx == SHN_UNDEF) continue;
+            if (!terminated(strtab, sym.st_name)) continue;
+
+            uint8_t type = ELF32_ST_TYPE(sym.st_info);
+            if (type != STT_FUNC && type != STT_OBJECT && type != STT_NOTYPE) continue;
+
+            const char* name = strtab.data() + sym.st_name;
+            if (name[0] == '\0') continue;
+
+            uintptr_t addr = sym.st_value;
+            if (isPIE && sym.st_shndx != SHN_ABS) {
+                if (addr > UINTPTR_MAX - baseAddr) continue;
+                addr += baseAddr;
+            }
+
+            Symbol s;
+            s.name = demangleSymbol(name);
+            s.address = addr;
+            s.size = sym.st_size;
+            s.module = moduleName;
+
+            size_t idx = symbols_.size();
+            if (s.name != name) mangledIndex_.emplace(name, idx);
+            symbols_.push_back(std::move(s));
+            // SHN_ABS values are constants, not addresses (the GLIBC_2.x version
+            // nodes are absolute 0): findable by name, but never a label for a value.
+            if (sym.st_shndx != SHN_ABS) addrIndex_[addr] = idx;
+            const bool hidden = symIndex < versions.size() && (versions[symIndex] & 0x8000);
+            if (auto known = nameIndex_.find(name); known == nameIndex_.end()) {
+                nameIndex_[std::string(name)] = addr;
+                if (hidden) hiddenNames.insert(name);
+            } else if (!hidden && hiddenNames.erase(name)) {
+                known->second = addr;
+            }
+        }
+    };
+
+    // One .symtab and one .dynsym, as the ELF spec allows: many section
+    // headers can name overlapping data, and reading each would multiply the
+    // symbols without limit.
+    bool hasSymtab = false, hasDynsym = false;
+    for (size_t i = 0; i < shdrs.size(); ++i) {
+        const auto type = shdrs[i].sh_type;
+        if ((type != SHT_DYNSYM && type != SHT_SYMTAB) || shdrs[i].sh_link >= shdrs.size()) continue;
+        bool& done = type == SHT_SYMTAB ? hasSymtab : hasDynsym;
+        if (done) continue;
+        done = true;
+        processSymtab(shdrs[i], shdrs[shdrs[i].sh_link], i);
+    }
+    if (!hasSymtab && followDebugLink) {
+        auto debug = findSeparateDebugFile(shdrs, ehdr, f, fileSize, path);
+        if (!debug.empty() && debug != path)
+            parseElf32Symbols(debug, moduleName, moduleBase, false);
+    }
+}
+
+void SymbolResolver::addUserSymbol(uintptr_t address, const std::string& name) {
+    removeUserSymbol(address);
+    if (name.empty()) return;
+    userSymbols_[address] = name;
+    userNameIndex_[name] = address;
+}
+
+void SymbolResolver::removeUserSymbol(uintptr_t address) {
+    auto it = userSymbols_.find(address);
+    if (it != userSymbols_.end()) {
+        std::string name = it->second;
+        userSymbols_.erase(it);
+        auto index = userNameIndex_.find(name);
+        if (index != userNameIndex_.end() && index->second == address) {
+            userNameIndex_.erase(index);
+            for (const auto& [otherAddress, otherName] : userSymbols_)
+                if (otherName == name) userNameIndex_[name] = otherAddress;
+        }
+    }
+}
+
+std::string SymbolResolver::resolve(uintptr_t address) const {
+    // User-defined labels take priority over module symbols at the same
+    // distance; a module symbol nearer the address (a function starting after
+    // the label) names it better.
+    std::string userName;
+    uintptr_t userOffset = UINTPTR_MAX;
+    if (!userSymbols_.empty()) {
+        auto it = userSymbols_.upper_bound(address);
+        if (it != userSymbols_.begin()) {
+            --it;
+            uintptr_t off = address - it->first;
+            if (off == 0) return it->second;
+            if (off <= 0x1000) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "+0x%lx", off);
+                userName = it->second + buf;
+                userOffset = off;
+            }
+        }
+    }
+    if (addrIndex_.empty()) return userName;
+
+    // Find the symbol at or before this address
+    auto it = addrIndex_.upper_bound(address);
+    if (it == addrIndex_.begin()) return userName;
+    --it;
+
+    auto& sym = symbols_[it->second];
+
+    // Check if address is within the symbol's range (or within a reasonable
+    // distance). Past the symbol's known extent, only attribute the address to it
+    // within a 4KB grace window (likely still in the same function). Size-0
+    // symbols (hand-written asm, many NOTYPE entries) have unknown extent, so the
+    // grace window is measured from the symbol start — otherwise one size-0 symbol
+    // would claim every address after it, up to megabytes away.
+    uintptr_t offset = address - sym.address;
+    uintptr_t extent = sym.size > 0 ? sym.size : 0;
+    if (offset >= extent && offset > 0x1000) return userName;
+    if (offset >= userOffset) return userName;
+
+    if (offset == 0)
+        return sym.module + "!" + sym.name;
+    else {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "+0x%lx", offset);
+        return sym.module + "!" + sym.name + buf;
+    }
+}
+
+uintptr_t SymbolResolver::lookup(const std::string& name) const {
+    auto user = userNameIndex_.find(name);
+    if (user != userNameIndex_.end()) return user->second;
+    auto it = nameIndex_.find(name);
+    return it != nameIndex_.end() ? it->second : 0;
+}
+
+} // namespace ce

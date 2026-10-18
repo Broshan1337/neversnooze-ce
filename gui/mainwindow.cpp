@@ -1,0 +1,7320 @@
+#include <bit>
+#include "core/target_capabilities.hpp"
+#include "arch/target_arch.hpp"
+#include <csignal>
+#include "gui/mainwindow.hpp"
+#include "gui/code_editor.hpp"
+#include "core/local_target.hpp"
+#include "gui/gdbconnectiondialog.hpp"
+#include "gui/theme.hpp"
+#include "core/expression.hpp"
+#include "core/value_io.hpp"
+#include "core/memview_nav.hpp"
+#include "gui/processlistdialog.hpp"
+#include "gui/registereditor.hpp"
+#include "gui/debuggerwindow.hpp"
+#include "gui/memorybrowser.hpp"
+#include "gui/advancedoptions.hpp"
+#include "gui/changeaddressdialog.hpp"
+#include "gui/graphicalmemoryview.hpp"
+#include "scanner/pointer_scanner.hpp"
+#include "gui/scripteditor.hpp"
+#include "gui/pointerscan_dialog.hpp"
+#include "gui/guest_scan_dialog.hpp"
+#include "gui/structuredissector.hpp"
+#include "gui/monodissector.hpp"
+#include "gui/luaconsole.hpp"
+#include "gui/breakpointlist.hpp"
+#include "gui/codefinder.hpp"
+#include "debug/instruction_access.hpp"
+#include "gui/codereferences.hpp"
+#include "gui/heapregions.hpp"
+#include "gui/memoryregions.hpp"
+#include "gui/modulelist.hpp"
+#include "gui/overlay.hpp"
+#include "gui/stackview.hpp"
+#include "gui/threadlist.hpp"
+#include "gui/settingsdialog.hpp"
+#include "gui/tracerwindow.hpp"
+#include "gui/filepatcher.hpp"
+#include "gui/branchmapper.hpp"
+#include "gui/elfinspector.hpp"
+#include "gui/formdesigner.hpp"
+#include "gui/findstaticswindow.hpp"
+#include "platform/linux/ceserver_process.hpp"
+#include "platform/linux/ceserver_debugger.hpp"
+#include "scripting/lua_gui.hpp"
+#include "core/ct_file.hpp"
+#include "core/ct_file_stream.hpp"
+#include <QSaveFile>
+#include <streambuf>
+#include <sstream>
+#include <limits>
+#include <unordered_set>
+#include <stdexcept>
+#include "core/target_profile.hpp"
+#include "core/trainer.hpp"
+#include "analysis/managed_runtime.hpp"
+#include "analysis/mono_dissector.hpp"
+#include <QRegularExpression>
+#include <dlfcn.h>
+
+#include <QMenuBar>
+#include <QApplication>
+#include <QScopedValueRollback>
+#include "gui/autoasmoperation.hpp"
+#include <QEventLoop>
+#include <QScrollArea>
+#include <QFontMetrics>
+#include <thread>
+#include <sys/utsname.h>
+#include <atomic>
+#include <QCoreApplication>
+#include <QTextBrowser>
+#include <QDesktopServices>
+#include <QUrl>
+#include <fstream>
+#include "platform/linux/injector.hpp"
+#include <QClipboard>
+#include <QPixmap>
+#include <QPainter>
+#include <QVBoxLayout>
+#include <QHBoxLayout>
+#include <QGridLayout>
+#include <QHeaderView>
+#include <QMessageBox>
+#include <QTabWidget>
+#include <QColorDialog>
+#include <QListWidget>
+#include <sys/prctl.h>
+#include <sys/wait.h>
+#include <QSignalBlocker>
+#include <QFile>
+#include <QProgressDialog>
+#include <QFileInfo>
+#include <QProcess>
+#include <QDockWidget>
+
+#include "gui/agent_panel.hpp"
+#include <QStandardPaths>
+#include <QDir>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QScreen>
+#include <QGuiApplication>
+#include <QLabel>
+#include <QKeySequenceEdit>
+#include <QPushButton>
+#include <QTimer>
+#include <QFileInfo>
+#include <cerrno>
+#include <QBrush>
+#include <QFont>
+#include <QMenu>
+#include <QShortcut>
+#include <QInputDialog>
+#include <QSettings>
+#include <QFormLayout>
+#include <QStatusBar>
+#include <QColor>
+#include <QDoubleValidator>
+#include <QIntValidator>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <QFileDialog>
+#include <QTextStream>
+#include <QLocale>
+#include <cstdio>
+#include <cstring>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonArray>
+#include <QStringList>
+#include <QMimeData>
+#include <QDataStream>
+#include <QMap>
+#include <cmath>
+#include <charconv>
+#include <cstring>
+#include <exception>
+
+namespace ce::gui {
+
+// The address list's value refresh (and target-exit check). Not the Memory
+// Viewer's "memview/refreshMs" setting: saving Settings stored that key's
+// 2000 ms default and slowed this list and exit detection fourfold.
+constexpr int kValueRefreshMs = 500;
+// Load rows as the user scrolls, keeping large first scans responsive.
+static constexpr int kResultBatchSize = 1000;
+
+static QString foundLabelText(size_t count) {
+    return QString("Found: %1").arg(QLocale().toString((qulonglong)count));
+}
+
+// Settings > Display "Uppercase hexadecimal" and "Address width", read like
+// the Memory Viewer reads them, for the address list and the scan results.
+struct AddressDisplay { bool upper = false; int digits = 16; };
+static AddressDisplay loadAddressDisplay() {
+    QSettings s;
+    return {s.value("display/hexUpper", false).toBool(), s.value("display/addressWidth", 1).toInt() == 0 ? 8 : 16};
+}
+static AddressDisplay& addressDisplay() {
+    static AddressDisplay display = loadAddressDisplay();
+    return display;
+}
+static QString formatListAddress(uintptr_t address) {
+    const auto& display = addressDisplay();
+    const QString digits = QString("%1").arg(address, display.digits, 16, QChar('0'));
+    return "0x" + (display.upper ? digits.toUpper() : digits);
+}
+
+// Accepts "," or "." decimals (Turkish comma-locale); defined lower down.
+static double parseUserDouble(const QString& s, bool* ok = nullptr);
+// Hex-aware integer field parse (shared ce::parseIntegerScalar); defined lower down.
+static long long parseIntField(const QString& valStr, bool hex);
+static std::optional<long long> scanIntegerInput(const QString& text, bool hex, bool pointer = false);
+static bool scanTakesValue(ScanCompare compare);
+static void warnBadScanValue(QWidget* parent, const QString& text);
+
+// Forward declarations of static helpers
+static QJsonArray cheatEntriesToJson(const ce::CheatTable& table);
+static QFont settingsMonospaceFont();
+static ScanCompare mapScanType(int index);
+static ValueType mapValueType(int index);
+static void warnIfMemoryUnreadable(QWidget* parent, ce::ProcessHandle* p,
+                                   pid_t pid, const QString& name);
+
+// ═══════════════════════════════════════════════════════════════
+// MainWindow
+// ═══════════════════════════════════════════════════════════════
+
+MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
+    scannerThreads_ = QSettings().value("scan/threads", 0).toInt();
+    scanner_ = std::make_unique<MemoryScanner>(scannerThreads_);
+    setupUi();
+    setupMenus();
+    updateScanButtons();
+    setWindowTitle("Neversnooze CE");
+    {
+        // The default size grows with the text size, within the screen.
+        const double textScale = std::max(1.0, fontMetrics().height() / 17.0);
+        QSize size(int(960 * textScale), int(760 * textScale));
+        if (auto* screen = QGuiApplication::primaryScreen())
+            size = size.boundedTo(screen->availableGeometry().size() * 0.92);
+        resize(size);
+    }
+    // Restore the last window size/position and splitter layout (no-ops on the
+    // first run, leaving the defaults above). Saved back in closeEvent().
+    {
+        QSettings s;
+        if (auto g = s.value("mainwindow/geometry").toByteArray(); !g.isEmpty())
+            restoreGeometry(g);
+        for (auto* sp : findChildren<QSplitter*>())
+            if (!sp->objectName().isEmpty())
+                if (auto st = s.value("mainwindow/splitter/" + sp->objectName()).toByteArray();
+                    !st.isEmpty())
+                    sp->restoreState(st);
+    }
+
+    // Drive CE Lua timers (createTimer/timer_onTimer): trainer scripts rely on a
+    // periodic pump on the Lua thread. 30ms matches CE's default timer resolution.
+    auto* luaTimerPump = new QTimer(this);
+    connect(luaTimerPump, &QTimer::timeout, this, [this]() { luaEngine_.pumpTimers(); });
+    luaTimerPump->start(30);
+
+    // selectFilePath(sender, setting) in a table's Lua opens a real file chooser.
+    luaEngine_.setFilePicker([this](const std::string& setting) -> std::string {
+        QString title = setting.empty() ? QString("Select file")
+                                        : QString("Select file for %1").arg(QString::fromStdString(setting));
+        return QFileDialog::getOpenFileName(this, title).toStdString();
+    });
+
+    // Lua-evaluated AA blocks: {$lua}return "..."{$asm} substitutes the result
+    // into the AA stream at preprocess time.
+    autoAsm_.setLuaEvaluator([this](const std::string& code) {
+        return luaEngine_.evalToString(code);
+    });
+
+    // Refresh address list values periodically (skip if user is editing)
+    valueRefreshTimer_ = new QTimer(this);
+    auto* timer = valueRefreshTimer_;
+    connect(timer, &QTimer::timeout, this, [this]() {
+        if (!process_) return;
+        // Releasing a dead target deletes its windows. A modal dialog or menu
+        // open in one of them is a nested event loop on its stack (often a
+        // stack object parented to the window), so deleting under it crashes:
+        // wait until it closes, this timer comes back.
+        const bool nestedLoop = QApplication::activeModalWidget() || QApplication::activePopupWidget();
+        if (dynamic_cast<ce::GdbProcessHandle*>(process_.get()) && !process_->targetDescription().live) {
+            if (nestedLoop) return;
+            onDisconnectProcess();
+            processLabel_->setText("GDB target disconnected or exited");
+            processDetail_->clear();
+            statusBar()->showMessage("GDB target disconnected or exited",5000);
+            return;
+        }
+        // A ceserver connection closes on any error or timeout and never comes
+        // back: say so, instead of showing "??" values against a dead link.
+        // Ask the client directly: targetDescription() is a network round trip
+        // on the GUI thread for every tick.
+        if (ceserverClient_ && !ceserverClient_->isConnected()) {
+            if (nestedLoop) return;
+            onDisconnectProcess();
+            processLabel_->setText("ceserver connection lost");
+            processDetail_->setText(tr("Connect again with File > Connect to ceserver."));
+            statusBar()->showMessage("ceserver connection lost",5000);
+            return;
+        }
+        // Detect target death: once the pid is gone, stop polling and clear state
+        // so the UI doesn't keep showing stale values against a dead process.
+        // A process we started (Create Process) stays a zombie until reaped, and
+        // kill(pid, 0) still succeeds on a zombie. waitid with WNOWAIT only looks
+        // at exits, so it never takes a ptrace stop from the debugger's thread.
+        siginfo_t exitInfo{};
+        const bool exitedChild = !ceserverClient_ && currentPid_ > 0 &&
+            ::waitid(P_PID, static_cast<id_t>(currentPid_), &exitInfo, WEXITED | WNOHANG | WNOWAIT) == 0 &&
+            exitInfo.si_pid == currentPid_;
+        if (exitedChild || (!ceserverClient_ && currentPid_ > 0 && ::kill(currentPid_, 0) != 0 && errno == ESRCH)) {
+            if (nestedLoop) return;
+            processLabel_->setText(QString("Process %1 has exited").arg(currentPid_));
+            processDetail_->setText(tr("Open another process with Ctrl+O."));
+            statusBar()->showMessage("Target process exited", 5000);
+            if (!releaseTargetUsers()) return;
+            if (exitedChild) (void)::waitpid(currentPid_, nullptr, WNOHANG);   // reap it now that nothing traces it
+            process_.reset();
+            currentPid_ = 0;
+            updateWindowTitle();
+            addressListModel_->setProcess(nullptr);
+            resultsModel_->setProcess(nullptr);
+            updateScanButtons();
+            return;
+        }
+        // Skip the refresh only while a cell editor is open: the item delegate
+        // editor is a separate widget parented under the view's viewport, so the
+        // old indexWidget() guard never fired. Plain view focus (the user just
+        // watching live values) is NOT editing, so check for a focused
+        // descendant editor rather than mere focus on the view itself.
+        QWidget* fw = QApplication::focusWidget();
+        bool editing = fw && fw != addressListView_ &&
+                       fw != addressListView_->viewport() &&
+                       addressListView_->isAncestorOf(fw);
+        if (!editing)
+            addressListModel_->updateValues(process_.get());
+
+        // Refresh the module cache (module+offset address display) on a slower
+        // cadence than the value poll, so modules mapped after attach show up
+        // without re-parsing /proc/pid/maps every tick.
+        if (++moduleCacheTick_ >= 10) {
+            moduleCacheTick_ = 0;
+            addressListModel_->refreshModuleCache();
+        }
+
+        // Live-refresh the scan-results list too, but only the rows currently
+        // visible (result sets can be millions of rows).
+        if (resultsModel_ && resultsView_ && resultsModel_->rowCount() > 0) {
+            QModelIndex topIdx = resultsView_->indexAt(QPoint(2, 2));
+            QModelIndex botIdx = resultsView_->indexAt(
+                QPoint(2, resultsView_->viewport()->height() - 2));
+            int first = topIdx.isValid() ? topIdx.row() : 0;
+            int last  = botIdx.isValid() ? botIdx.row()
+                                         : std::min(resultsModel_->rowCount() - 1, first + 100);
+            resultsModel_->refreshRange(first, last);
+        }
+    });
+    timer->start(kValueRefreshMs);
+
+    // Freeze timer — writes frozen values at 100ms intervals
+    auto* freezeTimer = new QTimer(this);
+    connect(freezeTimer, &QTimer::timeout, this, &MainWindow::onFreezeTimer);
+    freezeTimer->start(100);
+
+    // F5 forces an immediate value refresh (CE-style manual refresh).
+    auto* refreshSc = new QShortcut(QKeySequence(Qt::Key_F5), this);
+    connect(refreshSc, &QShortcut::activated, this, [this]() {
+        if (!process_) return;
+        addressListModel_->updateValues(process_.get());
+        if (resultsModel_ && resultsView_ && resultsModel_->rowCount() > 0) {
+            QModelIndex topIdx = resultsView_->indexAt(QPoint(2, 2));
+            QModelIndex botIdx = resultsView_->indexAt(
+                QPoint(2, resultsView_->viewport()->height() - 2));
+            int first = topIdx.isValid() ? topIdx.row() : 0;
+            int last  = botIdx.isValid() ? botIdx.row()
+                                         : std::min(resultsModel_->rowCount() - 1, first + 100);
+            resultsModel_->refreshRange(first, last);
+        }
+    });
+}
+
+void MainWindow::setupMenus() {
+    // Menu bar follows Cheat Engine's MainUnit.MainMenu1 (captions, item order,
+    // separators, shortcuts). CE items with no Linux backend are left out instead of
+    // shown disabled, and Windows-only menus (D3D) are dropped. Our tools stay under
+    // Tools, which CE leaves empty in the form and fills at runtime.
+
+    // ── File ──
+    auto* file = menuBar()->addMenu("&File");
+    file->addAction("Clear scan results", this, [this]() {
+        resultsModel_->clear(); lastResult_.reset(); undoResult_.reset(); updateScanButtons();
+    });
+    file->addAction("Open Process...", this, &MainWindow::onOpenProcess, QKeySequence("Ctrl+O"));
+    file->addSeparator();
+    file->addAction("Save", this, &MainWindow::onSaveTable, QKeySequence("Ctrl+S"));
+    file->addAction("Save As...", this, &MainWindow::onSaveTableAs, QKeySequence("Ctrl+Shift+S"));
+    file->addAction("Load...", this, &MainWindow::onLoadTable, QKeySequence("Ctrl+L"));
+    recentMenu_ = file->addMenu("Load Recent"); // populated from QSettings below
+    recentMenu_->setToolTipsVisible(true);      // show the full path on hover
+    rebuildRecentMenu();
+    file->addSeparator();
+    file->addAction("Save scan results...", this, &MainWindow::onSaveScanResults,
+                    QKeySequence("Alt+Shift+S"));
+    file->addSeparator();
+    file->addAction("Generate Trainer Lua Script...", this, &MainWindow::onCreateTrainer);
+    file->addSeparator();
+    file->addAction("Connect to ceserver...", this, &MainWindow::onConnectCeserver);  // Linux extra
+    file->addAction("Connect to GDB / QEMU...", this, &MainWindow::onConnectGdb);
+    file->addAction("Disconnect target", this, &MainWindow::onDisconnectProcess);
+    file->addSeparator();
+    file->addAction("Quit", this, &QWidget::close, QKeySequence("Ctrl+Q"));
+
+    // ── Top-level menus in CE's order (D3D dropped — Windows-only, see below) ──
+    // File · Edit · Process · Table · Tools · .Net · Network · Plugins ·
+    // Languages · Help.
+    auto* edit = menuBar()->addMenu("&Edit");
+    auto* process = menuBar()->addMenu("&Process");
+    auto* table = menuBar()->addMenu("Table");
+    // CE's "D3D" menu (Direct3D overlay/hook) is Windows-only and every item is
+    // permanently disabled on Linux, so it's dropped here rather than shown as a
+    // dead top-level menu. Graphics hooking is out of scope (see docs/DEVELOPMENT).
+    auto* tools = menuBar()->addMenu("&Tools");
+    auto* dotnet = menuBar()->addMenu(".Net");
+    // CE's .Net/Mono menu: dissect a Mono/IL2CPP runtime's classes and fields.
+    dotnet->addAction("Mono dissector...", this, &MainWindow::openMonoDissector);
+    // CE also has Network, Plugins and Languages menus. Their ceserver transfer
+    // options, plugin loader and translations don't exist here, so the menus are
+    // left out rather than shown full of disabled items (same call as D3D above).
+
+    // ── Table (CE: Lua script + forms) ──
+    table->addAction("Show Cheat Table Lua Script", this, &MainWindow::showTableLuaScript,
+                     QKeySequence("Ctrl+Alt+L"));
+    table->addSeparator();
+    table->addAction("Create Form...", this, [this]() {
+        auto* fd = new FormDesigner(this); fd->setAttribute(Qt::WA_DeleteOnClose); fd->show();
+    });
+
+    // (D3D menu intentionally omitted on Linux — see note at the menu creation above.)
+
+
+    // The Memory Viewer is the entry point; the memory/debug windows (Memory
+    // Regions, Heap list, Module list, Referenced strings, Thread list, Stacktrace,
+    // Registers, Breakpoint list, Debugger, Branch mapper, Break-and-trace, …) live
+    // in ITS View/Debug menus — matching CE — populated by populateBrowserMenus().
+    tools->addAction("Memory Viewer...", this, &MainWindow::onMemoryView, QKeySequence("Ctrl+M"));
+    tools->addAction("AI Assistant", this, [this]() { showAgentPanel(); }, QKeySequence("Ctrl+Shift+I"));
+    tools->addSeparator();
+    // Analysis panels (also in the Memory Viewer's Tools menu) — surfaced here so
+    // they're findable from the main window without opening the viewer first.
+    addAnalysisToolsMenu(tools);
+    // Table > Auto Assemble... is the fuller version (it picks up the viewer's
+    // selected instruction), so the Tools copy would only duplicate it.
+    for (QAction* action : tools->actions())
+        if (action->text() == "Auto Assemble...") tools->removeAction(action);
+    tools->addSeparator();
+    // Table-wide edits (the entry context menu keeps to the entry under the cursor).
+    for (auto* button : findChildren<QPushButton*>())
+        if (button->text() == "Add Address")
+            edit->addAction("Add Address...", button, &QPushButton::click);
+    edit->addAction("Add Group", this, [this]() { addressListModel_->addGroup(); });
+    edit->addSeparator();
+    edit->addAction("Enable all entries", this, [this]() { addressListModel_->setAllActive(true); });
+    edit->addAction("Disable all entries", this, [this]() { addressListModel_->setAllActive(false); });
+    edit->addSeparator();
+    edit->addAction("Settings...", this, [this]() { openSettingsDialog(); });
+
+    // ── Process menu ──
+    process->addAction("Open Process...", this, &MainWindow::onOpenProcess);
+    // CE formProcessInfo (Process/System Info) — Linux equivalents.
+    // CE "Create Process" / frmopenfileasprocessdialogunit: launch an executable
+    // and attach. As our own child it is ptrace-accessible under yama scope=1.
+    process->addAction("Create Process...", this, [this]() {
+        auto path = QFileDialog::getOpenFileName(this, "Open file as process", "", "Executables (*)");
+        if (path.isEmpty()) return;
+        std::string p = path.toStdString();
+        pid_t pid = fork();
+        if (pid == 0) {
+            prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+            execl(p.c_str(), p.c_str(), (char*)nullptr);
+            _exit(127);
+        }
+        if (pid < 0) { QMessageBox::warning(this, "Create Process", "fork() failed."); return; }
+        usleep(120000);   // let it map its image
+        // Through attachToPid so the old target's Debugger/views are torn down
+        // before process_ is replaced (they hold a raw handle).
+        attachToPid(pid, QFileInfo(path).fileName());
+    });
+    process->addAction("Process/System Info", this, [this]() {
+        QDialog dialog(this);
+        dialog.setWindowTitle("Process and System Info");
+        auto* layout = new QVBoxLayout(&dialog);
+        // One form for both sections so their label columns line up.
+        auto* form = new QFormLayout;
+        form->setHorizontalSpacing(16);
+        form->setLabelAlignment(Qt::AlignLeft);
+        layout->addLayout(form);
+        auto section = [&](const QString& title) {
+            auto* heading = new QLabel(title);
+            heading->setObjectName("pageTitle");
+            if (form->rowCount() > 0) heading->setContentsMargins(0, 10, 0, 0);
+            form->addRow(heading);
+            return form;
+        };
+        auto value = [](const QString& text) {
+            auto* label = new QLabel(text);
+            label->setTextInteractionFlags(Qt::TextSelectableByMouse);
+            label->setWordWrap(true);
+            return label;
+        };
+        auto* target = section("Process");
+        if (!process_) {
+            target->addRow(value("No process is open. Use File > Open Process."));
+        } else {
+            const auto modules = process_->modules();
+            const auto description = process_->targetDescription();
+            target->addRow("Name:", value(currentProcessName_));
+            target->addRow("PID:", value(QString::number(currentPid_)));
+            target->addRow("Executable:", value(modules.empty() ? QString("(unknown)") : QString::fromStdString(modules.front().path)));
+            if (auto localPid = ce::localTargetPid(process_.get()))
+                target->addRow("Kind:", value(QString::fromStdString(ce::probeTarget(*localPid).summary())));
+            target->addRow("Program:", value(QString("%1, %2-byte pointers, %3")
+                .arg(ce::cpuArchitectureName(description.program.architecture)).arg(description.program.pointerWidth)
+                .arg(ce::byteOrderName(description.program.byteOrder))));
+            target->addRow("Modules:", value(QString::number(modules.size())));
+            target->addRow("Threads:", value(QString::number(process_->threads().size())));
+        }
+        auto* system = section("System");
+        struct utsname uts{};
+        if (::uname(&uts) == 0) system->addRow("Kernel:", value(QString("%1 %2 (%3)").arg(uts.sysname, uts.release, uts.machine)));
+        system->addRow("CPUs:", value(QString::number(std::thread::hardware_concurrency())));
+        QString scope = "not present (Yama disabled)";
+        if (QFile f("/proc/sys/kernel/yama/ptrace_scope"); f.open(QIODevice::ReadOnly)) {
+            const QString level = QString::fromUtf8(f.readAll()).trimmed();
+            static const char* meaning[] = {"any process of the same user", "only child processes",
+                                            "administrators only", "no attaching"};
+            const int n = level.toInt();
+            scope = n >= 0 && n <= 3 ? QString("%1: %2").arg(level, meaning[n]) : level;
+        }
+        system->addRow("ptrace scope:", value(scope));
+        system->addRow("Qt:", value(qVersion()));
+        layout->addStretch();
+        auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close);
+        connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+        layout->addWidget(buttons);
+        dialog.resize(520, dialog.sizeHint().height());
+        dialog.exec();
+    });
+    // "Pause the process" toggle (CE's pause-the-game) — SIGSTOP/SIGCONT the target.
+    auto* pauseAct = process->addAction("Pause the process");
+    pauseAct->setCheckable(true);
+    pauseAction_ = pauseAct;
+    connect(pauseAct, &QAction::toggled, this, [this, pauseAct](bool checked) {
+        auto pid=ce::localTargetPid(process_.get());
+        if (!pid) {
+            pauseAct->setChecked(false);
+            statusBar()->showMessage("Pause requires a live local process target",5000);return;
+        }
+        if (::kill(*pid, checked ? SIGSTOP : SIGCONT) != 0)
+            pauseAct->setChecked(false);
+    });
+    // Optionally SIGSTOP the target for the duration of each scan (CE's "pause
+    // while scanning") so values can't change mid-scan, then resume.
+    auto* pauseScanAct = process->addAction("Pause target while scanning");
+    pauseScanAct->setCheckable(true);
+    pauseScanAct->setToolTip("Suspend the target during each First/Next Scan so its "
+                             "memory is a consistent snapshot, then resume it.");
+    connect(pauseScanAct, &QAction::toggled, this, [this](bool on) { pauseWhileScanning_ = on; });
+    // ── Table menu ──
+    table->addAction("Auto Assemble...", this, [this]() {
+        auto* editor = new ScriptEditor(process_.get(), &autoAsm_, this);
+        for (auto it = memoryViewers_.rbegin(); it != memoryViewers_.rend(); ++it) {
+            if (*it && (*it)->isVisible()) {
+                auto [address, size] = (*it)->injectionSelection();
+                editor->setInjectionAddress(address, size);
+                break;
+            }
+        }
+        // With no target yet the editor belongs to none: keep it (and its
+        // script) across the next attach and bind it then.
+        if (process_) trackTargetWindow(editor);
+        else unboundEditors_.push_back(editor);
+        editor->setAttribute(Qt::WA_DeleteOnClose);
+        editor->setAddToTable([this](const QString& d, const QString& s) {
+            addressListModel_->addScriptEntry(d, s);
+        });
+        editor->setBeforeExecute([this]() { stopCodeFindersForInjection(); });
+        editor->show();
+    }, QKeySequence("Ctrl+A"));
+    tools->addAction("File Patcher...", this, [this]() {
+        auto* dlg = new FilePatcher(this);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+    });
+    // CE frmSaveMemoryRegionUnit (Save memoryregion): dump a From..To range to a file.
+    tools->addAction("Save Memory Region...", this, [this]() {
+        if (!process_) { QMessageBox::warning(this, "Save Memory Region", "Open a process first."); return; }
+        auto* dlg = new QDialog(this);
+        dlg->setWindowTitle("Save Memory Region");
+        trackTargetWindow(dlg);   // closed when the target changes
+        auto* v = new QVBoxLayout(dlg);
+        auto* intro = new QLabel("Save a range of the target's memory to a file (up to 64 MiB). "
+                                 "Addresses are hexadecimal; To is exclusive.");
+        intro->setWordWrap(true);
+        intro->setProperty("secondary", true);
+        v->addWidget(intro);
+        auto* form = new QFormLayout;
+        auto* fromEdit = new QLineEdit;
+        auto* toEdit = new QLineEdit;
+        for (auto* edit : {fromEdit, toEdit}) {
+            edit->setFont(monospaceFont());
+            edit->setMinimumWidth(240);
+        }
+        fromEdit->setPlaceholderText("e.g. 7f3a00000000");
+        toEdit->setPlaceholderText("e.g. 7f3a00001000");
+        form->addRow("From:", fromEdit);
+        form->addRow("To:", toEdit);
+        v->addLayout(form);
+        auto* buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel);
+        v->addWidget(buttons);
+        connect(buttons, &QDialogButtonBox::rejected, dlg, &QDialog::reject);
+        connect(buttons, &QDialogButtonBox::accepted, this, [this, dlg, fromEdit, toEdit]() {
+            uintptr_t from = fromEdit->text().trimmed().toULongLong(nullptr, 16);
+            uintptr_t to = toEdit->text().trimmed().toULongLong(nullptr, 16);
+            if (to <= from) { QMessageBox::warning(dlg, "Save", "\"To\" must be greater than \"From\"."); return; }
+            // Cap like the Save Disassembly path: an unbounded range would throw
+            // std::bad_alloc out of a Qt slot (terminate) and OOM.
+            constexpr uintptr_t kMaxSave = 64ull * 1024 * 1024;  // 64 MiB
+            if (to - from > kMaxSave) {
+                QMessageBox::warning(dlg, "Save", "Region too large (max 64 MiB).");
+                return;
+            }
+            auto path = QFileDialog::getSaveFileName(dlg, "Save memory region", "region.bin");
+            if (path.isEmpty()) return;
+            // The process can have exited or been closed while this was open.
+            if (!process_) { QMessageBox::warning(dlg, "Save", "The process is no longer open."); return; }
+            std::vector<uint8_t> buf(to - from);
+            auto r = process_->read(from, buf.data(), buf.size());
+            if (!r || *r == 0) { QMessageBox::warning(dlg, "Save", "Could not read that region."); return; }
+            std::ofstream f(path.toStdString(), std::ios::binary);
+            f.write(reinterpret_cast<const char*>(buf.data()), (std::streamsize)*r);
+            if (!f) { QMessageBox::warning(dlg, "Save", QString("Could not write %1.").arg(path)); return; }
+            QMessageBox::information(dlg, "Saved", QString("Wrote %1 to %2.").arg(formatByteSize(*r), path));
+            dlg->accept();
+        });
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+    });
+    // CE frmMemoryAllocHandlerUnit (Memory Allocations): allocate + track blocks.
+    tools->addAction("Memory Allocations...", this, [this]() {
+        if (!process_) { QMessageBox::warning(this, "Memory Allocations", "Open a process first."); return; }
+        auto* dlg = new QDialog(this);
+        dlg->setWindowTitle("Memory Allocations");
+        trackTargetWindow(dlg);
+        dlg->resize(420, 320);
+        auto* v = new QVBoxLayout(dlg);
+        auto* intro = new QLabel("Memory reserved in the target from here (readable, writable and "
+                                 "executable). Double-click a block to browse it.");
+        intro->setWordWrap(true);
+        intro->setProperty("secondary", true);
+        v->addWidget(intro);
+        auto* list = new QListWidget;
+        list->setProperty("monospace", true);   // font from the theme sheet
+        setEmptyHint(list, "No blocks allocated yet.\nClick Allocate to reserve memory in the target.");
+        auto refill = [this, list]() {
+            list->clear();
+            for (const auto& a : allocations_)
+                list->addItem(QString("0x%1   %2").arg(a.first, 0, 16).arg(formatByteSize(a.second)));
+        };
+        refill();
+        v->addWidget(list);
+        auto* row = new QHBoxLayout;
+        auto* allocBtn = new QPushButton("Allocate");
+        auto* freeBtn = new QPushButton("Free");
+        freeBtn->setToolTip("Free the selected block");
+        freeBtn->setEnabled(false);   // needs a selected block
+        connect(list, &QListWidget::currentRowChanged, freeBtn, [freeBtn](int row) { freeBtn->setEnabled(row >= 0); });
+        auto* closeBtn = new QPushButton("Close");
+        row->addWidget(allocBtn); row->addWidget(freeBtn); row->addStretch(); row->addWidget(closeBtn);
+        v->addLayout(row);
+        connect(closeBtn, &QPushButton::clicked, dlg, &QDialog::accept);
+        connect(allocBtn, &QPushButton::clicked, this, [this, dlg, refill]() {
+            bool ok = false;
+            int size = QInputDialog::getInt(dlg, "Allocate", "Size (bytes):", 4096, 1, 1 << 30, 1, &ok);
+            if (!ok) return;
+            auto r = process_->allocate(size, ce::MemProt::All, 0);
+            if (!r) {
+                QMessageBox::warning(dlg, "Allocate", QString("Could not allocate %1 in the target: %2")
+                    .arg(formatByteSize(size), QString::fromStdString(r.error().message())));
+                return;
+            }
+            allocations_.push_back({(qulonglong)*r, (qulonglong)size});
+            refill();
+        });
+        connect(freeBtn, &QPushButton::clicked, this, [this, dlg, list, refill]() {
+            int i = list->currentRow();
+            if (i < 0 || i >= (int)allocations_.size()) return;
+            if (auto freed = process_->free(allocations_[i].first, allocations_[i].second); !freed) {
+                QMessageBox::warning(dlg, "Free", QString("Could not free the block: %1")
+                    .arg(QString::fromStdString(freed.error().message())));
+                return;
+            }
+            allocations_.erase(allocations_.begin() + i);
+            refill();
+        });
+        connect(list, &QListWidget::itemDoubleClicked, this, [this, list](QListWidgetItem*) {
+            int i = list->currentRow();
+            if (i >= 0 && i < (int)allocations_.size()) openMemoryView(allocations_[i].first);
+        });
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+    });
+    // CE frmExeTrainerGeneratorUnit: compile a standalone trainer executable.
+    tools->addAction("Generate Trainer (executable)...", this, [this]() {
+        auto path = QFileDialog::getSaveFileName(this, "Generate Trainer executable", "trainer");
+        if (path.isEmpty()) return;
+        try {
+            ce::CheatTable table = buildCheatTable();
+            ce::TrainerGenerator gen;
+            std::string err = gen.generateBinary(table, path.toStdString());
+            if (err.empty())
+                statusBar()->showMessage("Trainer executable written to " + path, 6000);
+            else
+                QMessageBox::critical(this, "Generate Trainer", QString::fromStdString(err));
+        } catch (const std::exception& ex) {
+            QMessageBox::critical(this, "Generate Trainer", ex.what());
+        }
+    });
+    // CE frmStringPointerScanUnit (Structure spider): find pointer paths to a target
+    // and dissect the structure there.
+    tools->addAction("Structure Spider...", this, [this]() {
+        if (!process_) { QMessageBox::warning(this, "Structure Spider", "Open a process first."); return; }
+        bool ok = false;
+        // Start from the selected cheat-table entry, the usual thing to spider from.
+        QString initial;
+        if (auto rows = addressListView_->selectionModel()->selectedRows(); !rows.isEmpty()) {
+            const auto& entries = addressListModel_->entries();
+            if (int r = rows.first().row(); r >= 0 && r < (int)entries.size() && !entries[r].isGroup)
+                initial = QString("0x%1").arg((qulonglong)entries[r].address, 0, 16);
+        }
+        QString ts = QInputDialog::getText(this, "Structure Spider",
+                                           "Address of the value to find pointer paths to (hex):",
+                                           QLineEdit::Normal, initial, &ok);
+        if (!ok || ts.trimmed().isEmpty()) return;
+        bool valid = false;
+        uintptr_t target = ts.trimmed().toULongLong(&valid, 16);
+        if (!valid || !target) {
+            QMessageBox::warning(this, "Structure Spider", QString("\"%1\" is not a hexadecimal address.").arg(ts.trimmed()));
+            return;
+        }
+        if (!process_) { QMessageBox::warning(this, "Structure Spider", "The process is no longer open."); return; }
+        // The scan runs on a worker so the GUI keeps running; the window shows
+        // its progress. Closing the window, or a target change (which deletes
+        // target windows), cancels the scan and joins the worker.
+        struct SpiderJob : QObject {
+            explicit SpiderJob(QObject* parent) : QObject(parent) {}
+            ~SpiderJob() override { scanner.cancel(); if (worker.joinable()) worker.join(); }
+            ce::PointerScanner scanner;
+            std::thread worker;
+            std::atomic<bool> done{false};
+            std::vector<ce::PointerPath> paths;   // written by the worker, read after join
+            std::string error;
+        };
+        auto* dlg = new QDialog(this);
+        dlg->setWindowTitle("Structure spider");
+        dlg->resize(520, 420);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        trackTargetWindow(dlg);
+        auto* v = new QVBoxLayout(dlg);
+        const QString targetText = QString("0x%1").arg((qulonglong)target, 0, 16);
+        auto* status = new QLabel(QString("Searching for pointer paths to %1...").arg(targetText));
+        status->setWordWrap(true);
+        v->addWidget(status);
+        auto* list = new QListWidget;
+        v->addWidget(list);
+        auto* job = new SpiderJob(dlg);
+        ce::PointerScanConfig cfg;
+        cfg.targetAddress = target; cfg.maxDepth = 2; cfg.maxOffset = 256; cfg.staticOnly = false;
+        job->worker = std::thread([job, proc = process_.get(), cfg] {
+            // buildPointerMap throws for a target of unknown pointer width, and
+            // a huge target can run out of memory: report either in the window.
+            try { job->paths = job->scanner.scan(*proc, cfg); }
+            catch (const std::exception& e) { job->error = e.what(); }
+            catch (...) { job->error = "unexpected error"; }
+            job->done = true;
+        });
+        connect(dlg, &QDialog::finished, job, [job]() { job->scanner.cancel(); });
+        auto* row = new QHBoxLayout;
+        auto* dissectBtn = new QPushButton("Dissect structure at target");
+        connect(dissectBtn, &QPushButton::clicked, this, [this, target]() {
+            if (!process_) return;
+            auto* sd = new StructureDissector(process_.get(), target, this);
+            sd->setAttribute(Qt::WA_DeleteOnClose);
+            sd->setAddToListCallback([this](uintptr_t a, ce::ValueType t, const QString& d) {
+                addressListModel_->addEntry(a, t, d);
+            });
+            trackStructDissector(sd);
+            sd->show();
+        });
+        // Cancel while the scan runs, Close afterwards.
+        auto* closeBtn = new QPushButton("Cancel");
+        connect(closeBtn, &QPushButton::clicked, dlg, [dlg, job, status]() {
+            if (job->done) { dlg->accept(); return; }
+            job->scanner.cancel();
+            status->setText("Cancelling...");
+        });
+        row->addWidget(dissectBtn); row->addStretch(); row->addWidget(closeBtn);
+        v->addLayout(row);
+        auto* poll = new QTimer(dlg);
+        connect(poll, &QTimer::timeout, dlg, [poll, job, status, list, closeBtn, targetText]() {
+            if (!job->done) {
+                if (!job->scanner.wasCancelled())
+                    status->setText(QString("Searching for pointer paths to %1... %2%")
+                                        .arg(targetText).arg(int(job->scanner.progress() * 100)));
+                return;
+            }
+            poll->stop();
+            job->worker.join();
+            closeBtn->setText("Close");
+            if (!job->error.empty()) {
+                status->setText(QString("The pointer scan failed: %1").arg(QString::fromStdString(job->error)));
+                return;
+            }
+            if (job->scanner.wasCancelled()) { status->setText("Cancelled."); return; }
+            QString text = QString("%1 pointer path(s) to %2:").arg(job->paths.size()).arg(targetText);
+            if (job->scanner.truncated()) text += " (the scan stopped at a limit, so some paths may be missing)";
+            status->setText(text);
+            for (const auto& p : job->paths) list->addItem(QString::fromStdString(p.toString()));
+        });
+        poll->start(100);
+        dlg->show();
+    });
+    // CE frmgroupscanalgoritmgeneratorunit: build a grouped-scan pattern from the
+    // selected scan results (offsets from the first, with each value), for finding
+    // other instances of the same structure.
+    tools->addAction("Group Scan Generator...", this, [this]() {
+        if (!process_ || !lastResult_) { QMessageBox::warning(this, "Group Scan Generator", "Run a scan and select results first."); return; }
+        auto sel = resultsView_->selectionModel()->selectedRows();
+        if (sel.size() < 2) { QMessageBox::information(this, "Group Scan Generator", "Select two or more addresses in the scan results first (Ctrl+click or Shift+click). The generator builds a pattern from their offsets and values."); return; }
+        std::vector<uintptr_t> addrs;
+        for (const auto& idx : sel) addrs.push_back(resultsModel_->addressAt(idx.row()));
+        std::sort(addrs.begin(), addrs.end());
+        uintptr_t base = addrs.front();
+        QStringList parts;
+        for (auto a : addrs) {
+            int32_t v = 0;
+            process_->read(a, &v, sizeof(v));
+            parts << QString("%1:%2").arg(a - base).arg(v);   // offset:value (4 bytes)
+        }
+        QString pattern = parts.join(' ');
+        auto* dlg = new QDialog(this);
+        dlg->setWindowTitle("Group Scan Generator");
+        auto* v = new QVBoxLayout(dlg);
+        v->addWidget(new QLabel("Grouped-scan pattern (offset:value, 4-byte):"));
+        auto* edit = new QPlainTextEdit(pattern); edit->setReadOnly(true);
+        v->addWidget(edit);
+        auto* row = new QHBoxLayout;
+        auto* copyBtn = new QPushButton("Copy");
+        connect(copyBtn, &QPushButton::clicked, this, [pattern]() { QApplication::clipboard()->setText(pattern); });
+        auto* closeBtn = new QPushButton("Close");
+        connect(closeBtn, &QPushButton::clicked, dlg, &QDialog::accept);
+        row->addStretch(); row->addWidget(copyBtn); row->addWidget(closeBtn);
+        v->addLayout(row);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+    });
+    // CE savedisassemblyfrm: disassemble a From..To range to a text file.
+    tools->addAction("Save Disassembly...", this, [this]() {
+        if (!process_) { QMessageBox::warning(this, "Save Disassembly", "Open a process first."); return; }
+        bool ok = false;
+        QString fromS = QInputDialog::getText(this, "Save Disassembly", "From (hex):",
+                                              QLineEdit::Normal, "0", &ok);
+        if (!ok) return;
+        QString toS = QInputDialog::getText(this, "Save Disassembly", "To (hex):",
+                                            QLineEdit::Normal, "0", &ok);
+        if (!ok) return;
+        uintptr_t from = fromS.toULongLong(nullptr, 16), to = toS.toULongLong(nullptr, 16);
+        if (to <= from || to - from > (64u << 20)) {
+            QMessageBox::warning(this, "Save Disassembly", "Invalid or too-large range."); return;
+        }
+        if (!process_) { QMessageBox::warning(this, "Save Disassembly", "The process is no longer open."); return; }
+        std::vector<uint8_t> buf(to - from);
+        auto r = process_->read(from, buf.data(), buf.size());
+        if (!r || *r == 0) { QMessageBox::warning(this, "Save Disassembly", "Could not read that range."); return; }
+        auto architecture = ce::disassemblerArchFor(*process_, from);
+        if (!architecture) {
+            QMessageBox::warning(this, "Save Disassembly", QString::fromStdString(architecture.error()));
+            return;
+        }
+        ce::Disassembler dis(*architecture);
+        auto insns = dis.disassemble(from, {buf.data(), *r}, 1000000, /*emitDataBytes=*/true);
+        auto path = QFileDialog::getSaveFileName(this, "Save disassembly", "disasm.asm");
+        if (path.isEmpty()) return;
+        std::ofstream f(path.toStdString());
+        for (const auto& i : insns)
+            f << std::hex << i.address << ": " << i.mnemonic
+              << (i.operands.empty() ? "" : " ") << i.operands << "\n";
+        QMessageBox::information(this, "Saved", QString("Wrote %1 instructions to %2.")
+                                    .arg(insns.size()).arg(path));
+    });
+    // CE frmMemoryViewExUnit (Graphical Memory View): bytes as pixels.
+    process->addAction("Wait for process...", this, [this]() {
+        bool ok = false;
+        auto name = QInputDialog::getText(this, "Wait for process",
+            "Name (or part of the name) of the program to wait for.\nNeversnooze CE opens it as soon as it starts:",
+            QLineEdit::Normal, "", &ok);
+        if (!ok || name.isEmpty()) return;
+        stopProcessWatch();
+        processWatcher_ = std::make_unique<os::ProcessWatcher>();
+        auto* status = statusBar();
+        status->showMessage(QString("Watching for '%1'…").arg(name));
+        const quint64 watch = processWatch_;
+        processWatcher_->start(name.toStdString(),
+            [this, watch](pid_t pid, const std::string& procName) {
+                QMetaObject::invokeMethod(this, [this, pid, procName, watch]() {
+                    autoAttach(pid, QString::fromStdString(procName), watch);
+                }, Qt::QueuedConnection);
+            });
+    });
+    auto* snapshotMenu = tools->addMenu("Snapshot");
+    // Bounded so a large game cannot exhaust memory; a diff reads at most as
+    // much again.
+    static constexpr uint64_t kSnapshotBudget = uint64_t(1) << 30;
+    snapshotMenu->addAction("Capture writable regions", this, [this]() {
+        if (!process_) {
+            QMessageBox::warning(this, "No process", "Open a process before capturing a snapshot.");
+            return;
+        }
+        ProcessHandle* proc = process_.get();
+        std::shared_ptr<Snapshot> captured;
+        try {
+            runSnapshotTask([&] {
+                captured = std::make_shared<Snapshot>(Snapshot::capture(*proc, kSnapshotBudget));
+            });
+        } catch (const std::exception& e) {
+            QMessageBox::warning(this, "Snapshot failed", QString::fromStdString(e.what()));
+            return;
+        }
+        snapshot_ = std::move(captured);
+        QString text = QString("Captured %1 region(s), %2 total.")
+            .arg(snapshot_->regionCount()).arg(formatByteSize(snapshot_->byteCount()));
+        if (snapshot_->truncated())
+            text += QString("\n\nThe snapshot stopped at its %1 limit: writable memory "
+                            "after that point is not included.").arg(formatByteSize(kSnapshotBudget));
+        QMessageBox::information(this, "Snapshot captured", text);
+    });
+    snapshotMenu->addAction("Diff against current", this, [this]() {
+        if (!process_ || !snapshot_) {
+            QMessageBox::warning(this, "Need both", "Capture a baseline snapshot first, then open a process.");
+            return;
+        }
+        constexpr size_t kShown = 200;
+        ProcessHandle* proc = process_.get();
+        std::shared_ptr<const Snapshot> baseline = snapshot_;
+        std::vector<Snapshot::ByteDiff> diffs;
+        uint64_t changed = 0;
+        try {
+            runSnapshotTask([&] {
+                const Snapshot now = baseline->recapture(*proc);
+                diffs = baseline->diff(now, kShown, &changed);
+            });
+        } catch (const std::exception& e) {
+            QMessageBox::warning(this, "Diff failed", QString::fromStdString(e.what()));
+            return;
+        }
+        if (changed == 0) {
+            QMessageBox::information(this, "Diff", "No byte-level differences detected.");
+            return;
+        }
+        // Only the first kShown differences are kept; the count covers all.
+        QString text;
+        text += QString("%1 byte%2 changed since the baseline.\n\n")
+            .arg(changed).arg(changed == 1 ? "" : "s");
+        for (const auto& d : diffs) {
+            text += QString("0x%1: 0x%2 -> 0x%3\n")
+                .arg(d.address, 16, 16, QChar('0'))
+                .arg(d.before, 2, 16, QChar('0'))
+                .arg(d.after,  2, 16, QChar('0'));
+        }
+        if (changed > diffs.size())
+            text += QString("\n(%1 more not shown.)").arg(changed - diffs.size());
+
+        auto* dlg = new QDialog(this);
+        dlg->setWindowTitle("Snapshot Diff");
+        dlg->resize(640, 480);
+        auto* l = new QVBoxLayout(dlg);
+        auto* edit = new QPlainTextEdit(text);
+        edit->setReadOnly(true);
+        edit->setFont(monospaceFont(-1));
+        l->addWidget(edit);
+        auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close);
+        connect(buttons, &QDialogButtonBox::rejected, dlg, &QDialog::accept);
+        l->addWidget(buttons);
+        dlg->exec();
+        dlg->deleteLater();
+    });
+    snapshotMenu->addAction("Restore baseline", this, [this]() {
+        if (!process_ || !snapshot_) {
+            QMessageBox::warning(this, "Need both", "Capture a baseline snapshot first.");
+            return;
+        }
+        auto answer = QMessageBox::question(this, "Restore?",
+            QString("Write the baseline back into the process? This overwrites the "
+                    "captured memory that is still mapped writable (%1 regions, %2).")
+                .arg(snapshot_->regionCount()).arg(formatByteSize(snapshot_->byteCount())));
+        if (answer != QMessageBox::Yes) return;
+        // Both go away if the process exits while the question is open.
+        if (!process_ || !snapshot_) { QMessageBox::warning(this, "Restore", "The process is no longer open."); return; }
+        ProcessHandle* proc = process_.get();
+        std::shared_ptr<const Snapshot> baseline = snapshot_;
+        uint64_t written = 0;
+        try {
+            runSnapshotTask([&] { written = baseline->restore(*proc); });
+        } catch (const std::exception& e) {
+            QMessageBox::warning(this, "Restore failed", QString::fromStdString(e.what()));
+            return;
+        }
+        QString text = QString("Wrote %1 bytes back into the process.").arg(written);
+        if (written < baseline->byteCount())
+            text += QString("\n\n%1 bytes were skipped: that memory is no longer mapped, "
+                            "or is now read-only or executable.").arg(baseline->byteCount() - written);
+        QMessageBox::information(this, "Restored", text);
+    });
+    snapshotMenu->addAction("Save to file...", this, [this]() {
+        if (!snapshot_) {
+            QMessageBox::warning(this, "No snapshot", "Capture a snapshot first.");
+            return;
+        }
+        auto path = QFileDialog::getSaveFileName(this, "Save snapshot", "snapshot.cesnap",
+            "Snapshot (*.cesnap);;All (*)");
+        if (path.isEmpty()) return;
+        if (!snapshot_->save(path.toStdString())) {
+            QMessageBox::warning(this, "Save failed", "Could not write " + path);
+        }
+    });
+    snapshotMenu->addAction("Load from file...", this, [this]() {
+        auto path = QFileDialog::getOpenFileName(this, "Load snapshot", "",
+            "Snapshot (*.cesnap);;All (*)");
+        if (path.isEmpty()) return;
+        auto loaded = std::make_shared<Snapshot>();
+        std::string err;
+        if (!loaded->load(path.toStdString(), &err)) {
+            QMessageBox::warning(this, "Load failed", QString::fromStdString(err));
+            return;
+        }
+        snapshot_ = std::move(loaded);
+        QMessageBox::information(this, "Snapshot loaded",
+            QString("Loaded %1 region(s), %2 bytes.")
+                .arg(snapshot_->regionCount()).arg(snapshot_->byteCount()));
+    });
+    tools->addSeparator();
+    tools->addAction("Overlay...", this, &MainWindow::showOverlayDialog);
+    tools->addAction("Speedhack...", this, [this]() {
+        auto* dlg = new QDialog(this);
+        dlg->setWindowTitle("Speedhack");
+        auto* layout = new QVBoxLayout(dlg);
+        layout->setSpacing(10);
+        auto* intro = new QLabel("Scales the time the game sees. Apply loads the speedhack "
+                                 "library into the process the first time.");
+        intro->setWordWrap(true);
+        intro->setProperty("secondary", true);
+        auto* speedRow = new QHBoxLayout;
+        speedRow->addWidget(new QLabel("Speed"));
+        speedRow->addStretch();
+        auto* speedValue = new QLabel("1.0×");
+        speedValue->setStyleSheet(QString("font-size: %1pt; font-weight: 600;")
+            .arg(QApplication::font().pointSizeF() * 1.4, 0, 'f', 1));
+        speedRow->addWidget(speedValue);
+        auto* slider = new QSlider(Qt::Horizontal);
+        slider->setRange(1, 100);  // 0.1x to 10.0x
+        slider->setValue(10);      // 1.0x default
+        connect(slider, &QSlider::valueChanged, [speedValue](int v) {
+            speedValue->setText(QString("%1×").arg(v / 10.0, 0, 'f', 1));
+        });
+        auto* presets = new QHBoxLayout;
+        for (double preset : {0.5, 1.0, 2.0, 5.0}) {
+            auto* b = new QPushButton(QString("%1×").arg(preset, 0, 'g', 2));
+            connect(b, &QPushButton::clicked, slider, [slider, preset]() { slider->setValue(int(preset * 10)); });
+            presets->addWidget(b);
+        }
+        // Status of the last Apply: injection errors or the speed now in effect.
+        auto* label = new QLabel(process_ ? "Not applied yet." : "Open a process first.");
+        label->setProperty("secondary", true);
+        label->setWordWrap(true);
+        auto* applyBtn = new QPushButton("Apply");
+        applyBtn->setProperty("primary", true);
+        applyBtn->setEnabled(process_ != nullptr);
+        connect(applyBtn, &QPushButton::clicked, [this, slider, label]() {
+            double speed = slider->value() / 10.0;
+            // Inject the speedhack library into the running target the first time,
+            // so it works without relaunching the game under LD_PRELOAD (CE-style).
+            if (process_) {
+                // The speedhack is injected locally and speaks through this
+                // machine's /dev/shm: a remote PID names some other process here.
+                const auto localPid = ce::localTargetPid(process_.get());
+                if (!localPid) { label->setText("The speedhack works on local processes only."); return; }
+                pid_t pid = *localPid;
+                bool loaded = false;
+                std::ifstream maps("/proc/" + std::to_string(pid) + "/maps");
+                std::string line;
+                while (std::getline(maps, line))
+                    if (line.find("libspeedhack.so") != std::string::npos) { loaded = true; break; }
+                if (!loaded) {
+                    // injectLibrary needs the target's libc symbols (dlopen); the
+                    // resolver is otherwise only populated lazily on Lua use.
+                    if (luaResolver_.count() == 0) luaResolver_.loadProcess(*process_);
+                    // Installed beside libcecore (lib, lib64 or a multiarch
+                    // directory), or next to the binary in a build tree.
+                    const std::string so = ce::findCompanionLibrary("libspeedhack.so");
+                    if (so.empty()) {
+                        label->setText("Inject failed: libspeedhack.so is not installed next to Neversnooze CE.");
+                        return;
+                    }
+                    // A containerised game (Flatpak, Steam runtime) may see
+                    // this file under another name; dlopen runs in its view.
+                    std::string targetSo = so;
+                    if (auto task = ce::os::processMemoryTask(pid)) targetSo = ce::os::targetVisiblePath(*task, so);
+                    auto r = ce::os::injectLibrary(*process_, luaResolver_, targetSo);
+                    if (!r) {
+                        label->setText(QString("Inject failed: %1")
+                                           .arg(QString::fromStdString(r.error())));
+                        return;  // don't set a speed the plugin can't read
+                    }
+                }
+                label->setText(QString("Active: the game runs at %1×.").arg(speed, 0, 'f', 1));
+            }
+            // Match the plugin side (plugins/speedhack.c): O_NOFOLLOW refuses a
+            // symlink-swapped /dev/shm entry and mode 0600 keeps the channel
+            // same-user only. Do NOT add O_EXCL/unlink: the file is a persistent
+            // shared channel the injected plugin mmaps, so it must be opened in
+            // place (a new inode would orphan the plugin's existing mapping).
+            int shmfd = ::open("/dev/shm/ce_speedhack", O_CREAT | O_RDWR | O_NOFOLLOW, 0600);
+            if (shmfd >= 0) {
+                // Confirm we opened a real regular file, not a fifo/device an
+                // attacker pre-created at the predictable path.
+                struct stat st{};
+                if (::fstat(shmfd, &st) == 0 && S_ISREG(st.st_mode) && st.st_uid == ::geteuid() && !(st.st_mode & 077) &&
+                    ::ftruncate(shmfd, sizeof(double)) == 0) {
+                    void* mem = ::mmap(nullptr, sizeof(double), PROT_READ|PROT_WRITE, MAP_SHARED, shmfd, 0);
+                    if (mem != MAP_FAILED) { *(double*)mem = speed; ::munmap(mem, sizeof(double)); }
+                }
+                ::close(shmfd);
+            }
+        });
+        layout->addWidget(intro);
+        layout->addLayout(speedRow);
+        layout->addWidget(slider);
+        layout->addLayout(presets);
+        auto* applyRow = new QHBoxLayout;
+        applyRow->addWidget(label, 1);
+        applyRow->addWidget(applyBtn);
+        layout->addLayout(applyRow);
+        dlg->resize(380, dlg->sizeHint().height());
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+    });
+
+    // ── Help ──
+    auto* help = menuBar()->addMenu("&Help");
+    help->addAction("Neversnooze CE Help", this, [this]() {
+        openHelpDoc("README.md", "Neversnooze CE: Help",
+                    "https://github.com/Broshan1337/neversnooze-ce#readme");
+    });
+    help->addAction("Lua documentation", this, [this]() {
+        openHelpDoc("docs/SCRIPTING.md", "Lua / Scripting documentation",
+                    "https://github.com/Broshan1337/neversnooze-ce/blob/main/docs/SCRIPTING.md");
+    });
+    help->addSeparator();
+    auto launchTutorial = [this](const QString& program) {
+        const QString path = QCoreApplication::applicationDirPath() + "/" + program;
+        if (!QProcess::startDetached(path, {}))
+            QMessageBox::warning(this, "Tutorial not found",
+                QString("Could not start %1. It is installed next to Neversnooze CE.").arg(path));
+    };
+    help->addAction("Neversnooze CE Tutorial...", this, [launchTutorial]() { launchTutorial("cetutorial"); });
+    help->addAction("Graphical Tutorial...", this, [launchTutorial]() { launchTutorial("cegtutorial"); });
+    help->addSeparator();
+    help->addAction("About", this, [this]() {
+        QMessageBox::about(this, "About Neversnooze CE",
+            QString("<p style='text-align:center'><img src=':/icon.png' width='96'/></p>"
+                    "<h2 style='margin-bottom:2px'>Neversnooze CE</h2>"
+                    "<p style='margin-top:0'>Version %1</p>"
+                    "<p>A memory scanner, debugger and code injection tool for native Linux, "
+                    "Wine and Proton programs.</p>"
+                    "<p>Built with Qt %2, Capstone, Keystone and Lua 5.3.<br>"
+                    "Free and open source under the MIT license.<br>"
+                    "A Neversnooze project, based on "
+                    "<a href='https://github.com/wleeaf/cheat-engine-linux'>cheat-engine-linux</a> "
+                    "by wleeaf, inspired by Cheat Engine by Dark Byte.</p>"
+                    "<p><a href='https://github.com/Broshan1337/neversnooze-ce'>"
+                    "github.com/Broshan1337/neversnooze-ce</a></p>")
+                .arg(CECORE_VERSION, qVersion()));
+    });
+}
+
+// Table "Comments" window — CE's CommentsUnit: a PageControl with a Comments tab
+// holding a free-text memo, plus Close. The text is the cheat table's comment,
+// Locate a shipped doc next to the binary (dev build or installed layout).
+// Returns an empty string when not found (caller falls back to the online copy).
+static QString findDocFile(const QString& rel) {
+    const QString exeDir = QCoreApplication::applicationDirPath();
+    const QString base = QFileInfo(rel).fileName();
+    const QStringList candidates = {
+        exeDir + "/" + rel,                                          // next to the binary
+        exeDir + "/../" + rel,                                       // dev build: build/../<rel>
+        exeDir + "/../share/doc/neversnooze-ce/" + base,            // installed
+        "/usr/share/doc/neversnooze-ce/" + base,
+    };
+    for (const auto& c : candidates)
+        if (QFileInfo::exists(c)) return QFileInfo(c).absoluteFilePath();
+    return {};
+}
+
+void MainWindow::openHelpDoc(const QString& relPath, const QString& title, const QString& url) {
+    QString path = findDocFile(relPath);
+    QFile f(path);
+    if (path.isEmpty() || !f.open(QIODevice::ReadOnly)) {
+        // No local copy (e.g. a minimal install): open the online doc instead.
+        QDesktopServices::openUrl(QUrl(url));
+        return;
+    }
+    auto* dlg = new QDialog(this);
+    dlg->setWindowTitle(title);
+    dlg->resize(780, 640);
+    auto* v = new QVBoxLayout(dlg);
+    auto* view = new QTextBrowser;
+    view->setOpenExternalLinks(true);
+    view->setMarkdown(QString::fromUtf8(f.readAll()));   // render the Markdown
+    view->document()->setDocumentMargin(12);
+    v->addWidget(view);
+    auto* row = new QHBoxLayout;
+    auto* online = new QPushButton("Open on GitHub");
+    connect(online, &QPushButton::clicked, this, [url]() { QDesktopServices::openUrl(QUrl(url)); });
+    row->addWidget(online);
+    row->addStretch();
+    auto* closeBtn = new QPushButton("Close");
+    row->addWidget(closeBtn);
+    v->addLayout(row);
+    connect(closeBtn, &QPushButton::clicked, dlg, &QDialog::accept);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->show();
+}
+
+// persisted via buildCheatTable()/onLoadTable().
+void MainWindow::showComments() {
+    auto* dlg = new QDialog(this);
+    tableTextWindows_.push_back(dlg);   // closed when another table loads
+    dlg->setWindowTitle("Table Comments");
+    dlg->resize(520, 400);
+    auto* v = new QVBoxLayout(dlg);
+    auto* memo = new QPlainTextEdit;                   // CE Memo1
+    memo->setPlainText(tableComment_);
+    memo->setPlaceholderText("Notes about this cheat table: how to use it, what each entry does, "
+                             "which game version it was made for. They are saved with the table.");
+    memo->document()->setDocumentMargin(6);
+    v->addWidget(memo);
+    auto* row = new QHBoxLayout;                        // CE Panel1
+    row->addStretch();
+    auto* closeBtn = new QPushButton("Close");         // CE Button1
+    row->addWidget(closeBtn);
+    v->addLayout(row);
+    connect(memo, &QPlainTextEdit::textChanged, this,
+            [this, memo]() { tableComment_ = memo->toPlainText(); });
+    connect(closeBtn, &QPushButton::clicked, dlg, &QDialog::accept);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->show();
+}
+
+// CE's "Show Cheat Table Lua Script": view/edit the table-level Lua that runs on
+// load and is saved with the table (buildCheatTable). Kept editable here so a
+// table author can add trainer logic, not only import a script that already runs.
+void MainWindow::showTableLuaScript() {
+    auto* dlg = new QDialog(this);
+    tableTextWindows_.push_back(dlg);   // closed when another table loads
+    dlg->setWindowTitle("Cheat Table Lua Script");
+    dlg->resize(640, 460);
+    auto* v = new QVBoxLayout(dlg);
+    auto* memo = new CodeEditor;
+    memo->setPlainText(tableLuaScript_);
+    memo->setPlaceholderText("-- Lua that runs when this table is opened; saved with the table.");
+    v->addWidget(memo);
+
+    auto* row = new QHBoxLayout;
+    auto* execBtn = new QPushButton("Execute script");
+    execBtn->setProperty("primary", true);
+    row->addWidget(execBtn);
+    auto* result = new QLabel;
+    result->setWordWrap(true);
+    row->addWidget(result, 1);
+    auto* closeBtn = new QPushButton("Close");
+    row->addWidget(closeBtn);
+    v->addLayout(row);
+
+    // Edits are captured live so Close (or saving the table) keeps them.
+    connect(memo, &QPlainTextEdit::textChanged, this,
+            [this, memo]() { tableLuaScript_ = memo->toPlainText(); });
+    // Run it now, through the same engine and against the current process/list as
+    // the load-time run. No extra trust prompt: the user typed/edited this here.
+    connect(execBtn, &QPushButton::clicked, this, [this, memo, result]() {
+        luaEngine_.setProcess(process_.get());
+        luaEngine_.setAddressList(addressListModel_);
+        auto res = luaEngine_.evalToString(memo->toPlainText().toStdString());
+        const auto pal = editorPalette();
+        result->setStyleSheet(QString("color: %1;").arg((res.has_value() ? pal.success : pal.error).name()));
+        result->setText(res.has_value() ? "Script executed."
+                                        : QString("Error: %1").arg(QString::fromStdString(res.error())));
+    });
+    connect(closeBtn, &QPushButton::clicked, dlg, &QDialog::accept);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->show();
+}
+
+// Advanced Options — CE's "Code list" window. Kept as a single instance so the
+// list survives reopening; double-click / "Open the disassembler" navigates the
+// memory browser to the code address.
+void MainWindow::showAdvancedOptions() {
+    if (!advancedOptions_) {
+        advancedOptions_ = new ce::gui::AdvancedOptionsWindow(process_.get(), this);
+        connect(advancedOptions_, &ce::gui::AdvancedOptionsWindow::navigateTo, this,
+                [this](uintptr_t addr) { openMemoryView(addr); });  // full-featured viewer
+    }
+    advancedOptions_->setProcess(process_.get());
+    advancedOptions_->show();
+    advancedOptions_->raise();
+    advancedOptions_->activateWindow();
+}
+
+void MainWindow::showOverlayDialog() {
+    QDialog dialog(this);
+    dialog.setWindowTitle("Overlay");
+    auto* layout = new QVBoxLayout(&dialog);
+    layout->setSpacing(10);
+    auto* intro = new QLabel("A transparent, click-through layer drawn over the whole screen, "
+                             "for use with a game in borderless or windowed mode.");
+    intro->setWordWrap(true);
+    intro->setProperty("secondary", true);
+    layout->addWidget(intro);
+    auto* osdCheck = new QCheckBox("Status text (process, active cheats, frame rate)");
+    auto* crosshairCheck = new QCheckBox("Crosshair in the centre of the screen");
+    auto* showButton = new QPushButton("Show Overlay");
+    showButton->setProperty("primary", true);
+    auto* hideButton = new QPushButton("Hide Overlay");
+    auto* closeButton = new QPushButton("Close");
+
+    osdCheck->setChecked(!overlayWindow_ || overlayWindow_->osdEnabled());
+    crosshairCheck->setChecked(!overlayWindow_ || overlayWindow_->crosshairEnabled());
+
+    layout->addWidget(osdCheck);
+    layout->addWidget(crosshairCheck);
+    layout->addSpacing(4);
+    auto* buttons = new QHBoxLayout;
+    buttons->addWidget(showButton);
+    buttons->addWidget(hideButton);
+    buttons->addStretch();
+    buttons->addWidget(closeButton);
+    layout->addLayout(buttons);
+    dialog.resize(440, dialog.sizeHint().height());
+
+    auto ensureOverlay = [this]() {
+        if (overlayWindow_)
+            return;
+
+        overlayWindow_ = new OverlayWindow;
+        overlayWindow_->setAttribute(Qt::WA_DeleteOnClose);
+        connect(overlayWindow_, &QObject::destroyed, this, [this]() {
+            overlayWindow_ = nullptr;
+        });
+
+        auto* statusTimer = new QTimer(overlayWindow_);
+        connect(statusTimer, &QTimer::timeout, this, &MainWindow::updateOverlayStatus);
+        statusTimer->start(500);
+    };
+
+    connect(showButton, &QPushButton::clicked, this, [this, ensureOverlay, osdCheck, crosshairCheck]() {
+        ensureOverlay();
+        overlayWindow_->setOsdEnabled(osdCheck->isChecked());
+        overlayWindow_->setCrosshairEnabled(crosshairCheck->isChecked());
+        updateOverlayStatus();
+        overlayWindow_->showFullScreen();
+    });
+    connect(hideButton, &QPushButton::clicked, this, [this]() {
+        if (overlayWindow_)
+            overlayWindow_->close();
+    });
+    connect(osdCheck, &QCheckBox::toggled, this, [this](bool enabled) {
+        if (overlayWindow_)
+            overlayWindow_->setOsdEnabled(enabled);
+    });
+    connect(crosshairCheck, &QCheckBox::toggled, this, [this](bool enabled) {
+        if (overlayWindow_)
+            overlayWindow_->setCrosshairEnabled(enabled);
+    });
+    connect(closeButton, &QPushButton::clicked, &dialog, &QDialog::accept);
+
+    dialog.exec();
+}
+
+void MainWindow::updateOverlayStatus() {
+    if (!overlayWindow_)
+        return;
+
+    int total = 0;
+    int active = 0;
+    for (const auto& entry : addressListModel_->entries()) {
+        if (entry.isGroup)
+            continue;
+        ++total;
+        if (entry.active)
+            ++active;
+    }
+
+    overlayWindow_->setStatusText(QString("%1 | Records %2/%3 active")
+        .arg(processLabel_->text())
+        .arg(active)
+        .arg(total));
+}
+
+// The monospace font from the Settings dialog (display/fontFamily + fontSize),
+// used for the results / cheat-table views. Defaults to the desktop's monospace font.
+static QFont settingsMonospaceFont() {
+    QSettings s;
+    return QFont(s.value("display/fontFamily", defaultMonospaceFamily()).toString(),
+                 s.value("display/fontSize", defaultMonospaceSize()).toInt());
+}
+
+void MainWindow::setupUi() {
+    auto* central = new QWidget;
+    auto* mainLayout = new QVBoxLayout(central);
+    mainLayout->setContentsMargins(4, 4, 4, 4);
+    mainLayout->setSpacing(4);
+
+    // ── Process bar ──
+    auto* processBar = new QHBoxLayout;
+    auto* openBtn = new QPushButton;
+    openBtn->setFixedSize(38, 38);
+    openBtn->setToolTip("Open process");
+    // Remove the default button padding so the icon fills the button instead of
+    // being clipped by the frame.
+    openBtn->setStyleSheet("QPushButton { padding: 0px; }");
+    // Prefer the bundled app icon; if it isn't available, draw a crosshair
+    // target (thematic for a scanner) instead of falling back to plain text.
+    // A crisp, purpose-drawn "find process" magnifying glass (drawn at 4x and
+    // downscaled) rather than the scaled app logo, so it reads cleanly at button
+    // size. The accent blue is legible on both the light and dark process bar.
+    QPixmap btnIcon(88, 88);
+    btnIcon.setDevicePixelRatio(1.0);
+    btnIcon.fill(Qt::transparent);
+    {
+        QPainter p(&btnIcon);
+        p.setRenderHint(QPainter::Antialiasing);
+        QPen pen(QColor(0x3f, 0x77, 0xe6));   // accent blue
+        pen.setWidthF(8);
+        pen.setCapStyle(Qt::RoundCap);
+        p.setPen(pen);
+        p.setBrush(Qt::NoBrush);
+        p.drawEllipse(QPointF(36, 36), 22, 22);      // lens
+        p.drawLine(QPointF(52, 52), QPointF(74, 74)); // handle
+    }
+    openBtn->setIcon(QIcon(btnIcon.scaled(24, 24, Qt::KeepAspectRatio, Qt::SmoothTransformation)));
+    openBtn->setIconSize(QSize(24, 24));
+    connect(openBtn, &QPushButton::clicked, this, &MainWindow::onOpenProcess);
+    processLabel_ = new QLabel("No process selected");
+    processLabel_->setObjectName("processLabel");
+    processLabel_->setStyleSheet(QString("font-weight: 600; font-size: %1pt;")
+        .arg(QApplication::font().pointSizeF() * 1.1, 0, 'f', 1));
+    processDetail_ = new QLabel(tr("Press Ctrl+O or click the magnifier to choose a process."));
+    processDetail_->setObjectName("processDetail");
+    processDetail_->setProperty("secondary", true);
+    processBar->addWidget(openBtn);
+    processBar->addWidget(processLabel_, 1);
+    mainLayout->addLayout(processBar);
+
+    // ── Top area: results + scan controls ──
+    auto* topSplitter = new QSplitter(Qt::Horizontal);
+    topSplitter->setObjectName("topSplitter");   // persisted across runs
+
+    // Left: scan results
+    auto* leftPanel = new QWidget;
+    auto* leftLayout = new QVBoxLayout(leftPanel);
+    leftLayout->setContentsMargins(0, 0, 0, 0);
+
+    resultsModel_ = new ScanResultsModel(this);
+    resultsView_ = new QTableView;
+    resultsView_->setModel(resultsModel_);
+    resultsView_->setSelectionBehavior(QAbstractItemView::SelectRows);
+    resultsView_->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    resultsView_->setAlternatingRowColors(true);   // activates the theme's zebra rows
+    resultsView_->setFont(settingsMonospaceFont());
+    resultsView_->verticalHeader()->setVisible(false);
+    resultsView_->horizontalHeader()->setStretchLastSection(true);
+    // Headers align with their (left-aligned) cells, as in every other table.
+    resultsView_->horizontalHeader()->setDefaultAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    resultsView_->horizontalHeader()->setHighlightSections(false);
+    resultsView_->setShowGrid(false);
+    // Address sized to its content; Value and Previous share the rest evenly.
+    resultsView_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    resultsView_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
+    resultsView_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
+
+    // A centered hint shown over the empty result list so the pane isn't a blank
+    // grid before the first scan (a "finished app" touch).
+    resultsEmptyHint_ = new QLabel(
+        tr("No results yet.\n\nEnter a value and press First Scan,\n"
+           "or open a process with Ctrl+O."),
+        resultsView_->viewport());
+    resultsEmptyHint_->setAlignment(Qt::AlignCenter);
+    resultsEmptyHint_->setProperty("secondary", true);
+    resultsEmptyHint_->setWordWrap(true);
+    resultsEmptyHint_->setAttribute(Qt::WA_TransparentForMouseEvents);
+    resultsView_->viewport()->installEventFilter(this);
+    auto updateResultsHint = [this]() {
+        if (!resultsEmptyHint_) return;
+        const bool empty = resultsModel_->rowCount() == 0;
+        // Only point at Open Process while there is no process to scan.
+        resultsEmptyHint_->setText(process_
+            ? tr("No results yet.\n\nEnter a value and press First Scan.")
+            : tr("No results yet.\n\nOpen a process with Ctrl+O,\nthen enter a value and press First Scan."));
+        resultsEmptyHint_->setGeometry(resultsView_->viewport()->rect());
+        resultsEmptyHint_->setVisible(empty);
+    };
+    connect(resultsModel_, &QAbstractItemModel::modelReset, this, updateResultsHint);
+    connect(resultsModel_, &QAbstractItemModel::rowsInserted, this, updateResultsHint);
+    connect(resultsModel_, &QAbstractItemModel::rowsRemoved, this, updateResultsHint);
+    updateResultsHint();
+
+    connect(resultsView_, &QTableView::doubleClicked, this, &MainWindow::onResultDoubleClicked);
+    // Enter adds all selected results to the address list (complements the
+    // context menu's "Add N selected").
+    auto* addSelSc = new QShortcut(QKeySequence(Qt::Key_Return), resultsView_);
+    addSelSc->setContext(Qt::WidgetShortcut);
+    connect(addSelSc, &QShortcut::activated, this, [this]() {
+        if (!lastResult_) return;
+        auto sel = resultsView_->selectionModel()->selectedRows();
+        for (auto& idx : sel)
+            onResultDoubleClicked(idx);   // the same record a double-click adds
+    });
+    resultsView_->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(resultsView_, &QTableView::customContextMenuRequested, this, [this](const QPoint& pos) {
+        if (!lastResult_) return;
+        auto sel = resultsView_->selectionModel()->selectedRows();
+        if (sel.isEmpty()) return;
+        QMenu menu(this);
+        // CE foundlistpopup order.
+        auto* addAct = menu.addAction(sel.size() > 1
+            ? QString("Add %1 selected addresses to the address list").arg(sel.size())
+            : QString("Add selected address to the address list"));
+        auto* browseAct = menu.addAction("Browse this memory region");
+        auto* disasmAct = menu.addAction("Disassemble this memory region");
+        auto* copyAct = menu.addAction(sel.size() > 1 ? QString("Copy %1 addresses").arg(sel.size())
+                                                      : QString("Copy address"));
+        copyAct->setShortcut(QKeySequence::Copy);
+        auto* removeAct = menu.addAction(sel.size() > 1
+            ? QString("Remove %1 selected addresses from the results").arg(sel.size())
+            : QString("Remove selected address from the results"));
+        menu.addSeparator();
+        auto* accAct = menu.addAction("Find out what accesses this address");
+        auto* wrAct  = menu.addAction("Find out what writes to this address");
+        QAction* picked = menu.exec(resultsView_->viewport()->mapToGlobal(pos));
+        if (!picked) return;
+        const uintptr_t firstAddr = resultsModel_->addressAt(sel.first().row());
+        if (picked == addAct) {
+            for (auto& idx : sel)
+                onResultDoubleClicked(idx);   // the same record a double-click adds
+        } else if (picked == browseAct || picked == disasmAct) {
+            // Full-featured viewer (breakpoints, add-to-list, Tools/Debug menus),
+            // the same one the Memory View button opens, not a stripped-down clone.
+            openMemoryView(firstAddr);
+        } else if (picked == copyAct) {
+            QStringList addrs;
+            for (auto& idx : sel)
+                addrs << QString("0x%1").arg(resultsModel_->addressAt(idx.row()), 0, 16);
+            QApplication::clipboard()->setText(addrs.join('\n'));
+        } else if (picked == removeAct) {
+            // Swap in a pruned copy of the result so the removal persists into a later
+            // Next Scan (CE "remove selected addresses from the list"). The pre-prune set
+            // becomes the undo state, so "Undo scan" brings the removed rows back.
+            std::vector<bool> mask(lastResult_->count(), false);
+            for (auto& idx : sel) {
+                int r = idx.row();
+                if (r >= 0 && r < (int)mask.size()) mask[r] = true;
+            }
+            // A failure (incomplete result files, a full disk) must not escape
+            // the slot: that would terminate Neversnooze CE.
+            std::unique_ptr<ce::ScanResult> pruned;
+            try { pruned = ce::pruneScanResult(*lastResult_, lastResultValueSize_, mask); }
+            catch (const std::exception& error) {
+                QMessageBox::warning(this, "Remove from results", QString::fromStdString(error.what()));
+                return;
+            }
+            resultsModel_->setResult(pruned.get(), lastResultType_, lastResultValueSize_, resultsModel_->stringEncoding());
+            undoResult_ = std::move(lastResult_);
+            undoResultType_ = lastResultType_;
+            undoResultValueSize_ = lastResultValueSize_;
+            lastResult_ = std::move(pruned);
+            foundLabel_->setText(foundLabelText(lastResult_->count()));
+            updateScanButtons();
+        } else if (picked == accAct) {
+            startCodeFinderForAddress(firstAddr, /*writesOnly=*/false);
+        } else if (picked == wrAct) {
+            startCodeFinderForAddress(firstAddr, /*writesOnly=*/true);
+        }
+    });
+    // Ctrl+C copies the selected result addresses (the "Copy address(es)" menu
+    // action), matching the address list's copy shortcut.
+    auto* resultsCopySc = new QShortcut(QKeySequence::Copy, resultsView_);
+    // Scoped to its list: two window-wide Ctrl+C shortcuts are ambiguous to
+    // Qt, which then fires neither.
+    resultsCopySc->setContext(Qt::WidgetShortcut);
+    connect(resultsCopySc, &QShortcut::activated, this, [this]() {
+        if (!lastResult_) return;
+        const auto sel = resultsView_->selectionModel()->selectedRows();
+        QStringList addrs;
+        for (const auto& idx : sel)
+            addrs << QString("0x%1").arg(resultsModel_->addressAt(idx.row()), 0, 16);
+        if (!addrs.isEmpty()) QApplication::clipboard()->setText(addrs.join('\n'));
+    });
+    leftLayout->addWidget(resultsView_);
+
+    auto* foundRow = new QHBoxLayout;
+    foundLabel_ = new QLabel("Found: 0");
+    foundRow->addWidget(foundLabel_);
+    foundRow->addStretch();
+    auto* resHexCheck = new QCheckBox("Hex");
+    resHexCheck->setToolTip("Show result values in hexadecimal");
+    connect(resHexCheck, &QCheckBox::toggled, this, [this](bool on) { resultsModel_->setDisplayHex(on); });
+    foundRow->addWidget(resHexCheck);
+    leftLayout->addLayout(foundRow);
+
+    auto* leftBtns = new QHBoxLayout;
+    auto* memViewBtn = new QPushButton("Memory View");
+    memViewBtn->setObjectName("memoryViewButton");
+    memViewBtn->setToolTip("Browse the selected process's memory");
+    connect(memViewBtn, &QPushButton::clicked, this, &MainWindow::onMemoryView);
+    auto* addAddrBtn = new QPushButton("Add Address");
+    connect(addAddrBtn, &QPushButton::clicked, this, [this]() {
+        // CE uses formAddressChange for both add and edit.
+        ce::gui::ChangeAddressDialog dlg("", mapValueType(valueTypeCombo_->currentIndex()),
+                                         false, 1, this, /*showSigned=*/true, process_.get());
+        openAddressDialog_ = &dlg;
+        dlg.setWindowTitle("Add address");
+        if (dlg.exec() != QDialog::Accepted) return;
+        auto text = dlg.address();
+        if (text.isEmpty()) return;
+        auto addr = parseAddressExpr(text);
+        if (addr) {
+            // Keep the address EXPRESSION (not just the resolved absolute) whenever
+            // it isn't a plain hex literal, so pointer chains ("[base]+8"),
+            // module+offset ("game.exe+1C"), and symbols re-resolve every refresh
+            // AND survive save/reload across ASLR. A bare hex address is static.
+            auto trimmed = text.trimmed();
+            auto hexBody = trimmed;
+            if (hexBody.startsWith("0x") || hexBody.startsWith("0X")) hexBody = hexBody.mid(2);
+            bool plainHex = !hexBody.isEmpty() &&
+                std::all_of(hexBody.begin(), hexBody.end(),
+                            [](QChar c){ return std::isxdigit(c.toLatin1()); });
+            QString expr = plainHex ? QString() : trimmed;
+            // Every field of the dialog, as Add Address Manually applies them.
+            const int id = addressListModel_->addEntry(*addr, dlg.valueType(), "Manual entry", expr, (size_t)dlg.length());
+            addressListModel_->setHexView(id, dlg.showHex());
+            addressListModel_->setSigned(id, dlg.isSigned());
+        } else
+            QMessageBox::warning(this, "Add Address", QString("Could not resolve \"%1\".").arg(text.trimmed()));
+    });
+    leftBtns->addWidget(memViewBtn);
+    leftBtns->addWidget(addAddrBtn);
+    leftBtns->addStretch();
+    leftLayout->addLayout(leftBtns);
+
+    // Right: scan controls
+    auto* rightPanel = new QWidget;
+    auto* rightLayout = new QVBoxLayout(rightPanel);
+    rightLayout->setContentsMargins(4, 0, 0, 0);
+
+    // Value input
+    auto* valueLayout = new QHBoxLayout;
+    valueLayout->addWidget(new QLabel("Value:"));
+    scanValueEdit_ = new QLineEdit;
+    scanValueEdit_->setObjectName("scanValue");
+    valueLayout->addWidget(scanValueEdit_);
+    // Second bound, only shown for "Value between..." scans.
+    betweenAndLabel_ = new QLabel("and");
+    betweenAndLabel_->setVisible(false);
+    valueLayout->addWidget(betweenAndLabel_);
+    scanValue2Edit_ = new QLineEdit;
+    scanValue2Edit_->setObjectName("scanValueUpper");
+    scanValue2Edit_->setVisible(false);
+    valueLayout->addWidget(scanValue2Edit_);
+    hexCheck_ = new QCheckBox("Hex");
+    hexCheck_->setToolTip("Interpret integer scan values as hexadecimal");
+    valueLayout->addWidget(hexCheck_);
+    rightLayout->addLayout(valueLayout);
+
+    // Scan type
+    scanTypeCombo_ = new QComboBox;
+    scanTypeCombo_->setObjectName("scanComparison");
+    scanTypeCombo_->addItems({"Exact Value", "Bigger than...", "Smaller than...",
+        "Value between...", "Unknown initial value", "Increased value",
+        "Decreased value", "Changed value", "Unchanged value", "Same as first scan",
+        "Increased value by...", "Decreased value by..."});
+    rightLayout->addWidget(scanTypeCombo_);
+
+    // Reveal the second value box only for a "Value between..." scan, and grey out
+    // the value field(s) for compares that take no value (Unknown/Changed/
+    // Unchanged/Increased/Decreased/Same-as-first) so it's clear there is nothing
+    // to type, CE-style.
+    auto updateBetweenUi = [this]() {
+        ScanCompare cmp = mapScanType(scanTypeCombo_->currentIndex());
+        bool between = cmp == ScanCompare::Between;
+        betweenAndLabel_->setVisible(between);
+        scanValue2Edit_->setVisible(between);
+        bool takesValue = cmp == ScanCompare::Exact || cmp == ScanCompare::Greater ||
+                          cmp == ScanCompare::Less || cmp == ScanCompare::Between ||
+                          cmp == ScanCompare::IncreasedBy || cmp == ScanCompare::DecreasedBy;
+        scanValueEdit_->setEnabled(takesValue);
+        scanValue2Edit_->setEnabled(takesValue);
+        // Hex input only means something for integer-like values.
+        bool hexApplies = true;
+        if (valueTypeCombo_) {
+            const auto vt = mapValueType(valueTypeCombo_->currentIndex());
+            hexApplies = vt != ValueType::Float && vt != ValueType::Double && vt != ValueType::String &&
+                         vt != ValueType::UnicodeString && vt != ValueType::ByteArray && vt != ValueType::Binary;
+        }
+        hexCheck_->setEnabled(takesValue && hexApplies);
+    };
+    connect(scanTypeCombo_, &QComboBox::currentIndexChanged, this,
+        [updateBetweenUi](int) { updateBetweenUi(); });
+    updateBetweenUi();
+
+    // Value type
+    valueTypeCombo_ = new QComboBox;
+    valueTypeCombo_->setObjectName("scanValueType");
+    // Names match the cheat-table Type column / Change-address dialog (ce::valueTypeName)
+    // and CE, so a type reads the same in the scanner and the address list. mapValueType
+    // keys on the index, not the text, so the labels are free to be canonical.
+    valueTypeCombo_->addItems({"Byte", "2 Bytes", "4 Bytes", "8 Bytes", "Float", "Double", "String", "Unicode String", "Array of byte", "Binary", "All", "Pointer", "Grouped", "Custom"});
+    valueTypeCombo_->setCurrentIndex(2); // 4 Bytes default
+    rightLayout->addWidget(valueTypeCombo_);
+
+    auto* floatLayout = new QHBoxLayout;
+    floatRoundingCombo_ = new QComboBox;
+    floatRoundingCombo_->setObjectName("scanRounding");
+    floatRoundingCombo_->setToolTip("Exact uses stored precision. Rounded uses the precision of your input. Truncated compares integer parts. Extreme uses a tolerance.");
+    floatRoundingCombo_->addItems({"Exact", "Rounded", "Truncated", "Extreme"});
+    floatRoundingCombo_->setCurrentIndex(1);  // CE defaults float scans to Rounded
+    floatToleranceEdit_ = new QLineEdit;
+    floatToleranceEdit_->setObjectName("scanTolerance");
+    floatToleranceEdit_->setToolTip("Absolute difference allowed in Extreme mode. Leave blank or use 0 for automatic tolerance.");
+    floatToleranceEdit_->setPlaceholderText("Tolerance");
+    floatToleranceEdit_->setValidator(new QDoubleValidator(0.0, std::numeric_limits<double>::max(), 4096, floatToleranceEdit_));
+    if (double tolerance = QSettings().value("scan/floatTolerance", 0.0).toDouble(); tolerance > 0)
+        floatToleranceEdit_->setText(QString::number(tolerance, 'g', 12));
+    floatLayout->addWidget(floatRoundingCombo_);
+    floatLayout->addWidget(floatToleranceEdit_);
+    rightLayout->addLayout(floatLayout);
+    auto updateFloatOptions = [this]() {
+        auto vt = mapValueType(valueTypeCombo_->currentIndex());
+        bool isFloat = vt == ValueType::Float || vt == ValueType::Double || vt == ValueType::All;
+        // Hide (not just disable) the float-only rounding/tolerance controls for
+        // integer/text scans so the row collapses instead of leaving greyed
+        // clutter. Tolerance appears only for the "Extreme" rounding mode.
+        floatRoundingCombo_->setVisible(isFloat);
+        floatToleranceEdit_->setVisible(isFloat && floatRoundingCombo_->currentIndex() == 3);
+        // Type-aware placeholder to guide what to type (AOB wildcards, etc.).
+        const char* ph = "e.g. 100";
+        switch (vt) {
+            case ValueType::Float:
+            case ValueType::Double:        ph = "e.g. 3.14"; break;
+            case ValueType::String:
+            case ValueType::UnicodeString: ph = "text to find"; break;
+            case ValueType::ByteArray:     ph = "e.g. 48 8B ?? 05"; break;
+            case ValueType::Binary:        ph = "e.g. 0110??01"; break;
+            case ValueType::Pointer:       ph = "e.g. 0x7fabc000"; break;
+            default:                       ph = "e.g. 100"; break;
+        }
+        scanValueEdit_->setPlaceholderText(ph);
+    };
+    connect(valueTypeCombo_, &QComboBox::currentIndexChanged, this,
+        [updateFloatOptions, updateBetweenUi](int) { updateFloatOptions(); updateBetweenUi(); });
+    connect(floatRoundingCombo_, &QComboBox::currentIndexChanged, this,
+        [updateFloatOptions](int) { updateFloatOptions(); });
+    updateFloatOptions();
+
+    // Buttons
+    auto* btnLayout = new QHBoxLayout;
+    firstScanBtn_ = new QPushButton("First Scan");
+    // Accent "primary action" styling comes from the theme (QPushButton#primaryButton).
+    firstScanBtn_->setObjectName("primaryButton");
+    nextScanBtn_ = new QPushButton("Next Scan");
+    nextScanBtn_->setObjectName("nextScanButton");
+    nextScanBtn_->setEnabled(false);
+    undoScanBtn_ = new QPushButton("Undo Scan");
+    undoScanBtn_->setEnabled(false);
+    connect(firstScanBtn_, &QPushButton::clicked, this, &MainWindow::onFirstScan);
+    connect(nextScanBtn_, &QPushButton::clicked, this, &MainWindow::onNextScan);
+    connect(undoScanBtn_, &QPushButton::clicked, this, &MainWindow::onUndoScan);
+    // Enter in the value field scans (CE-style): Next Scan when one is in progress,
+    // otherwise First Scan. Same for the second ("between") value box.
+    auto scanOnEnter = [this]() {
+        if (nextScanBtn_->isEnabled()) onNextScan();
+        else if (firstScanBtn_->isEnabled()) onFirstScan();
+    };
+    connect(scanValueEdit_, &QLineEdit::returnPressed, this, scanOnEnter);
+    connect(scanValue2Edit_, &QLineEdit::returnPressed, this, scanOnEnter);
+    btnLayout->addWidget(firstScanBtn_);
+    btnLayout->addWidget(nextScanBtn_);
+    rightLayout->addLayout(btnLayout);
+    rightLayout->addWidget(undoScanBtn_);
+
+    // Scan options group
+    auto* optGroup = new QGroupBox("Memory Scan Options");
+    auto* optLayout = new QGridLayout(optGroup);
+    optLayout->addWidget(new QLabel("From:"), 0, 0);
+    fromAddressEdit_ = new QLineEdit("0000000000");
+    fromAddressEdit_->setObjectName("scanFrom");
+    fromAddressEdit_->setFont(monospaceFont());
+    optLayout->addWidget(fromAddressEdit_, 0, 1);
+    optLayout->addWidget(new QLabel("To:"), 1, 0);
+    toAddressEdit_ = new QLineEdit(QString::number(UINTPTR_MAX,16));
+    toAddressEdit_->setObjectName("scanTo");
+    toAddressEdit_->setFont(monospaceFont());
+    optLayout->addWidget(toAddressEdit_, 1, 1);
+    // Tri-state like CE: checked = must have the protection, unchecked = must NOT,
+    // partial (grey) = don't care. Writable defaults to "must" (values live in
+    // writable memory); Executable defaults to "don't care".
+    writableCheck_ = new QCheckBox("Writable");
+    writableCheck_->setTristate(true);
+    writableCheck_->setCheckState(Qt::Checked);
+    writableCheck_->setToolTip("Checked: only writable regions. Unchecked: only "
+                               "non-writable. Grey: any (don't care).");
+    optLayout->addWidget(writableCheck_, 2, 0, 1, 2);
+    executableCheck_ = new QCheckBox("Executable");
+    executableCheck_->setTristate(true);
+    executableCheck_->setCheckState(Qt::PartiallyChecked);
+    executableCheck_->setToolTip("Checked: only executable regions. Unchecked: only "
+                                 "non-executable. Grey: any (don't care).");
+    optLayout->addWidget(executableCheck_, 3, 0, 1, 2);
+    fastScanCheck_ = new QCheckBox("Fast Scan");
+    fastScanCheck_->setChecked(true);
+    optLayout->addWidget(fastScanCheck_, 4, 0);
+    alignEdit_ = new QLineEdit("4");
+    alignEdit_->setFixedWidth(42);
+    optLayout->addWidget(alignEdit_, 4, 1);
+    // The alignment field only applies when Fast Scan is on; grey it out otherwise.
+    connect(fastScanCheck_, &QCheckBox::toggled, alignEdit_, &QLineEdit::setEnabled);
+
+    // Apply the persisted scan defaults from the Settings dialog (previously these
+    // were saved but never used). Writable/Executable store a bool "only-<prot>":
+    // true -> require it (checked), false -> don't care (grey); the tri-state's
+    // "exclude" (unchecked) isn't a default the settings can express.
+    {
+        QSettings s;
+        writableCheck_->setCheckState(s.value("scan/writable", true).toBool()
+                                      ? Qt::Checked : Qt::PartiallyChecked);
+        executableCheck_->setCheckState(s.value("scan/executable", false).toBool()
+                                        ? Qt::Checked : Qt::PartiallyChecked);
+        fastScanCheck_->setChecked(s.value("scan/fast", true).toBool());
+        alignEdit_->setText(QString::number(s.value("scan/alignment", 4).toInt()));
+        alignEdit_->setEnabled(fastScanCheck_->isChecked());
+        // The Settings dialog's default-type combo is shorter than the scanner's
+        // (it omits Unicode String/Binary/All/Grouped/Custom), so its index must
+        // be mapped, not applied raw: e.g. its "Array of byte" (7) and "Pointer"
+        // (8) are scanner indices 8 and 11.
+        int dvt = s.value("scan/defaultValueType", 2).toInt();
+        static const int kSettingsToScanner[] = {0, 1, 2, 3, 4, 5, 6, 8, 11};
+        constexpr int kMapSize = (int)(sizeof(kSettingsToScanner) / sizeof(kSettingsToScanner[0]));
+        if (dvt >= 0 && dvt < kMapSize && kSettingsToScanner[dvt] < valueTypeCombo_->count())
+            valueTypeCombo_->setCurrentIndex(kSettingsToScanner[dvt]);
+    }
+
+    percentCheck_ = new QCheckBox("Compare by %");
+    optLayout->addWidget(percentCheck_, 5, 0);
+    percentValueEdit_ = new QLineEdit("10");
+    percentValueEdit_->setFixedWidth(68);
+    percentValueEdit_->setEnabled(false);
+    percentValueEdit_->setValidator(new QDoubleValidator(0.0, 1000000.0, 4, percentValueEdit_));
+    optLayout->addWidget(percentValueEdit_, 5, 1);
+
+    auto* percent2Label = new QLabel("Percent max:");
+    optLayout->addWidget(percent2Label, 6, 0);
+    percentValue2Edit_ = new QLineEdit("20");
+    percentValue2Edit_->setFixedWidth(68);
+    percentValue2Edit_->setEnabled(false);
+    percentValue2Edit_->setValidator(new QDoubleValidator(0.0, 1000000.0, 4, percentValue2Edit_));
+    optLayout->addWidget(percentValue2Edit_, 6, 1);
+
+    caseSensitiveCheck_ = new QCheckBox("Case sensitive (text)");
+    caseSensitiveCheck_->setChecked(true);   // string scans default to case-sensitive
+    optLayout->addWidget(caseSensitiveCheck_, 8, 0, 1, 2);
+
+    // Region-type filters (CE's "Memory Scan Options": MEM_PRIVATE / MEM_IMAGE /
+    // MEM_MAPPED). All on = scan everything (the default). Turning one off skips that
+    // class of memory: Private = anonymous heap/stack, Image = loaded ELF modules,
+    // Mapped = other file-backed maps. Backed by ScanConfig::scan{Private,Image,Mapped}.
+    {
+        QSettings s;
+        auto* memRow = new QWidget;
+        auto* memLayout = new QHBoxLayout(memRow);
+        memLayout->setContentsMargins(0, 0, 0, 0);
+        memPrivateCheck_ = new QCheckBox("Private");
+        memPrivateCheck_->setToolTip("Scan MEM_PRIVATE regions (anonymous heap, stack, private maps)");
+        memPrivateCheck_->setChecked(s.value("scan/memPrivate", true).toBool());
+        memImageCheck_ = new QCheckBox("Image");
+        memImageCheck_->setToolTip("Scan MEM_IMAGE regions (loaded executable modules)");
+        memImageCheck_->setChecked(s.value("scan/memImage", true).toBool());
+        memMappedCheck_ = new QCheckBox("Mapped");
+        memMappedCheck_->setToolTip("Scan MEM_MAPPED regions (other file-backed maps)");
+        memMappedCheck_->setChecked(s.value("scan/memMapped", true).toBool());
+        memLayout->addWidget(memPrivateCheck_);
+        memLayout->addWidget(memImageCheck_);
+        memLayout->addWidget(memMappedCheck_);
+        memLayout->addStretch();
+        optLayout->addWidget(memRow, 9, 0, 1, 2);
+        // Persist each toggle so the filter survives a restart (session preference).
+        auto persist = [](const char* key, QCheckBox* box) {
+            connect(box, &QCheckBox::toggled, box, [key](bool on) {
+                QSettings s; s.setValue(key, on);
+            });
+        };
+        persist("scan/memPrivate", memPrivateCheck_);
+        persist("scan/memImage", memImageCheck_);
+        persist("scan/memMapped", memMappedCheck_);
+    }
+
+    auto* textEncodingLabel = new QLabel("Text encoding:");
+    optLayout->addWidget(textEncodingLabel, 7, 0);
+    stringEncodingCombo_ = new QComboBox;
+    stringEncodingCombo_->addItems({"UTF-8", "ISO-8859-1", "CP1252"});
+    optLayout->addWidget(stringEncodingCombo_, 7, 1);
+
+    auto* orderLabel = new QLabel("Data order:");
+    scanByteOrderCombo_ = new QComboBox;
+    scanByteOrderCombo_->setObjectName("scanByteOrder");
+    scanByteOrderCombo_->addItem("Auto (target)", static_cast<int>(ce::ByteOrder::Unknown));
+    scanByteOrderCombo_->addItem("Little-endian", static_cast<int>(ce::ByteOrder::Little));
+    scanByteOrderCombo_->addItem("Big-endian", static_cast<int>(ce::ByteOrder::Big));
+    scanByteOrderCombo_->setToolTip("Choose the encoding of the data being scanned. Auto uses the selected target's data order.");
+    orderLabel->setBuddy(scanByteOrderCombo_);
+    optLayout->addWidget(orderLabel, 10, 0);
+    optLayout->addWidget(scanByteOrderCombo_, 10, 1);
+    auto* widthLabel = new QLabel("Pointer size:");
+    scanPointerWidthCombo_ = new QComboBox;
+    scanPointerWidthCombo_->setObjectName("scanPointerWidth");
+    scanPointerWidthCombo_->addItem("Auto (target)", 0);
+    scanPointerWidthCombo_->addItem("4 bytes", 4);
+    scanPointerWidthCombo_->addItem("8 bytes", 8);
+    scanPointerWidthCombo_->setToolTip("Size of encoded pointers for Pointer, Grouped and Custom scans. A different saved record size requires a New Scan.");
+    widthLabel->setBuddy(scanPointerWidthCombo_);
+    optLayout->addWidget(widthLabel, 11, 0);
+    optLayout->addWidget(scanPointerWidthCombo_, 11, 1);
+    auto updateDataFormatUi = [this, orderLabel, widthLabel] {
+        const auto type = mapValueType(valueTypeCombo_->currentIndex());
+        const bool order = type != ValueType::Byte && type != ValueType::String &&
+            type != ValueType::ByteArray && type != ValueType::Binary;
+        const bool width = type == ValueType::Pointer || type == ValueType::Grouped || type == ValueType::Custom;
+        orderLabel->setVisible(order); scanByteOrderCombo_->setVisible(order);
+        widthLabel->setVisible(width); scanPointerWidthCombo_->setVisible(width);
+    };
+    connect(valueTypeCombo_, &QComboBox::currentIndexChanged, this,
+        [updateDataFormatUi](int) { updateDataFormatUi(); });
+    updateDataFormatUi();
+
+    auto updatePercentUi = [this, percent2Label]() {
+        bool enabled = percentCheck_->isChecked();
+        bool needsUpper = enabled && mapScanType(scanTypeCombo_->currentIndex()) == ScanCompare::Between;
+        // Hide (not just grey) the percent value fields until "Compare by %" is on,
+        // and the "Percent max" row until the scan is a "between" compare, so the
+        // options group collapses instead of showing dead controls. Keep enabled
+        // in sync with visible (the fields start disabled).
+        percentValueEdit_->setVisible(enabled);
+        percentValueEdit_->setEnabled(enabled);
+        percent2Label->setVisible(needsUpper);
+        percentValue2Edit_->setVisible(needsUpper);
+        percentValue2Edit_->setEnabled(needsUpper);
+    };
+    connect(percentCheck_, &QCheckBox::toggled, this, [updatePercentUi](bool) { updatePercentUi(); });
+    connect(scanTypeCombo_, &QComboBox::currentIndexChanged, this,
+        [updatePercentUi](int) { updatePercentUi(); });
+    updatePercentUi();
+    rightLayout->addWidget(optGroup);
+
+    progressBar_ = new QProgressBar;
+    progressBar_->setMaximum(100);
+    progressBar_->setValue(0);
+    progressBar_->setVisible(false);
+    rightLayout->addWidget(progressBar_);
+
+    rightLayout->addStretch();
+
+    topSplitter->addWidget(leftPanel);
+    topSplitter->addWidget(rightPanel);
+    topSplitter->setStretchFactor(0, 2);
+    topSplitter->setStretchFactor(1, 1);
+
+    // ── Bottom: address list ──
+    addressListModel_ = new AddressListModel(this);
+    addressListModel_->setAutoAssembler(&autoAsm_);
+    // Resolve record address expressions through the app-wide symbol table, so a label
+    // set in the Memory Viewer (or a module export) works as a record address.
+    addressListModel_->setSymbolResolver(&luaResolver_);
+    addressListModel_->setBeforeAaExecute([this]() { stopCodeFindersForInjection(); });
+    // Let inline Address-column edits accept the full expression syntax.
+    addressListModel_->setAddressResolver([this](const QString& t) { return parseAddressExpr(t); });
+    addressListModel_->setActivationErrorCallback([this](const QString& title, const QString& message) {
+        QMessageBox::warning(this, title, message);
+    });
+    luaEngine_.setAddressList(addressListModel_);
+    registerLuaGuiBindings(luaEngine_.state());
+    setLuaMainForm(this);
+    // Run the user's autorun/ Lua scripts (CE autorun/) once the window is fully up.
+    QTimer::singleShot(0, this, [this]() { runAutorunScripts(); });
+    addressListView_ = new QTableView;
+    addressListView_->setModel(addressListModel_);
+    addressListView_->setAlternatingRowColors(true);   // activates the theme's zebra rows
+    // Centered hint over the empty cheat table (matches the results-list hint).
+    tableEmptyHint_ = new QLabel(
+        tr("No saved addresses.\nDouble-click a result or use Add Address."),
+        addressListView_->viewport());
+    tableEmptyHint_->setAlignment(Qt::AlignCenter);
+    tableEmptyHint_->setProperty("secondary", true);
+    tableEmptyHint_->setWordWrap(true);
+    tableEmptyHint_->setAttribute(Qt::WA_TransparentForMouseEvents);
+    addressListView_->viewport()->installEventFilter(this);
+    auto updateTableHint = [this]() {
+        if (!tableEmptyHint_) return;
+        tableEmptyHint_->setGeometry(addressListView_->viewport()->rect());
+        tableEmptyHint_->setVisible(addressListModel_->rowCount() == 0);
+    };
+    connect(addressListModel_, &QAbstractItemModel::modelReset, this, updateTableHint);
+    connect(addressListModel_, &QAbstractItemModel::rowsInserted, this, updateTableHint);
+    connect(addressListModel_, &QAbstractItemModel::rowsRemoved, this, updateTableHint);
+    // Row visibility (collapsed groups) is a view property that a model reset or a
+    // structural change clears, so re-hide the collapsed children whenever that happens.
+    // Inserts and removals rebuild it once per burst (scheduleAddressListRefresh).
+    connect(addressListModel_, &QAbstractItemModel::modelReset, this, &MainWindow::reapplyGroupCollapse);
+    connect(addressListModel_, &QAbstractItemModel::layoutChanged, this, &MainWindow::reapplyGroupCollapse);
+    // Surface a reverted (protected) manual edit as a status-bar hint toward
+    // find-what-writes, so "my edit doesn't stick" has an explanation.
+    connect(addressListModel_, &AddressListModel::valueReverted, this,
+        [this](uintptr_t addr, const QString& wrote, const QString& now) {
+            statusBar()->showMessage(
+                QString("Value at 0x%1 was reverted (wrote %2, now %3). It looks protected: "
+                        "right-click the entry and choose \"Find what writes\" to locate the "
+                        "code that overwrites it.").arg(addr, 0, 16).arg(wrote).arg(now), 9000);
+        });
+    updateTableHint();
+    // System-wide hotkeys (X11): fire while the game is focused, like CE. The
+    // dispatch map is keyed by the id we hand registerHotkey in rebuildValueHotkeys.
+    globalHotkeys_ = new GlobalHotkeyManager(this);
+    connect(globalHotkeys_, &GlobalHotkeyManager::activated, this, [this](int id, bool autoRepeat) {
+        auto it = hotkeyActions_.find(id);
+        if (it == hotkeyActions_.end() || (autoRepeat && !it->repeats)) return;
+        const auto run = it->run;   // the action may rebuild the hotkeys
+        run();
+    });
+
+    connect(addressListModel_, &QAbstractItemModel::modelReset, this, &MainWindow::rebuildValueHotkeys);
+    connect(addressListModel_, &QAbstractItemModel::rowsInserted, this, &MainWindow::scheduleAddressListRefresh);
+    connect(addressListModel_, &QAbstractItemModel::rowsRemoved, this, &MainWindow::scheduleAddressListRefresh);
+    addressListView_->setSelectionBehavior(QAbstractItemView::SelectRows);
+    addressListView_->setFont(settingsMonospaceFont());
+    addressListView_->verticalHeader()->setVisible(false);
+    auto* addressHeader = addressListView_->horizontalHeader();
+    addressHeader->setDefaultAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    addressHeader->setHighlightSections(false);
+    addressListView_->setShowGrid(false);
+    addressHeader->setMinimumSectionSize(48);
+    addressHeader->setSectionResizeMode(0, QHeaderView::Fixed);
+    addressHeader->resizeSection(0, 62);
+    addressHeader->setSectionResizeMode(1, QHeaderView::Stretch);
+    addressHeader->setSectionResizeMode(2, QHeaderView::Interactive);
+    addressHeader->resizeSection(2, QFontMetrics(addressListView_->font()).horizontalAdvance("GameAssembly.so+0x123456") + 18);
+    addressHeader->setSectionResizeMode(3, QHeaderView::ResizeToContents);
+    addressHeader->setSectionResizeMode(4, QHeaderView::ResizeToContents);
+    addressListView_->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    // Drag-and-drop reordering (CE): drag an entry to move it; the model's dropMimeData
+    // does the reorder (a group header carries its children) and the view must not do
+    // its own row removal, so the model returns false from dropMimeData.
+    addressListView_->setDragEnabled(true);
+    addressListView_->setAcceptDrops(true);
+    addressListView_->setDropIndicatorShown(true);
+    addressListView_->setDragDropMode(QAbstractItemView::InternalMove);
+    addressListView_->setDefaultDropAction(Qt::MoveAction);
+    // Double-clicking a script entry's Address/Type/Value cell (which carry no
+    // editable data for a script) opens the auto-assembler editor for it. The
+    // Description cell still edits inline.
+    connect(addressListView_, &QAbstractItemView::doubleClicked, this,
+            [this](const QModelIndex& idx) {
+        if (!idx.isValid()) return;
+        // Double-clicking a group header (outside its editable Description) collapses or
+        // expands it, hiding/showing its children like a CE tree node.
+        if (idx.column() != 1 && addressListModel_->toggleGroupCollapse(idx.row())) {
+            reapplyGroupCollapse();
+            return;
+        }
+        if (idx.column() != 1 && addressListModel_->isScriptEntry(idx.row())) {
+            editScriptEntry(idx.row());
+            return;
+        }
+        // CE: double-clicking the Address cell browses that address in the Memory
+        // Viewer, focusing the disassembler for code or the hex dump for data
+        // (Shift forces the disassembler, Ctrl forces the hex dump).
+        if (idx.column() == 2) {
+            const int row = idx.row();
+            const auto& ents = addressListModel_->entries();
+            if (row < 0 || row >= (int)ents.size()) return;
+            const auto& e = ents[row];
+            if (e.isGroup || addressListModel_->isScriptEntry(row) || e.address == 0) return;
+            auto* mv = openMemoryView(e.address);
+            if (!mv) return;
+            bool exec = false;
+            if (process_) {
+                if (auto rg = process_->queryRegion(e.address))
+                    exec = (rg->protection & ce::MemProt::Exec);
+            }
+            const auto mods = QApplication::keyboardModifiers();
+            const auto pane = ce::chooseMemViewPane(exec, mods & Qt::ShiftModifier,
+                                                    mods & Qt::ControlModifier);
+            mv->focusPane(pane == ce::MemViewPane::Disassembler
+                              ? MemoryBrowser::Pane::Disassembler
+                              : MemoryBrowser::Pane::HexDump);
+        }
+    });
+    addressListView_->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(addressListView_, &QWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
+        QMenu menu;
+        // Persistent indexes: the menu and the dialogs its actions open run
+        // event loops in which table scripts and timers can add, remove or
+        // move records. A persistent index follows its record (or becomes
+        // invalid, row -1), so an action never lands on another record.
+        QList<QPersistentModelIndex> selected;
+        for (const auto& index : addressListView_->selectionModel()->selectedRows()) selected.push_back(index);
+
+        if (!selected.isEmpty()) {
+            const QPersistentModelIndex first = selected.first();
+            int firstRow = first.row();
+            const auto& ents0 = addressListModel_->entries();
+            // "Edit script..." for a single auto-assembler entry — it has no
+            // address to edit, so this opens the script in the AA editor.
+            if (selected.size() == 1 && addressListModel_->isScriptEntry(firstRow)) {
+                menu.addAction("Edit script...", [this, first]() { if (first.row() >= 0) editScriptEntry(first.row()); });
+                menu.addSeparator();
+            } else if (selected.size() == 1 && firstRow < (int)addressListModel_->entries().size()
+                       && !addressListModel_->entries()[firstRow].isGroup) {
+                // CE "Change address" (formAddressChangeUnit): edit address/type/flags.
+                menu.addAction("Change address...", [this, first]() {
+                    const int firstRow = first.row();
+                    if (firstRow < 0 || firstRow >= (int)addressListModel_->entries().size()) return;
+                    // The dialog's event loop runs table scripts that can add or
+                    // remove records: take the ID now, never a reference or row.
+                    const auto& e = addressListModel_->entries()[firstRow];
+                    const int id = e.id;
+                    QString addrStr = !e.addressExpr.isEmpty()
+                        ? e.addressExpr : QString("0x%1").arg((qulonglong)e.address, 0, 16);
+                    ce::gui::ChangeAddressDialog dlg(addrStr, e.type, e.showAsHex,
+                                                     (int)e.byteCount, this, e.showAsSigned,
+                                                     process_.get());
+                    openAddressDialog_ = &dlg;
+                    if (dlg.exec() != QDialog::Accepted) return;
+                    if (addressListModel_->rowOfId(id) < 0) return;   // deleted meanwhile
+                    const QString a = dlg.address();
+                    bool numeric = false;
+                    qulonglong v = a.toULongLong(&numeric, 16);
+                    if (numeric && !a.contains('[') && !a.contains('+') && !a.contains(' '))
+                        addressListModel_->setAddress(id, (uintptr_t)v);
+                    else
+                        addressListModel_->setAddressExpression(id, a.toStdString());
+                    const ce::ValueType nt = dlg.valueType();
+                    addressListModel_->setType(id, nt);
+                    addressListModel_->setHexView(id, dlg.showHex());
+                    addressListModel_->setSigned(id, dlg.isSigned());
+                    // Length applies to String / Array of byte (and Unicode strings).
+                    if (nt == ce::ValueType::String || nt == ce::ValueType::UnicodeString ||
+                        nt == ce::ValueType::ByteArray)
+                        addressListModel_->setByteCount(id, (std::size_t)dlg.length());
+                });
+                menu.addSeparator();
+            }
+
+            // CE PopupMenu2: Cut / Copy / Paste (PasteTableentryFRM).
+            menu.addAction("Cut", this, [this]() { onCopyAddresses(); onDeleteAddresses(); }, QKeySequence::Cut);
+            menu.addAction("Copy", this, &MainWindow::onCopyAddresses, QKeySequence::Copy);
+            // The same paste as Ctrl+V: every field, groups, scripts and CE XML.
+            menu.addAction("Paste", this, &MainWindow::onPasteAddresses, QKeySequence::Paste);
+            // Copy an individual field of the first selected entry to the clipboard.
+            if (firstRow >= 0 && firstRow < (int)ents0.size()) {
+                const auto& fe = ents0[firstRow];
+                auto* copyMenu = menu.addMenu("Copy field");
+                copyMenu->addAction("Description", [fe]() {
+                    QApplication::clipboard()->setText(fe.description);
+                });
+                if (!fe.isGroup && fe.autoAsmScript.isEmpty()) {
+                    copyMenu->addAction("Address", [fe]() {
+                        QApplication::clipboard()->setText(
+                            fe.addressExpr.isEmpty() ? QString("0x%1").arg(fe.address, 0, 16)
+                                                     : fe.addressExpr);
+                    });
+                    copyMenu->addAction("Value", [fe]() {
+                        QApplication::clipboard()->setText(fe.currentValue);
+                    });
+                }
+                if (!fe.autoAsmScript.isEmpty())
+                    copyMenu->addAction("Script", [fe]() {
+                        QApplication::clipboard()->setText(fe.autoAsmScript);
+                    });
+            }
+            menu.addAction("Delete", this, &MainWindow::onDeleteAddresses, QKeySequence::Delete);
+
+            menu.addSeparator();
+            // Rarely used items sit in submenus so the menu stays one column at
+            // large text sizes (it wrapped into two at 130 DPI).
+            QMenu* arrangeMenu = menu.addMenu("Arrange");
+            arrangeMenu->addAction("Indent", [this, selected]() {
+                QList<int> rows;
+                for (const auto& idx : selected) if (idx.row() >= 0) rows.append(idx.row());
+                addressListModel_->indentRows(rows);
+            });
+            arrangeMenu->addAction("Outdent", [this, selected]() {
+                QList<int> rows;
+                for (const auto& idx : selected) if (idx.row() >= 0) rows.append(idx.row());
+                addressListModel_->outdentRows(rows);
+            });
+            // CE "Add the selected records to a new group": wrap the selection under a
+            // fresh group header (prompts for its name, like CE's group description).
+            arrangeMenu->addAction("Add to new group...", [this, selected]() {
+                QList<int> rows;
+                for (const auto& idx : selected) if (idx.row() >= 0) rows.append(idx.row());
+                if (rows.isEmpty()) return;
+                bool ok = false;
+                QString name = QInputDialog::getText(this, "New group",
+                    "Group name:", QLineEdit::Normal, "New group", &ok);
+                if (!ok) return;
+                if (name.isEmpty()) name = "New group";
+                addressListModel_->groupSelectedRows(rows, name);
+            });
+            if (selected.size() == 1) {
+                auto* up = arrangeMenu->addAction("Move Up", [this, first]() { if (first.row() >= 0) moveSelectedEntry(first.row(), -1); });
+                up->setShortcut(QKeySequence("Ctrl+Up"));
+                auto* down = arrangeMenu->addAction("Move Down", [this, first]() { if (first.row() >= 0) moveSelectedEntry(first.row(), +1); });
+                down->setShortcut(QKeySequence("Ctrl+Down"));
+            }
+
+            menu.addSeparator();
+            // Set the value of ALL selected entries at once (CE's batch set value).
+            menu.addAction("Set value...", [this, selected]() {
+                // Pre-fill with the first selected entry's current value (in its display
+                // format), like CE, so the user edits from the existing value not a blank.
+                QString initial;
+                const auto& ents = addressListModel_->entries();
+                for (const auto& idx : selected) {
+                    int r = idx.row();
+                    if (r >= 0 && r < (int)ents.size() && !ents[r].isGroup) {
+                        const QString& cv = ents[r].currentValue;
+                        if (cv != "?" && cv != "??") initial = cv;
+                        break;
+                    }
+                }
+                bool ok = false;
+                QString v = QInputDialog::getText(this, "Set value",
+                    QString("New value for %1 selected entr%2:")
+                        .arg(selected.size()).arg(selected.size() == 1 ? "y" : "ies"),
+                    QLineEdit::Normal, initial, &ok);
+                if (!ok) return;
+                // A group header has no value of its own, so setting a group applies the
+                // value to its child entries recursively (CE moRecursiveSetValue). A set
+                // dedupes when a group and its child are both selected.
+                std::vector<int> indents;
+                indents.reserve(ents.size());
+                for (const auto& e : ents) indents.push_back(e.indent);
+                std::set<int> targets;
+                for (const auto& idx : selected) {
+                    int r = idx.row();
+                    if (r < 0 || r >= (int)ents.size()) continue;
+                    if (ents[r].isGroup) {
+                        auto [b, en] = ce::descendantRange(indents, (size_t)r);
+                        for (size_t i = b; i < en; ++i)
+                            if (!ents[i].isGroup) targets.insert((int)i);
+                    } else {
+                        targets.insert(r);
+                    }
+                }
+                for (int r : targets)
+                    addressListModel_->setEntryValueTo(r, v);
+            });
+
+            menu.addSeparator();
+            auto* freezeMenu = menu.addMenu("Freeze Mode");
+            freezeMenu->addAction("Normal", [this, selected]() {
+                for (auto& idx : selected) addressListModel_->setFreezeMode(idx.row(), FreezeMode::Normal);
+            });
+            freezeMenu->addAction("Increase Only", [this, selected]() {
+                for (auto& idx : selected) addressListModel_->setFreezeMode(idx.row(), FreezeMode::IncreaseOnly);
+            });
+            freezeMenu->addAction("Decrease Only", [this, selected]() {
+                for (auto& idx : selected) addressListModel_->setFreezeMode(idx.row(), FreezeMode::DecreaseOnly);
+            });
+            freezeMenu->addAction("Never Increase", [this, selected]() {
+                for (auto& idx : selected) addressListModel_->setFreezeMode(idx.row(), FreezeMode::NeverIncrease);
+            });
+            freezeMenu->addAction("Never Decrease", [this, selected]() {
+                for (auto& idx : selected) addressListModel_->setFreezeMode(idx.row(), FreezeMode::NeverDecrease);
+            });
+
+            // Obfuscated values: declare a codec so the value is displayed decoded and
+            // edited/frozen by its logical value (block 6). Reuses ce::ValueCodec::parse.
+            // How the entry is shown and decoded: format, colour, dropdown, codec.
+            QMenu* encodingMenu = menu.addMenu("Display");
+            encodingMenu->addAction("Set value codec...", [this, selected]() {
+                if (selected.isEmpty() || selected.first().row() < 0) return;
+                QString cur = QString::fromStdString(
+                    addressListModel_->entryCodecSpec(selected.first().row()));
+                bool ok = false;
+                QString spec = QInputDialog::getText(this, "Value codec",
+                    "How the game obfuscates this value in memory:\n"
+                    "none, xor:0xKEY, add:N, rol:N or ror:N (e.g. xor:0x5A).\n\n"
+                    "The list shows the decoded value; edits and freezes are encoded back.",
+                    QLineEdit::Normal, cur, &ok);
+                if (!ok) return;
+                spec = spec.trimmed();
+                ce::ValueCodec codec;   // default: none
+                if (!spec.isEmpty() && spec.compare("none", Qt::CaseInsensitive) != 0) {
+                    auto c = ce::ValueCodec::parse(spec.toStdString());
+                    if (!c) {
+                        QMessageBox::warning(this, "Invalid codec",
+                            "Use none, xor:0xKEY, add:N, rol:N, or ror:N.");
+                        return;
+                    }
+                    codec = *c;
+                }
+                for (auto& idx : selected) addressListModel_->setEntryCodec(idx.row(), codec);
+            });
+
+            auto* orderMenu = encodingMenu->addMenu("Data order");
+            for (auto choice : {std::pair{"Auto (target)", ByteOrder::Unknown},
+                                std::pair{"Little-endian", ByteOrder::Little},
+                                std::pair{"Big-endian", ByteOrder::Big}}) {
+                auto* action = orderMenu->addAction(choice.first);
+                action->setCheckable(true);
+                const auto& entry = addressListModel_->entries()[selected.first().row()];
+                action->setChecked(entry.dataByteOrder == choice.second);
+                connect(action, &QAction::triggered, this, [this, selected, order=choice.second] {
+                    for (auto& index : selected) {
+                        if (index.row() < 0) continue;
+                        const auto width = addressListModel_->entries()[index.row()].pointerWidth;
+                        addressListModel_->setEntryDataFormat(index.row(), order, width);
+                    }
+                });
+            }
+            auto* widthMenu = encodingMenu->addMenu("Pointer size");
+            for (auto choice : {std::pair{"Auto (target)", 0}, std::pair{"4 bytes", 4}, std::pair{"8 bytes", 8}}) {
+                auto* action = widthMenu->addAction(choice.first); action->setCheckable(true);
+                action->setChecked(addressListModel_->entries()[selected.first().row()].pointerWidth == choice.second);
+                connect(action, &QAction::triggered, this, [this, selected, width=choice.second] {
+                    for (auto& index : selected) {
+                        if (index.row() < 0) continue;
+                        const auto order = addressListModel_->entries()[index.row()].dataByteOrder;
+                        addressListModel_->setEntryDataFormat(index.row(), order, width);
+                    }
+                });
+            }
+
+            menu.addSeparator();
+            auto* typeMenu = menu.addMenu("Change type");
+            const std::pair<const char*, ValueType> typeChoices[] = {
+                {"Byte", ValueType::Byte}, {"2 Bytes", ValueType::Int16},
+                {"4 Bytes", ValueType::Int32}, {"8 Bytes", ValueType::Int64},
+                {"Float", ValueType::Float}, {"Double", ValueType::Double},
+                {"Pointer", ValueType::Pointer},
+            };
+            for (const auto& [label, vt] : typeChoices) {
+                typeMenu->addAction(label, [this, selected, vt]() {
+                    for (auto& idx : selected) addressListModel_->setEntryType(idx.row(), vt);
+                });
+            }
+
+            menu.addSeparator();
+            // Toggle hex display: reflect the first selected row's current state.
+            const auto& ents = addressListModel_->entries();
+            bool firstHex = !selected.isEmpty() && selected.first().row() < (int)ents.size()
+                            && ents[selected.first().row()].showAsHex;
+            encodingMenu->addSeparator();
+            auto* hexAct = encodingMenu->addAction("Show as hexadecimal");
+            hexAct->setCheckable(true);
+            hexAct->setChecked(firstHex);
+            connect(hexAct, &QAction::triggered, this, [this, selected, firstHex]() {
+                for (auto& idx : selected) addressListModel_->setShowAsHex(idx.row(), !firstHex);
+            });
+
+            // Static-address durability: rewrite a raw scanned address as
+            // "module+0xoffset" so a saved table survives the module rebasing
+            // (PIE/ASLR) on the next launch. Only meaningful with a process attached
+            // (module bases known); leaves pointer/expression records untouched.
+            if (process_) {
+                menu.addAction("Convert to module+offset", [this, selected]() {
+                    if (!process_) return;
+                    const auto modules = process_->modules();   // by value: hold it, don't dangle
+                    const auto& entries = addressListModel_->entries();
+                    int converted = 0, skipped = 0;
+                    for (const auto& idx : selected) {
+                        int row = idx.row();
+                        if (row < 0 || row >= (int)entries.size()) continue;
+                        const auto& e = entries[row];
+                        if (e.isGroup || !e.autoAsmScript.isEmpty()) continue;
+                        if (!e.addressExpr.isEmpty()) { ++skipped; continue; } // already symbolic
+                        std::string expr = ce::moduleOffsetString(modules, e.address);
+                        if (expr.empty()) { ++skipped; continue; }             // not inside a module
+                        addressListModel_->setAddressExpression(e.id, expr);
+                        ++converted;
+                    }
+                    statusBar()->showMessage(
+                        QString("Converted %1 address%2 to module+offset%3")
+                            .arg(converted).arg(converted == 1 ? "" : "es")
+                            .arg(skipped ? QString(" (%1 skipped)").arg(skipped) : QString()), 4000);
+                });
+            }
+
+            // Open the memory browser at this entry's exact address (CE's
+            // "Browse this memory region"). Skipped for script/group rows, which
+            // have no address.
+            if (firstRow >= 0 && firstRow < (int)ents0.size()
+                && !ents0[firstRow].isGroup && ents0[firstRow].autoAsmScript.isEmpty()) {
+                menu.addAction("Browse this memory region", [this, selected]() {
+                    if (!process_ || selected.isEmpty()) return;
+                    auto& entries = addressListModel_->entries();
+                    int row = selected.first().row();
+                    if (row >= 0 && row < (int)entries.size())
+                        openMemoryView(entries[row].address);   // full-featured viewer
+                });
+            }
+            menu.addAction("Find what accesses this address", [this, selected]() {
+                if (!selected.isEmpty())
+                    startCodeFinder(selected.first().row(), false);
+            });
+            menu.addAction("Find what writes to this address", [this, selected]() {
+                if (!selected.isEmpty())
+                    startCodeFinder(selected.first().row(), true);
+            });
+            // CE "Pointer scan for this address".
+            if (firstRow >= 0 && firstRow < (int)ents0.size()
+                && !ents0[firstRow].isGroup && ents0[firstRow].autoAsmScript.isEmpty()) {
+                menu.addAction("Pointer scan for this address", [this, selected]() {
+                    if (!process_ || selected.isEmpty()) return;
+                    const int row = selected.first().row();
+                    const auto& entries = addressListModel_->entries();
+                    if (row < 0 || row >= (int)entries.size()) return;
+                    const auto type = entries[row].type;
+                    auto* dlg = new PointerScanDialog(process_.get(), this);
+                    trackTargetWindow(dlg);
+                    dlg->setAttribute(Qt::WA_DeleteOnClose);
+                    dlg->setTargetAddress(entries[row].address);
+                    connect(dlg, &PointerScanDialog::addressSelected, this,
+                            [this, type](uintptr_t addr, const QString& expr) {
+                                // The path string is a resolvable pointer expression; store it
+                                // AS the address so the record re-resolves each refresh and
+                                // survives the module rebasing on restart (the point of a scan).
+                                // The record keeps the scanned entry's value type.
+                                addressListModel_->addEntry(addr, type, expr, expr);
+                            });
+                    dlg->show();
+                });
+            }
+            // CE "Change Color" — per-record display color.
+            encodingMenu->addAction("Change Color...", [this, selected]() {
+                if (selected.isEmpty()) return;
+                // The dialog runs an event loop in which table scripts may add or
+                // remove records: keep IDs, not rows or a reference into the list.
+                std::vector<int> ids;
+                QColor initial = addressListView_->palette().color(QPalette::Text);
+                {
+                    const auto& entries = addressListModel_->entries();
+                    const int row = selected.first().row();
+                    if (row >= 0 && row < (int)entries.size() && !entries[row].color.isEmpty()) initial = QColor(entries[row].color);
+                    for (const auto& idx : selected)
+                        if (idx.row() >= 0 && idx.row() < (int)entries.size()) ids.push_back(entries[idx.row()].id);
+                }
+                QColor c = QColorDialog::getColor(initial, this, "Change record color");
+                if (!c.isValid()) return;
+                for (int id : ids) addressListModel_->setColor(id, c.name().toStdString());
+            });
+            // CE "Set/Change dropdown selection options".
+            if (selected.size() == 1) {
+                encodingMenu->addAction("Dropdown options...", [this, first]() {
+                    const int firstRow = first.row();
+                    if (firstRow < 0 || firstRow >= (int)addressListModel_->entries().size()) return;
+                    const int id = addressListModel_->entries()[firstRow].id;   // rows can move during the dialog
+                    bool ok = false;
+                    QString v = QInputDialog::getMultiLineText(this, "Dropdown options",
+                        "The values this entry can be set to from a dropdown, one per line,\n"
+                        "as value:label or just value. For example:\n0:Off\n1:On",
+                        addressListModel_->dropdownList(firstRow), &ok);
+                    if (ok)
+                        addressListModel_->setDropdownList(id, v.remove('\r').split('\n', Qt::SkipEmptyParts).join('\n'));
+                });
+            }
+            if (selected.size() == 1) {
+                menu.addSeparator();
+                QMenu* hotkeyMenu = menu.addMenu("Hotkeys");
+                hotkeyMenu->addAction("Toggle hotkey...", [this, selected]() {
+                    int row = selected.first().row();
+                    const auto& entries = addressListModel_->entries();
+                    if (row < 0 || row >= (int)entries.size()) return;
+
+                    QDialog dialog(this);
+                    dialog.setWindowTitle("Configure Hotkey");
+                    auto* layout = new QVBoxLayout(&dialog);
+                    auto* label = new QLabel(entries[row].description, &dialog);
+                    label->setObjectName("pageTitle");
+                    auto* editor = new QKeySequenceEdit(QKeySequence(entries[row].hotkeyKeys), &dialog);
+                    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+                    auto* clearButton = buttons->addButton("Clear", QDialogButtonBox::ResetRole);
+
+                    auto* note = new QLabel("Press the key combination that turns this entry on and off. "
+                                            "It works while the game has focus.", &dialog);
+                    note->setProperty("secondary", true);
+                    note->setWordWrap(true);
+                    editor->setMinimumWidth(280);
+                    layout->addWidget(label);
+                    layout->addWidget(note);
+                    layout->addWidget(editor);
+                    layout->addWidget(buttons);
+                    connect(clearButton, &QPushButton::clicked, editor, &QKeySequenceEdit::clear);
+                    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+                    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+
+                    const int id = entries[row].id;   // rows can move during the dialog
+                    if (dialog.exec() == QDialog::Accepted) {
+                        row = addressListModel_->rowOfId(id);
+                        if (row < 0) return;
+                        addressListModel_->setHotkeyKeys(row,
+                            editor->keySequence().toString(QKeySequence::PortableText));
+                        rebuildValueHotkeys();   // grab the new key (and release a cleared one) now
+                    }
+                });
+                hotkeyMenu->addAction("Value hotkeys...", [this, selected]() {
+                    int row = selected.first().row();
+                    const auto& entries = addressListModel_->entries();
+                    if (row < 0 || row >= (int)entries.size()) return;
+
+                    QDialog dialog(this);
+                    dialog.setWindowTitle("Configure Value Hotkeys");
+                    auto* layout = new QGridLayout(&dialog);
+                    auto* label = new QLabel(entries[row].description, &dialog);
+                    label->setObjectName("pageTitle");
+                    auto* increaseEditor = new QKeySequenceEdit(QKeySequence(entries[row].increaseHotkeyKeys), &dialog);
+                    auto* decreaseEditor = new QKeySequenceEdit(QKeySequence(entries[row].decreaseHotkeyKeys), &dialog);
+                    // A record without value hotkeys yet starts from the Settings > Hotkeys step.
+                    const QString defaultStep = QSettings().value("hotkeys/valueStep", "1").toString();
+                    const bool configured = !entries[row].increaseHotkeyKeys.isEmpty() || !entries[row].decreaseHotkeyKeys.isEmpty();
+                    auto* stepEdit = new QLineEdit(configured && !entries[row].hotkeyStep.isEmpty() ? entries[row].hotkeyStep : defaultStep, &dialog);
+                    stepEdit->setValidator(new QDoubleValidator(stepEdit));
+                    auto* setEditor = new QKeySequenceEdit(QKeySequence(entries[row].setValueHotkeyKeys), &dialog);
+                    auto* setValueEdit = new QLineEdit(entries[row].setValueHotkeyValue, &dialog);
+                    setValueEdit->setPlaceholderText("value to set");
+                    for (QWidget* field : std::initializer_list<QWidget*>{increaseEditor, decreaseEditor, stepEdit, setEditor, setValueEdit})
+                        field->setMinimumWidth(220);
+                    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+
+                    layout->addWidget(label, 0, 0, 1, 2);
+                    layout->addWidget(new QLabel("Increase", &dialog), 1, 0);
+                    layout->addWidget(increaseEditor, 1, 1);
+                    layout->addWidget(new QLabel("Decrease", &dialog), 2, 0);
+                    layout->addWidget(decreaseEditor, 2, 1);
+                    layout->addWidget(new QLabel("Step", &dialog), 3, 0);
+                    layout->addWidget(stepEdit, 3, 1);
+                    layout->addWidget(new QLabel("Set value hotkey", &dialog), 4, 0);
+                    layout->addWidget(setEditor, 4, 1);
+                    layout->addWidget(new QLabel("Set to value", &dialog), 5, 0);
+                    layout->addWidget(setValueEdit, 5, 1);
+                    layout->addWidget(buttons, 6, 0, 1, 2);
+                    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+                    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+
+                    const int id = entries[row].id;   // rows can move during the dialog
+                    if (dialog.exec() == QDialog::Accepted) {
+                        row = addressListModel_->rowOfId(id);
+                        if (row < 0) return;
+                        addressListModel_->setValueHotkeys(row,
+                            increaseEditor->keySequence().toString(QKeySequence::PortableText),
+                            decreaseEditor->keySequence().toString(QKeySequence::PortableText),
+                            stepEdit->text().isEmpty() ? defaultStep : stepEdit->text(),
+                            setEditor->keySequence().toString(QKeySequence::PortableText),
+                            setValueEdit->text());
+                        rebuildValueHotkeys();
+                    }
+                });
+            }
+        }
+
+        menu.addSeparator();
+        menu.addAction("Add Address Manually...", [this]() {
+            // CE's "Add Address Manually" opens the same formAddressChangeUnit as
+            // "Change address", so a new entry gets its type, flags, length, and an
+            // optional structured pointer in one dialog.
+            ce::gui::ChangeAddressDialog dlg("", mapValueType(valueTypeCombo_->currentIndex()),
+                                             false, 0, this, /*showSigned=*/true, process_.get());
+            openAddressDialog_ = &dlg;
+            if (dlg.exec() != QDialog::Accepted) return;
+            const QString a = dlg.address();
+            if (a.trimmed().isEmpty()) return;
+            bool numeric = false;
+            qulonglong v = a.toULongLong(&numeric, 16);
+            int id;
+            if (numeric && !a.contains('[') && !a.contains('+') && !a.contains(' ')) {
+                id = addressListModel_->addEntry((uintptr_t)v, dlg.valueType(),
+                                                 "No description", QString(), (size_t)dlg.length());
+            } else {
+                // Symbolic / module+offset / pointer chain: store the expression so it
+                // re-resolves live, seeding the initial numeric address if resolvable.
+                uintptr_t addr0 = 0;
+                if (auto r = parseAddressExpr(a)) addr0 = *r;
+                id = addressListModel_->addEntry(addr0, dlg.valueType(),
+                                                 "No description", a, (size_t)dlg.length());
+            }
+            addressListModel_->setHexView(id, dlg.showHex());
+            addressListModel_->setSigned(id, dlg.isSigned());
+        });
+        menu.addAction("Add Group", [this]() {
+            addressListModel_->addGroup();
+        });
+        // With entries selected, Paste is already in the edit group above.
+        if (selected.isEmpty()) menu.addAction("Paste", this, &MainWindow::onPasteAddresses, QKeySequence::Paste);
+
+        menu.addSeparator();
+        // Whole-table actions only on empty space: with an entry under the cursor the
+        // menu is about that entry, and it has to fit one column on a 1080p screen.
+        if (selected.isEmpty()) {
+            menu.addAction("Enable all", [this]() { addressListModel_->setAllActive(true); });
+            menu.addAction("Disable all", [this]() { addressListModel_->setAllActive(false); });
+        }
+
+        menu.exec(addressListView_->viewport()->mapToGlobal(pos));
+    });
+    // Delete key shortcut
+    auto* delShortcut = new QShortcut(QKeySequence::Delete, addressListView_);
+    // Only in the address list: window-wide, Delete in the scan results
+    // deleted the cheat table's selected records.
+    delShortcut->setContext(Qt::WidgetShortcut);
+    connect(delShortcut, &QShortcut::activated, this, &MainWindow::onDeleteAddresses);
+    // Ctrl+Up / Ctrl+Down reorder the selected cheat-table entry (CE-style).
+    auto moveSel = [this](int delta) {
+        auto sel = addressListView_->selectionModel()->selectedRows();
+        if (sel.size() == 1) moveSelectedEntry(sel.first().row(), delta);
+    };
+    auto* moveUpSc = new QShortcut(QKeySequence("Ctrl+Up"), addressListView_);
+    moveUpSc->setContext(Qt::WidgetShortcut);
+    connect(moveUpSc, &QShortcut::activated, this, [moveSel]() { moveSel(-1); });
+    auto* moveDownSc = new QShortcut(QKeySequence("Ctrl+Down"), addressListView_);
+    moveDownSc->setContext(Qt::WidgetShortcut);
+    connect(moveDownSc, &QShortcut::activated, this, [moveSel]() { moveSel(+1); });
+    auto* copyShortcut = new QShortcut(QKeySequence::Copy, addressListView_);
+    copyShortcut->setContext(Qt::WidgetShortcut);
+    connect(copyShortcut, &QShortcut::activated, this, &MainWindow::onCopyAddresses);
+    auto* pasteShortcut = new QShortcut(QKeySequence::Paste, addressListView_);
+    pasteShortcut->setContext(Qt::WidgetShortcut);
+    connect(pasteShortcut, &QShortcut::activated, this, &MainWindow::onPasteAddresses);
+    // Space toggles the active/frozen state of ALL selected entries (CE-style),
+    // regardless of the focused column. WidgetShortcut so it doesn't fire while a
+    // cell editor is open (there Space types a space). Intercepts before the
+    // table's default single-cell checkbox toggle, so there is no double-toggle.
+    auto* spaceShortcut = new QShortcut(QKeySequence(Qt::Key_Space), addressListView_);
+    spaceShortcut->setContext(Qt::WidgetShortcut);
+    // Like CE, every selected record takes the opposite of the current one's
+    // state: toggling each in turn would undo a group's cascade on a selected
+    // child. Rows are taken by id, since an activation can add or move records.
+    connect(spaceShortcut, &QShortcut::activated, this, [this]() {
+        const auto sel = addressListView_->selectionModel()->selectedRows();
+        if (sel.isEmpty()) return;
+        const auto& ents = addressListModel_->entries();
+        int lead = addressListView_->currentIndex().row();
+        if (!addressListView_->selectionModel()->isRowSelected(lead, {})) lead = sel.first().row();
+        if (lead < 0 || lead >= (int)ents.size()) return;
+        const auto state = ents[lead].active ? Qt::Unchecked : Qt::Checked;
+        std::vector<int> ids;
+        for (const auto& idx : sel)
+            if (idx.row() >= 0 && idx.row() < (int)ents.size()) ids.push_back(ents[idx.row()].id);
+        for (int id : ids) {
+            const int row = addressListModel_->rowOfId(id);
+            if (row >= 0) addressListModel_->setData(addressListModel_->index(row, 0), state, Qt::CheckStateRole);
+        }
+    });
+
+    // ── Cheat-Engine-faithful layout ──
+    // All widgets above are created and wired; here we discard the interim
+    // splitter layout and reposition them into Cheat Engine's exact main-window
+    // arrangement (coordinates transcribed from CE's MainUnit.lfm): a scan panel
+    // on top (process bar + found list on the left, scan controls on the right),
+    // the cheat table below, and an Advanced Options / Table Extras bar at the
+    // bottom.
+    auto* scanPanel = new QWidget;
+    auto* sv = new QVBoxLayout(scanPanel);
+    sv->setContentsMargins(2, 2, 2, 2);
+    sv->setSpacing(3);
+
+    // Process bar (spans the width): open-process button, process name (stretches),
+    // and the scan progress bar (shown only while scanning).
+    openBtn->setMinimumSize(0, 0);
+    openBtn->setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
+    openBtn->setFixedSize(32, 32);
+    auto* procRow = new QHBoxLayout;
+    procRow->addWidget(openBtn);
+    procRow->addSpacing(4);
+    procRow->addWidget(processLabel_);
+    procRow->addSpacing(10);
+    procRow->addWidget(processDetail_, 1);
+    progressBar_->setFixedWidth(220);
+    procRow->addWidget(progressBar_);
+    sv->addLayout(procRow);
+
+    // Main row: found-results list on the left (stretches with the window), and
+    // the scan controls in a fixed-width block on the right (Cheat Engine's shape).
+    // The "Found: N" count and the results' Hex toggle head the results column, so
+    // that Hex box sits on the list it formats rather than above the scan buttons
+    // (where it read as a second copy of the scan value's Hex box).
+    auto* mainRow = new QHBoxLayout;
+    auto* foundBlock = new QVBoxLayout;
+    auto* foundRow2 = new QHBoxLayout;
+    foundRow2->addWidget(foundLabel_);
+    foundRow2->addStretch();
+    foundRow2->addWidget(resHexCheck);
+    foundBlock->addLayout(foundRow2);
+    foundBlock->addWidget(resultsView_, 1);
+    auto* foundBtns = new QHBoxLayout;
+    foundBtns->addWidget(memViewBtn);
+    foundBtns->addStretch();
+    foundBtns->addWidget(addAddrBtn);
+    foundBlock->addLayout(foundBtns);
+    mainRow->addLayout(foundBlock, 1);
+
+    // Scan controls, laid out with real Qt layouts (no fixed pixel coordinates,
+    // so it scales with font size / DPI and leaves no dead space): a button row,
+    // a right-aligned label/field form, and the Memory Scan Options group.
+    auto* controls = new QWidget;
+    auto* cv = new QVBoxLayout(controls);
+    cv->setContentsMargins(6, 0, 0, 0);
+    cv->setSpacing(6);
+
+    auto* scanBtnRow = new QHBoxLayout;
+    scanBtnRow->setSpacing(4);
+    scanBtnRow->addWidget(firstScanBtn_);
+    scanBtnRow->addWidget(nextScanBtn_);
+    scanBtnRow->addWidget(undoScanBtn_);
+    cv->addLayout(scanBtnRow);
+
+    auto* scanForm = new QGridLayout;
+    scanForm->setHorizontalSpacing(6);
+    scanForm->setVerticalSpacing(6);
+    scanForm->setColumnStretch(1, 1);
+    scanForm->addWidget(new QLabel("Scan Value"), 0, 0, Qt::AlignRight | Qt::AlignVCenter);
+    auto* valRow = new QHBoxLayout;
+    valRow->setSpacing(4);
+    valRow->addWidget(scanValueEdit_, 1);
+    valRow->addWidget(betweenAndLabel_);
+    valRow->addWidget(scanValue2Edit_, 1);
+    valRow->addWidget(hexCheck_);
+    scanForm->addLayout(valRow, 0, 1);
+    scanForm->addWidget(new QLabel("Scan Type"), 1, 0, Qt::AlignRight | Qt::AlignVCenter);
+    scanForm->addWidget(scanTypeCombo_, 1, 1);
+    scanForm->addWidget(new QLabel("Value Type"), 2, 0, Qt::AlignRight | Qt::AlignVCenter);
+    scanForm->addWidget(valueTypeCombo_, 2, 1);
+    auto* floatRow2 = new QHBoxLayout;
+    floatRow2->setSpacing(4);
+    floatRow2->addWidget(floatRoundingCombo_);
+    floatRow2->addWidget(floatToleranceEdit_);
+    floatRow2->addStretch();
+    auto* roundingLabel = new QLabel("Rounding");
+    roundingLabel->setBuddy(floatRoundingCombo_);
+    scanForm->addWidget(roundingLabel, 3, 0, Qt::AlignRight | Qt::AlignVCenter);
+    scanForm->addLayout(floatRow2, 3, 1);
+    auto updateRoundingLabel = [this, roundingLabel]() {
+        const auto vt = mapValueType(valueTypeCombo_->currentIndex());
+        roundingLabel->setVisible(vt == ValueType::Float || vt == ValueType::Double || vt == ValueType::All);
+    };
+    connect(valueTypeCombo_, &QComboBox::currentIndexChanged, this, [updateRoundingLabel](int) { updateRoundingLabel(); });
+    updateRoundingLabel();
+    cv->addLayout(scanForm);
+
+    // Memory Scan Options group (From/To, Writable/Executable, Fast Scan, etc.).
+    cv->addWidget(optGroup);
+    auto updateTextOptions = [this, textEncodingLabel]() {
+        auto type = mapValueType(valueTypeCombo_->currentIndex());
+        bool text = type == ValueType::String || type == ValueType::UnicodeString;
+        caseSensitiveCheck_->setVisible(text);
+        stringEncodingCombo_->setVisible(type == ValueType::String);
+        textEncodingLabel->setVisible(type == ValueType::String);
+    };
+    connect(valueTypeCombo_, &QComboBox::currentIndexChanged, this, [updateTextOptions]() { updateTextOptions(); });
+    updateTextOptions();
+    cv->addStretch(1);
+    auto* controlsScroll = new QScrollArea;
+    controlsScroll->setObjectName("scanControlsScroll");
+    controlsScroll->setFrameShape(QFrame::NoFrame);
+    controlsScroll->setWidgetResizable(true);
+    controlsScroll->setWidget(controls);
+    controlsScroll->setMinimumWidth(controls->minimumSizeHint().width() + 18);
+    controlsScroll->setMaximumWidth(controls->minimumSizeHint().width() + 36);
+    controlsScroll->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Expanding);
+    mainRow->addWidget(controlsScroll);
+    sv->addLayout(mainRow, 1);
+
+    // These start hidden; their visibility is driven by scan state, not the layout
+    // (progress bar shows while scanning; the "and"/second-value box only for a
+    // "Value between..." scan).
+    progressBar_->setVisible(false);
+    betweenAndLabel_->setVisible(false);
+    scanValue2Edit_->setVisible(false);
+
+    // ── Assemble: scan panel (top) / cheat table (bottom) / actions bar ──
+    auto* newCentral = new QWidget;
+    auto* v = new QVBoxLayout(newCentral);
+    v->setContentsMargins(2, 2, 2, 2);
+    v->setSpacing(2);
+
+    auto* vsplit = new QSplitter(Qt::Vertical);
+    vsplit->setObjectName("vsplit");   // persisted across runs
+    vsplit->addWidget(scanPanel);
+    vsplit->addWidget(addressListView_);
+    vsplit->setStretchFactor(0, 0);
+    vsplit->setStretchFactor(1, 1);
+    vsplit->setChildrenCollapsible(false);
+    // Sizes for a 10 pt font at 96 DPI, scaled up for larger text (GNOME's text
+    // scaling, bigger fonts) so the scan options fit without scrolling.
+    const double textScale = std::max(1.0, fontMetrics().height() / 17.0);
+    vsplit->setSizes({int(480 * textScale), int(220 * textScale)});
+    v->addWidget(vsplit, 1);
+    addressListView_->setMinimumHeight(140);
+
+    auto* bottomBar = new QHBoxLayout;
+    auto* advBtn = new QPushButton("Advanced Options");
+    // CE "Advanced Options" = the Code list (AdvancedOptionsUnit): a persistent
+    // list of code addresses from find-what-writes, with disassemble/NOP/restore.
+    connect(advBtn, &QPushButton::clicked, this, &MainWindow::showAdvancedOptions);
+    auto* extrasBtn = new QPushButton("Table Extras");
+    // CE "Table Extras" opens the table notes (Comments) — a free-text memo saved
+    // with the table. (Save/Load now live in the File menu.)
+    connect(extrasBtn, &QPushButton::clicked, this, &MainWindow::showComments);
+    bottomBar->addWidget(advBtn);
+    bottomBar->addStretch();
+    bottomBar->addWidget(extrasBtn);
+    v->addLayout(bottomBar);
+
+    // Discard the interim splitter tree; its roots own only the helper widgets we
+    // did not reposition (the ones we use were reparented onto scanPanel above).
+    delete topSplitter;
+    delete central;
+    setCentralWidget(newCentral);
+    resize(760, 600);
+}
+
+// One-click elevation: use pkexec (graphical polkit prompt) to grant memory-read
+// access. For a real installed/dev binary that means setcap cap_sys_ptrace+ep on it
+// (persistent, targeted, effective after a restart). For an AppImage the capability
+// can't persist on the read-only temp mount, so lower kernel.yama.ptrace_scope
+// instead (effective immediately, resets on reboot — the .deb sets it up permanently).
+// A binary with file capabilities runs in secure-execution mode, where the
+// loader ignores $ORIGIN in its run path. An install outside the system library
+// directories (~/.local, /opt) finds libcecore only through $ORIGIN, so a
+// capability would stop Neversnooze CE from starting. The build tree uses
+// absolute run paths and keeps working.
+static bool capabilityKeepsLibrariesLoadable() {
+    Dl_info info{};
+    if (!dladdr(reinterpret_cast<void*>(&ce::findCompanionLibrary), &info) || !info.dli_fname) return false;
+    const QString library = QFileInfo(QString::fromLocal8Bit(info.dli_fname)).canonicalFilePath();
+    const QString exe = QFileInfo(QCoreApplication::applicationFilePath()).canonicalFilePath();
+    if (library.isEmpty() || library == exe) return true;   // engine linked into the executable
+    const QString dir = QFileInfo(library).absolutePath();
+    if (dir == QFileInfo(exe).absolutePath()) return true;  // build tree: absolute run path
+    static const QRegularExpression systemDir(
+        QStringLiteral("^/(usr/)?lib(64|32)?(/[a-z0-9_]+-linux-gnu[a-z0-9_]*)?$"));
+    return systemDir.match(dir).hasMatch();
+}
+
+static void grantPtraceAccess(QWidget* parent) {
+    const QString bin = QCoreApplication::applicationFilePath();
+    const bool isAppImage = qEnvironmentVariableIsSet("APPIMAGE") || bin.contains("/.mount_");
+    const bool capabilityUsable = !isAppImage && capabilityKeepsLibrariesLoadable();
+
+    QStringList args;
+    QString followup;
+    if (!capabilityUsable) {
+        args = {QStringLiteral("/bin/sh"), QStringLiteral("-c"),
+                QStringLiteral("echo 0 > /proc/sys/kernel/yama/ptrace_scope")};
+        followup = isAppImage
+            ? QObject::tr("Access granted for this session; re-open the process.\n"
+                          "(This resets on reboot. Install the .deb, or re-run the "
+                          "command, to make it permanent.)")
+            : QObject::tr("Access granted for this session; re-open the process.\n"
+                          "(This resets on reboot. A capability on this install would "
+                          "stop it from finding its libraries, because it is outside the "
+                          "system library directories.)");
+    } else {
+        const QString cescan = QFileInfo(bin).absolutePath() + QStringLiteral("/cescan");
+        // Fail when either setcap fails (no xattr support, nosuid mount), so
+        // the result below is not "granted" for nothing.
+        args = {QStringLiteral("/bin/sh"), QStringLiteral("-c"),
+                QStringLiteral("setcap cap_sys_ptrace+ep \"$1\" || exit 1; "
+                               "if [ -x \"$2\" ]; then setcap cap_sys_ptrace+ep \"$2\" || exit 1; fi"),
+                QStringLiteral("sh"), bin, cescan};
+        followup = QObject::tr("Access granted. Restart Neversnooze CE for it to take effect.");
+    }
+
+    int rc = QProcess::execute(QStringLiteral("pkexec"), args);
+    if (rc == 0)
+        QMessageBox::information(parent, QObject::tr("Access granted"), followup);
+    else
+        QMessageBox::warning(parent, QObject::tr("Could not grant access"),
+            QObject::tr("The privileged command was cancelled or failed (pkexec exit %1). "
+                        "You can still grant access manually from a terminal.").arg(rc));
+}
+
+// Probe whether we can actually read the target's memory. Under the default
+// kernel.yama.ptrace_scope=1, process_vm_readv is DENIED for any process we can't
+// ptrace — i.e. anything Neversnooze CE didn't spawn — so scanning, memory browsing
+// and debugging all silently fail (empty results, blank disassembler). Detect that
+// the moment a process is opened and tell the user exactly how to fix it, instead
+// of leaving them to wonder why "browse memory" shows nothing for some processes.
+static void warnIfMemoryUnreadable(QWidget* parent, ce::ProcessHandle* p,
+                                   pid_t pid, const QString& name) {
+    if (!p) return;
+    bool sawReadable = false;
+    for (auto& r : p->queryRegions()) {
+        if (!(r.protection & ce::MemProt::Read)) continue;
+        sawReadable = true;
+        uint8_t b = 0;
+        auto res = p->read(r.base, &b, 1);
+        if (res && *res >= 1) return;   // memory is readable — nothing to warn about
+        break;                          // first readable region failed → diagnose below
+    }
+    if (!sawReadable) return;           // couldn't enumerate regions — don't guess
+
+    QString scope = QStringLiteral("1");
+    if (QFile f(QStringLiteral("/proc/sys/kernel/yama/ptrace_scope")); f.open(QIODevice::ReadOnly))
+        scope = QString::fromUtf8(f.readAll()).trimmed();
+
+    QMessageBox box(parent);
+    box.setIcon(QMessageBox::Warning);
+    box.setWindowTitle(QObject::tr("Process memory not readable"));
+    box.setText(QObject::tr(
+        "Cannot read the memory of PID %1 (%2).\n\n"
+        "Linux only lets a program read another process's memory if it is allowed "
+        "to ptrace it. With kernel.yama.ptrace_scope = %3, that means the target "
+        "must be a child of Neversnooze CE, or Neversnooze CE must run with elevated "
+        "rights. Scanning, memory browsing and debugging this process will not work "
+        "until that is granted.").arg(pid).arg(name).arg(scope));
+    box.setInformativeText(QObject::tr(
+        "\"Grant access\" will ask for your password (via pkexec) and set it up for "
+        "you. Or do it manually:\n"
+        "  • Persistent, per-binary:  sudo setcap cap_sys_ptrace+ep %1\n"
+        "  • Whole system, until reboot:  sudo sysctl kernel.yama.ptrace_scope=0")
+        .arg(QCoreApplication::applicationFilePath()));
+
+    // Offer one-click elevation only when pkexec (polkit) is actually available.
+    QPushButton* grantBtn = nullptr;
+    const bool havePkexec = !QStandardPaths::findExecutable(QStringLiteral("pkexec")).isEmpty();
+    if (havePkexec)
+        grantBtn = box.addButton(QObject::tr("Grant access…"), QMessageBox::AcceptRole);
+    box.addButton(QMessageBox::Close);
+    box.exec();
+
+    if (grantBtn && box.clickedButton() == grantBtn)
+        grantPtraceAccess(parent);
+}
+
+// "Wait for process" found its program. Attaching replaces the target and
+// deletes its windows, which must not happen under a dialog or menu still on
+// the stack (a queued call runs inside their event loops): try again once it
+// has closed. Report success only when the attach happened.
+// A hit from a watch that has since ended (another attach, a new watch, an
+// earlier hit that attached) is dropped, also while it waits for a dialog.
+void MainWindow::autoAttach(pid_t pid, const QString& name, quint64 watch) {
+    if (watch != processWatch_) return;
+    if (::kill(pid, 0) != 0 && errno == ESRCH) return;   // gone before we got to it
+    // A running scan also waits here, not in attachToPid, so the retry is checked too.
+    if (QApplication::activeModalWidget() || QApplication::activePopupWidget() || scanInProgress_) {
+        QTimer::singleShot(250, this, [this, pid, name, watch]() { autoAttach(pid, name, watch); });
+        return;
+    }
+    // Through attachToPid so the old target's Debugger/views are torn down
+    // before process_ is replaced (they hold a raw handle).
+    attachToPid(pid, name);
+    if (process_ && currentPid_ == pid) {
+        statusBar()->showMessage(QString("Auto-attached to %1 (pid %2)").arg(name).arg(pid), 4000);
+        stopProcessWatch();
+    } else {
+        statusBar()->showMessage(QString("Found %1 (pid %2) but could not open it").arg(name).arg(pid), 8000);
+    }
+}
+
+void MainWindow::stopProcessWatch() {
+    if (processWatcher_) processWatcher_->stop();
+    ++processWatch_;
+}
+
+void MainWindow::attachToPid(pid_t pid, const QString& name) {
+    if (scanInProgress_) {   // queued while a scan runs ("Wait for process"): attach after it
+        QTimer::singleShot(200, this, [this, pid, name] { attachToPid(pid, name); });
+        return;
+    }
+    if (!releaseTargetUsers()) return;
+    currentPid_ = pid;
+    process_.reset();
+    ceserverClient_.reset();
+    process_ = std::make_unique<os::LinuxProcessHandle>(pid);
+    // A target chosen now ends a pending "Wait for process": it would otherwise
+    // switch to the next match whenever one starts, hours later.
+    stopProcessWatch();
+    // Resolve a readable name so the header isn't "PID: 1234 - 1234" when we were
+    // handed a bare pid (--pid, or a caller that didn't know the name): read the
+    // process's own /proc/<pid>/comm (e.g. "sleep"), falling back to the number.
+    QString label = name;
+    if (label.isEmpty()) {
+        QFile comm(QString("/proc/%1/comm").arg(pid));
+        if (comm.open(QIODevice::ReadOnly))
+            label = QString::fromUtf8(comm.readAll()).trimmed();
+        if (label.isEmpty()) label = QString::number(pid);
+    }
+    processLabel_->setText(label);
+    processDetail_->setText(QString("PID %1").arg(pid));
+    currentProcessName_ = label;
+    updateWindowTitle();
+    warnIfMemoryUnreadable(this, process_.get(), pid, label);
+    addressListModel_->setProcess(process_.get());
+    resultsModel_->setProcess(process_.get());
+    // Keep the shared Lua engine pointed at the current target, so scripts (and an
+    // already-open Lua Engine console) operate on this process after a re-attach,
+    // not a stale one. The address list model is persistent; bind it too.
+    luaEngine_.setProcess(process_.get());
+    luaEngine_.setAddressList(addressListModel_);
+    firstScanBtn_->setEnabled(true);
+    resultsModel_->clear();
+    lastResult_.reset();
+    undoResult_.reset();
+    lastResultType_ = ValueType::Int32;
+    undoResultType_ = ValueType::Int32;
+    lastResultValueSize_ = 0;
+    undoResultValueSize_ = 0;
+    resetGuestScanSetup();
+    updateScanButtons();
+
+    // Honest reporting: tell the user up-front what kind of target this is (Wine,
+    // emulator, managed runtime, sandboxed, already-traced) so any limitation is an
+    // explicit note, not a silent surprise later. See docs/CHALLENGING_TARGETS.md.
+    {
+        ce::TargetProfile prof = ce::probeTarget(pid);
+        processDetail_->setText(QString("PID %1  ·  %2").arg(pid).arg(QString::fromStdString(prof.summary())));
+        statusBar()->showMessage(
+            QString("Attached to %1: %2").arg(label, QString::fromStdString(prof.summary())), 8000);
+        // The summary + every note live on the process label's tooltip (persistent,
+        // non-intrusive; hover to read).
+        QString tip = QString::fromStdString(prof.summary());
+        for (const auto& n : prof.notes) tip += "\n\n• " + QString::fromStdString(n);
+        auto target = process_->targetDescription();
+        tip += QString("\n\nProgram: %1, %2-byte pointers, %3\nHost ABI: %4")
+            .arg(ce::cpuArchitectureName(target.program.architecture)).arg(target.program.pointerWidth)
+            .arg(ce::byteOrderName(target.program.byteOrder)).arg(ce::targetAbiName(target.host.abi));
+        for (const auto& c : ce::targetCapabilities(target))
+            if (c.state != ce::CapabilityState::Available)
+                tip += QString("\n%1: %2. %3").arg(ce::targetFeatureName(c.feature),
+                    ce::capabilityStateName(c.state), QString::fromStdString(c.reason));
+        processLabel_->setToolTip(tip);
+        // The one note that means nothing will work at all (attach/watch/inject all
+        // fail) is worth an explicit dialog: the target is already being traced.
+        if (prof.tracerPid != 0 && !prof.notes.empty())
+            QMessageBox::warning(this, "Target already being traced",
+                QString::fromStdString(prof.notes.front()));
+    }
+}
+
+void MainWindow::onOpenProcess() {
+    ProcessListDialog dlg(this);
+    if (dlg.exec() == QDialog::Accepted)
+        attachToPid(dlg.selectedPid(), dlg.selectedName());
+}
+
+bool MainWindow::attachToGdb(std::unique_ptr<ce::GdbProcessHandle> process,const QString& endpoint) {
+    if (!process) return false;
+    const auto description=process->targetDescription();
+    if (!description.live) {statusBar()->showMessage(QString::fromStdString(process->lastTransportError()),5000);return false;}
+    const auto architecture=QString::fromStdString(process->registerDescription().architecture);
+    if (!releaseTargetUsers()) return false;
+    process_.reset();ceserverClient_.reset();
+    process_=std::move(process);currentPid_=0;
+    stopProcessWatch();   // see attachToPid
+    luaEngine_.setProcess(process_.get());luaEngine_.setAddressList(addressListModel_);
+    addressListModel_->setProcess(process_.get());resultsModel_->setProcess(process_.get());
+    resultsModel_->clear();lastResult_.reset();undoResult_.reset();
+    lastResultType_=undoResultType_=ValueType::Int32;lastResultValueSize_=undoResultValueSize_=0;
+    foundLabel_->setText("Found: 0");
+    const QString dataOrder=description.program.byteOrder==ce::ByteOrder::Unknown
+        ? "data order unknown" : QString("%1 data").arg(ce::byteOrderName(description.program.byteOrder));
+    const QString pointers=description.program.pointerWidth
+        ? QString("%1-bit pointers").arg(description.program.pointerWidth*8) : "pointer width unknown";
+    processLabel_->setText(QString("GDB: %1").arg(endpoint));
+    processDetail_->setText(QString("%1  ·  %2  ·  %3").arg(architecture,dataOrder,pointers));
+    QString tip=QString("Guest CPU: %1\nData order: %2\nProgram pointers: %3\nTransport: GDB")
+        .arg(architecture).arg(ce::byteOrderName(description.program.byteOrder)).arg(pointers);
+    for (const auto& capability:ce::targetCapabilities(description))
+        if (capability.state!=ce::CapabilityState::Available)
+            tip+=QString("\n%1: %2. %3").arg(ce::targetFeatureName(capability.feature),ce::capabilityStateName(capability.state),QString::fromStdString(capability.reason));
+    processLabel_->setToolTip(tip);currentProcessName_="GDB "+endpoint;updateWindowTitle();
+    const auto regions=process_->queryRegions();
+    if (!regions.empty()) {
+        fromAddressEdit_->setText(QString("0x%1").arg(regions.front().base,0,16));
+        toAddressEdit_->setText(QString("0x%1").arg(regions.back().base+regions.back().size-1,0,16));
+    }
+    // Raw byte patterns work even when the stub cannot identify data byte order.
+    valueTypeCombo_->setCurrentIndex(8); // ByteArray, see mapValueType.
+    guestScanSetup_ = true;
+    updateScanButtons();
+    statusBar()->showMessage(regions.empty() ? "Connected to GDB; no memory map. Reconnect with a known scan range." : "Connected to GDB target",8000);
+    return true;
+}
+void MainWindow::onConnectGdb() {
+    GdbConnectionDialog dialog(this);
+    if (dialog.exec()==QDialog::Accepted) attachToGdb(dialog.takeProcess(),dialog.endpoint());
+}
+// A GDB guest narrows the scan to its memory and Array of byte; the next
+// target must not inherit that (First Scan on a native process searched only
+// the old guest range and found nothing).
+void MainWindow::resetGuestScanSetup() {
+    if (foundLabel_) foundLabel_->setText("Found: 0");
+    if (!guestScanSetup_) return;
+    guestScanSetup_ = false;
+    fromAddressEdit_->setText("0000000000");
+    toAddressEdit_->setText(QString::number(UINTPTR_MAX, 16));
+    const int dvt = QSettings().value("scan/defaultValueType", 2).toInt();
+    static const int kSettingsToScanner[] = {0, 1, 2, 3, 4, 5, 6, 8, 11};
+    if (dvt >= 0 && dvt < 9 && kSettingsToScanner[dvt] < valueTypeCombo_->count())
+        valueTypeCombo_->setCurrentIndex(kSettingsToScanner[dvt]);
+}
+
+void MainWindow::onDisconnectProcess() {
+    if (!releaseTargetUsers()) return;
+    stopProcessWatch();
+    resetGuestScanSetup();
+    process_.reset();ceserverClient_.reset();currentPid_=0;
+    addressListModel_->setProcess(nullptr);resultsModel_->setProcess(nullptr);resultsModel_->clear();
+    lastResult_.reset();undoResult_.reset();lastResultType_=undoResultType_=ValueType::Int32;
+    lastResultValueSize_=undoResultValueSize_=0;foundLabel_->setText("Found: 0");
+    processLabel_->setText("No process selected");processLabel_->setToolTip({});processDetail_->setText(tr("Press Ctrl+O or click the magnifier to choose a process."));currentProcessName_.clear();updateWindowTitle();updateScanButtons();
+}
+
+// The network half of attaching to a ceserver target: no GUI state, so the
+// Connect dialog can run it on a worker thread (each step can wait 5 s, and
+// resolving a host name has no limit at all).
+MainWindow::CeserverConnection MainWindow::connectCeserver(const QString& host, uint16_t port, pid_t pid) {
+    CeserverConnection c;
+    c.client = std::make_unique<ce::os::CEServerClient>();
+    std::string err;
+    if (!c.client->connectTcp(host.toStdString(), port, err)) {
+        c.error = QString("Connect failed: %1").arg(QString::fromStdString(err));
+        return c;
+    }
+    auto version = c.client->getVersion();
+    if (!version) {
+        c.error = QString("Handshake failed: %1").arg(QString::fromStdString(version.error()));
+        return c;
+    }
+    c.version = QString::fromStdString(version->versionString);
+    c.handle = ce::os::RemoteProcessHandle::open(*c.client, pid);
+    if (!c.handle) c.error = QString("Server refused PID %1").arg((int)pid);
+    return c;
+}
+
+bool MainWindow::attachToCeserver(const QString& host, uint16_t port, pid_t pid, QString* error) {
+    auto connection = connectCeserver(host, port, pid);
+    return adoptCeserver(std::move(connection), host, port, pid, error);
+}
+
+bool MainWindow::adoptCeserver(CeserverConnection connection, const QString& host, uint16_t port, pid_t pid, QString* error) {
+    auto fail = [&](const QString& message) { if (error) *error = message; return false; };
+    if (!connection.handle) return fail(connection.error);
+    auto client = std::move(connection.client);
+    auto handle = std::move(connection.handle);
+    if (!releaseTargetUsers())
+        return fail(tr("The current target is still in use: wait for the scan to finish or disable its scripts, then connect again."));
+    process_.reset();
+    ceserverClient_ = std::move(client);
+    process_ = std::move(handle);
+    stopProcessWatch();   // see attachToPid
+    luaEngine_.setProcess(process_.get());
+    currentPid_ = pid;
+    processLabel_->setText(QString("Remote process %1").arg((int)pid));
+    processDetail_->setText(QString("ceserver %1:%2  ·  %3").arg(host).arg(port).arg(connection.version));
+    currentProcessName_ = QString("ceserver %1:%2").arg(host).arg(port);
+    updateWindowTitle();
+    addressListModel_->setProcess(process_.get());
+    resultsModel_->setProcess(process_.get());
+    firstScanBtn_->setEnabled(true);
+    resultsModel_->clear();
+    lastResult_.reset();
+    undoResult_.reset();
+    lastResultType_ = ValueType::Int32;
+    undoResultType_ = ValueType::Int32;
+    lastResultValueSize_ = 0;
+    undoResultValueSize_ = 0;
+    resetGuestScanSetup();
+    updateScanButtons();
+    return true;
+}
+
+void MainWindow::onConnectCeserver() {
+    QSettings settings;
+    auto* dlg = new QDialog(this);
+    dlg->setWindowTitle("Connect to ceserver");
+    auto* form = new QFormLayout(dlg);
+    auto* intro = new QLabel("Attach to a process on another machine (or in a container) "
+                             "through a running ceserver.");
+    intro->setWordWrap(true);
+    intro->setProperty("secondary", true);
+    form->addRow(intro);
+
+    auto* hostEdit = new QLineEdit(settings.value("network/ceserverHost", "127.0.0.1").toString());
+    form->addRow("Host:", hostEdit);
+
+    auto* portSpin = new QSpinBox;
+    portSpin->setRange(1, 65535);
+    portSpin->setValue(settings.value("network/ceserverPort", 52736).toInt());
+    form->addRow("Port:", portSpin);
+
+    auto* pidEdit = new QLineEdit;
+    pidEdit->setPlaceholderText("process ID on the remote machine");
+    pidEdit->setValidator(new QIntValidator(1, std::numeric_limits<int>::max(), pidEdit));
+    portSpin->setGroupSeparatorShown(false);
+    hostEdit->setMinimumWidth(240);
+    form->addRow("PID:", pidEdit);
+
+    auto* statusLabel = new QLabel;
+    statusLabel->setWordWrap(true);
+    form->addRow(statusLabel);
+
+    auto* btnRow = new QHBoxLayout;
+    auto* connectBtn = new QPushButton("Connect");
+    connectBtn->setProperty("primary", true);
+    connectBtn->setDefault(true);
+    auto* cancelBtn = new QPushButton("Cancel");
+    btnRow->addStretch();
+    btnRow->addWidget(connectBtn);
+    btnRow->addWidget(cancelBtn);
+    form->addRow(btnRow);
+
+    connect(cancelBtn, &QPushButton::clicked, dlg, &QDialog::reject);
+    QPointer<QDialog> guard(dlg);
+    connect(connectBtn, &QPushButton::clicked, this, [this, guard, dlg, hostEdit, portSpin, pidEdit, statusLabel, connectBtn]() {
+        bool ok = false;
+        pid_t pid = pidEdit->text().toInt(&ok);
+        if (!ok || pid <= 0) {
+            statusLabel->setText("Enter a valid remote PID.");
+            return;
+        }
+        const QString host = hostEdit->text();
+        const auto port = static_cast<uint16_t>(portSpin->value());
+        statusLabel->setText(QString("Connecting to %1:%2...").arg(host).arg(port));
+        connectBtn->setEnabled(false);
+        // Off the GUI thread; Cancel closes the dialog and the late result is
+        // dropped (its connection closes with it).
+        std::thread([this, guard, dlg, host, port, pid, statusLabel, connectBtn]() {
+            auto connection = std::make_shared<CeserverConnection>(connectCeserver(host, port, pid));
+            // Posted to the application, not this window: the window may be
+            // gone by now. The dialog (its child) being alive says it is not.
+            QMetaObject::invokeMethod(qApp, [this, guard, dlg, host, port, pid, statusLabel, connectBtn, connection]() {
+                if (!guard || !dlg->isVisible()) return;   // cancelled meanwhile
+                connectBtn->setEnabled(true);
+                QString error;
+                if (!adoptCeserver(std::move(*connection), host, port, pid, &error)) {
+                    if (!error.isEmpty()) statusLabel->setText(error);
+                    return;
+                }
+                QSettings settings;
+                settings.setValue("network/ceserverHost", host);
+                settings.setValue("network/ceserverPort", port);
+                dlg->accept();
+            }, Qt::QueuedConnection);
+        }).detach();
+    });
+
+    dlg->exec();
+    dlg->deleteLater();
+}
+
+// Compares that only a next scan can do: they need the previous scan's values.
+static bool scanNeedsPreviousResult(ScanCompare compare) {
+    switch (compare) {
+        case ScanCompare::Changed: case ScanCompare::Unchanged: case ScanCompare::Increased:
+        case ScanCompare::Decreased: case ScanCompare::IncreasedBy: case ScanCompare::DecreasedBy:
+        case ScanCompare::SameAsFirst:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static ScanCompare mapScanType(int index) {
+    switch (index) {
+        case 0: return ScanCompare::Exact;
+        case 1: return ScanCompare::Greater;
+        case 2: return ScanCompare::Less;
+        case 3: return ScanCompare::Between;
+        case 4: return ScanCompare::Unknown;
+        case 5: return ScanCompare::Increased;
+        case 6: return ScanCompare::Decreased;
+        case 7: return ScanCompare::Changed;
+        case 8: return ScanCompare::Unchanged;
+        case 9: return ScanCompare::SameAsFirst;
+        case 10: return ScanCompare::IncreasedBy;
+        case 11: return ScanCompare::DecreasedBy;
+        default: return ScanCompare::Exact;
+    }
+}
+
+static ValueType mapValueType(int index) {
+    switch (index) {
+        case 0: return ValueType::Byte;
+        case 1: return ValueType::Int16;
+        case 2: return ValueType::Int32;
+        case 3: return ValueType::Int64;
+        case 4: return ValueType::Float;
+        case 5: return ValueType::Double;
+        case 6: return ValueType::String;
+        case 7: return ValueType::UnicodeString;
+        case 8: return ValueType::ByteArray;
+        case 9: return ValueType::Binary;
+        case 10: return ValueType::All;
+        case 11: return ValueType::Pointer;
+        case 12: return ValueType::Grouped;
+        case 13: return ValueType::Custom;
+        default: return ValueType::Int32;
+    }
+}
+
+static bool applyFloatOptions(ScanConfig& config, QComboBox* roundingCombo,
+                              QLineEdit* toleranceEdit) {
+    if (config.valueType != ValueType::Float &&
+        config.valueType != ValueType::Double && config.valueType != ValueType::All) {
+        return true;
+    }
+    config.roundingType = roundingCombo->currentIndex();
+    if (config.roundingType==3 && !toleranceEdit->text().trimmed().isEmpty()) {
+        ScanConfig tolerance;
+        if (!tolerance.parseFloatingValues(toleranceEdit->text().toStdString()) ||
+            !std::isfinite(tolerance.floatValue) || tolerance.floatValue<0) return false;
+        config.floatTolerance=tolerance.floatValue;
+    }
+    return true;
+
+}
+
+static size_t resultValueSizeForConfig(const ScanConfig& config) {
+    switch (config.valueType) {
+        case ValueType::Byte:
+            return 1;
+        case ValueType::Int16:
+            return 2;
+        case ValueType::Int32:
+        case ValueType::Float:
+            return 4;
+        case ValueType::Int64:
+        case ValueType::Double:
+        case ValueType::Pointer:
+            return 8;
+        case ValueType::String:
+            return std::max<size_t>(1, config.stringValueSize());
+        case ValueType::UnicodeString:
+            return std::max<size_t>(2, ce::encodeStringBytes(config.stringValue, "UTF-16LE").size());
+        case ValueType::ByteArray:
+        case ValueType::Binary:
+            return std::max<size_t>(1, config.byteArray.size());
+        case ValueType::Grouped:
+            return std::max<size_t>(1, config.groupedValueSize());
+        case ValueType::Custom:
+            return std::max<size_t>(1, config.customValueSize);
+        case ValueType::All:
+        default:
+            return 8;
+    }
+}
+
+
+namespace {
+// The scheduler state char from /proc/<pid>/stat ('R','S','T',…), or '?'.
+char processStateChar(pid_t pid) {
+    char path[64];
+    std::snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
+    FILE* f = std::fopen(path, "r");
+    if (!f) return '?';
+    char buf[512];
+    size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+    std::fclose(f);
+    buf[n] = '\0';
+    // comm (field 2) is parenthesised and may contain spaces; state follows the
+    // last ')'.
+    char* rp = std::strrchr(buf, ')');
+    if (!rp) return '?';
+    ++rp;
+    while (*rp == ' ') ++rp;
+    return *rp ? *rp : '?';
+}
+
+// SIGSTOP the target on construction, SIGCONT on destruction (best-effort), to
+// freeze it for a scan ("Pause while scanning"). Does nothing if the target is
+// already stopped (e.g. manually paused) so we never resume a process we didn't
+// suspend.
+struct ScopedSigstop {
+    pid_t pid; bool active;
+    ScopedSigstop(pid_t p, bool a) : pid(p), active(false) {
+        if (!a || p <= 0 || processStateChar(p) == 'T') return;
+        active = true;
+        ::kill(pid, SIGSTOP);
+    }
+    ~ScopedSigstop() { if (active) ::kill(pid, SIGCONT); }
+    ScopedSigstop(const ScopedSigstop&) = delete;
+    ScopedSigstop& operator=(const ScopedSigstop&) = delete;
+};
+
+// Discards mouse and keyboard input while installed. A scan's progress loop
+// used ExcludeUserInputEvents, which only defers input: Qt queued the clicks
+// and keys and replayed them after the scan (a second First Scan click wiped
+// the results it had just produced).
+class ScopedInputBlocker : public QObject {
+public:
+    ScopedInputBlocker() { qApp->installEventFilter(this); }
+    ~ScopedInputBlocker() override { qApp->removeEventFilter(this); }
+protected:
+    bool eventFilter(QObject*, QEvent* event) override {
+        switch (event->type()) {
+            case QEvent::MouseButtonPress: case QEvent::MouseButtonRelease:
+            case QEvent::MouseButtonDblClick: case QEvent::KeyPress: case QEvent::KeyRelease:
+            case QEvent::Wheel: case QEvent::Shortcut: case QEvent::ShortcutOverride:
+            case QEvent::TouchBegin: case QEvent::TouchUpdate: case QEvent::TouchEnd:
+                return true;
+            default:
+                return false;
+        }
+    }
+};
+} // namespace
+
+std::unique_ptr<ScanResult> MainWindow::runScanWithProgress(
+    const std::function<ScanResult()>& scanFn) {
+    // Optionally freeze the target for the whole scan so it's a consistent snapshot.
+    const auto pausePid=pauseWhileScanning_ ? ce::localTargetPid(process_.get()) : std::optional<pid_t>{};
+    ScopedSigstop pause(pausePid.value_or(0), pauseWhileScanning_);
+    // Pause the live-value refresh so it doesn't fight the scan for the target,
+    // and show the progress bar.
+    if (valueRefreshTimer_) valueRefreshTimer_->stop();
+    progressBar_->setValue(0);
+    progressBar_->setVisible(true);
+
+    std::unique_ptr<ScanResult> result;
+    std::exception_ptr err;
+    std::atomic<bool> done{false};
+    QScopedValueRollback scanning(scanInProgress_, true);
+    std::thread worker([&] {
+        try { result = std::make_unique<ScanResult>(scanFn()); }
+        catch (...) { err = std::current_exception(); }
+        done.store(true, std::memory_order_release);
+    });
+
+    // Drive the bar on the UI thread. Paints keep flowing (the bar animates);
+    // user input is dropped, not deferred, so no re-entrant or replayed scan.
+    {
+        ScopedInputBlocker blocker;
+        while (!done.load(std::memory_order_acquire)) {
+            progressBar_->setValue((int)(scanner_->progress() * 100.0f));
+            QApplication::processEvents(QEventLoop::AllEvents, 25);
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+        }
+    }
+    worker.join();
+
+    progressBar_->setValue(100);
+    progressBar_->setVisible(false);
+    if (valueRefreshTimer_)
+        valueRefreshTimer_->start(kValueRefreshMs);
+
+    if (err) std::rethrow_exception(err);
+    return result;
+}
+
+void MainWindow::runSnapshotTask(const std::function<void()>& task) {
+    if (valueRefreshTimer_) valueRefreshTimer_->stop();
+    progressBar_->setRange(0, 0);   // busy: a capture reports no progress
+    progressBar_->setVisible(true);
+
+    std::exception_ptr err;
+    std::atomic<bool> done{false};
+    QScopedValueRollback scanning(scanInProgress_, true);
+    std::thread worker([&] {
+        try { task(); }
+        catch (...) { err = std::current_exception(); }
+        done.store(true, std::memory_order_release);
+    });
+    {
+        ScopedInputBlocker blocker;
+        while (!done.load(std::memory_order_acquire)) {
+            QApplication::processEvents(QEventLoop::AllEvents, 25);
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+        }
+    }
+    worker.join();
+
+    progressBar_->setRange(0, 100);
+    progressBar_->setVisible(false);
+    if (valueRefreshTimer_)
+        valueRefreshTimer_->start(kValueRefreshMs);
+    if (err) std::rethrow_exception(err);
+}
+
+bool MainWindow::eventFilter(QObject* obj, QEvent* ev) {
+    if (ev->type() == QEvent::Resize) {
+        if (resultsEmptyHint_ && resultsView_ && obj == resultsView_->viewport())
+            resultsEmptyHint_->setGeometry(resultsView_->viewport()->rect());
+        if (tableEmptyHint_ && addressListView_ && obj == addressListView_->viewport())
+            tableEmptyHint_->setGeometry(addressListView_->viewport()->rect());
+    }
+    return QMainWindow::eventFilter(obj, ev);
+}
+
+void MainWindow::onFirstScan() {
+    // "New Scan" mode: a scan session is open, so this click resets to the
+    // pre-scan state (clears results, unlocks the value type) rather than
+    // scanning. The next click then runs a fresh First Scan.
+    if (lastResult_ != nullptr) {
+        resultsModel_->clear();
+        lastResult_.reset();
+        undoResult_.reset();
+        foundLabel_->setText("Found: 0");
+        // Changed, Increased and the like compare with a previous scan, which
+        // a first scan does not have: start again from Exact Value, as CE does.
+        if (scanNeedsPreviousResult(mapScanType(scanTypeCombo_->currentIndex())))
+            scanTypeCombo_->setCurrentIndex(0);
+        statusBar()->showMessage("New scan: pick a value type and value, then First Scan.", 4000);
+        updateScanButtons();
+        return;
+    }
+    if (!process_) {
+        statusBar()->showMessage("No process attached; open one first (Ctrl+O) to scan.", 4000);
+        return;
+    }
+    if (auto problem = ce::memoryAccessProblem(*process_)) {
+        QMessageBox::warning(this, "Cannot read the process", QString::fromStdString(*problem));
+        return;
+    }
+
+    ScanConfig config;
+    applyScanDataFormat(config);
+    config.valueType = mapValueType(valueTypeCombo_->currentIndex());
+    config.compareType = mapScanType(scanTypeCombo_->currentIndex());
+    // Fast Scan pins the scan to `alignment`-aligned addresses (much faster);
+    // unchecking it scans every byte offset so misaligned values are found too.
+    // Without this the Fast Scan checkbox did nothing.
+    config.alignment = fastScanCheck_->isChecked() ? alignEdit_->text().toInt() : 1;
+    if (config.alignment < 1) config.alignment = 1;
+    auto fromExpr = parseAddressExpr(fromAddressEdit_->text());
+    auto toExpr = parseAddressExpr(toAddressEdit_->text());
+    if (!fromExpr || !toExpr) {
+        QMessageBox::warning(this, "Scan range",
+            "From/To must be a hex address, symbol, or module+offset (e.g. target2, target2+0x5000).");
+        return;
+    }
+    config.startAddress = *fromExpr;
+    config.stopAddress = *toExpr;
+    if (config.startAddress > config.stopAddress) {
+        QMessageBox::warning(this, "Scan range",
+            "The From address must not be greater than the To address.");
+        return;
+    }
+    auto toMatch = [](Qt::CheckState s) {
+        return s == Qt::Checked   ? ce::ProtMatch::Yes
+             : s == Qt::Unchecked ? ce::ProtMatch::No
+                                  : ce::ProtMatch::Any;   // PartiallyChecked
+    };
+    config.writableMatch   = toMatch(writableCheck_->checkState());
+    config.executableMatch = toMatch(executableCheck_->checkState());
+    // CE Memory Scan Options: which region classes to scan (all on by default).
+    if (memPrivateCheck_) config.scanPrivate = memPrivateCheck_->isChecked();
+    if (memImageCheck_)   config.scanImage   = memImageCheck_->isChecked();
+    if (memMappedCheck_)  config.scanMapped  = memMappedCheck_->isChecked();
+
+    auto text = scanValueEdit_->text();
+    int intBase = (hexCheck_ && hexCheck_->isEnabled() && hexCheck_->isChecked()) ? 16 : 10;
+    if (config.valueType == ValueType::String || config.valueType == ValueType::UnicodeString) {
+        config.stringValue = text.toStdString();
+        if (config.valueType == ValueType::String)
+            config.stringEncoding = stringEncodingCombo_->currentText().toStdString();
+        // Case sensitivity applies to both Text and Unicode Text (set unconditionally).
+        config.caseSensitive = !caseSensitiveCheck_ || caseSensitiveCheck_->isChecked();
+        config.alignment = 1;
+    } else if (config.valueType == ValueType::ByteArray) {
+        // parseAOB returns false for an empty pattern OR a token that isn't hex
+        // or a wildcard (a typo like "8Z") — reject both instead of scanning wrong.
+        if (!config.parseAOB(text.toStdString())) {
+            QMessageBox::warning(this, "Array of byte scan", "Enter a valid AOB pattern (e.g. \"7F 45 ?? 46\").");
+            return;
+        }
+        config.alignment = 1;
+    } else if (config.valueType == ValueType::Binary) {
+        config.parseBinary(text.toStdString());
+        // parseBinary returns void; an empty pattern means nothing was parsed.
+        if (config.byteArray.empty()) {
+            QMessageBox::warning(this, "Binary scan", "Enter a valid binary pattern (e.g. \"0110??01\").");
+            return;
+        }
+        config.alignment = 1;
+    } else if (config.valueType == ValueType::Grouped) {
+        std::string error;
+        if (!config.parseGrouped(text.toStdString(), &error)) {
+            QMessageBox::warning(this, "Grouped scan", QString::fromStdString(error));
+            return;
+        }
+        config.alignment = 1;
+    } else if (config.valueType == ValueType::Custom) {
+        config.customFormula = text.toStdString();
+        config.customValueSize = std::max<size_t>(1, static_cast<size_t>(config.alignment));
+        config.alignment = 1;
+    } else if (config.valueType == ValueType::Float || config.valueType == ValueType::Double) {
+        if (!config.parseFloatingValues(text.toStdString(), scanValue2Edit_->text().toStdString())) {
+            QMessageBox::warning(this, "Floating scan", "Enter valid numeric values for the selected comparison.");return;
+        }
+    } else if (config.valueType == ValueType::Pointer) {
+        auto value = scanIntegerInput(text, intBase == 16, /*pointer=*/true);
+        if (!value && scanTakesValue(config.compareType)) { warnBadScanValue(this, text); return; }
+        config.intValue = value.value_or(0);
+    } else if (config.valueType == ValueType::All) {
+        if (!config.parseAllValues(text.toStdString(), scanValue2Edit_->text().toStdString(), intBase == 16)) {
+            QMessageBox::warning(this, "All scan", "Enter valid numeric values for the selected comparison.");return;
+        }
+    } else {
+        auto value = scanIntegerInput(text, intBase == 16);
+        if (!value && scanTakesValue(config.compareType)) { warnBadScanValue(this, text); return; }
+        config.intValue = value.value_or(0);
+    }
+    // "Value between..." needs a second (upper) bound from its own box.
+    if (config.compareType == ScanCompare::Between && config.valueType != ValueType::All &&
+        config.valueType != ValueType::Float && config.valueType != ValueType::Double) {
+        auto text2 = scanValue2Edit_->text();
+        if (config.valueType == ValueType::Float || config.valueType == ValueType::Double || config.valueType == ValueType::All)
+            config.floatValue2 = parseUserDouble(text2);
+        if (config.valueType != ValueType::Float && config.valueType != ValueType::Double) {
+            auto value = scanIntegerInput(text2, intBase == 16, config.valueType == ValueType::Pointer);
+            if (!value) { warnBadScanValue(this, text2); return; }
+            config.intValue2 = *value;
+        }
+    }
+    if (!applyFloatOptions(config, floatRoundingCombo_, floatToleranceEdit_)) {
+        QMessageBox::warning(this, "Floating tolerance", "Enter a finite nonnegative tolerance.");return;
+    }
+    size_t resultValueSize = resultValueSizeForConfig(config);
+
+    firstScanBtn_->setEnabled(false);
+    // Scan on a worker thread with a live progress bar (keeps the UI responsive).
+    std::unique_ptr<ScanResult> result;
+    try {
+        result = runScanWithProgress([&] { return scanner_->firstScan(*process_, config); });
+    } catch (const std::invalid_argument& e) {
+        // The scanner refused these settings and says why; the advice below
+        // is about running out of memory and does not apply.
+        firstScanBtn_->setEnabled(true);
+        QMessageBox::warning(this, "Scan failed", QString("The scan could not start: %1").arg(e.what()));
+        return;
+    } catch (const std::exception& e) {
+        // A huge target (e.g. an emulator mapping many GB of guest RAM) can
+        // exhaust memory during the scan/merge. Report it instead of letting
+        // the exception escape the Qt event handler and std::terminate.
+        firstScanBtn_->setEnabled(true);
+        QMessageBox::warning(this, "Scan failed",
+            QString("The scan could not complete: %1\n\n"
+                    "Try narrowing the From/To range, enabling Fast Scan, or "
+                    "choosing a more specific value type.").arg(e.what()));
+        return;
+    }
+    firstScanBtn_->setEnabled(true);
+
+    foundLabel_->setText(foundLabelText(result->count()));
+    if (result->hasWriteError())
+        QMessageBox::warning(this, "Scan results truncated",
+            "A scan-result file could not be fully written (the disk may be full). "
+            "Some results are unreliable; free space and scan again.");
+    if (result->valueSize()) resultValueSize = result->valueSize();
+    resultsModel_->setResult(result.get(), config.valueType, resultValueSize, config.stringEncoding);
+
+    undoResult_ = std::move(lastResult_);
+    undoResultType_ = lastResultType_;
+    undoResultValueSize_ = lastResultValueSize_;
+    lastResult_ = std::move(result);
+    lastResultType_ = config.valueType;
+    lastResultValueSize_ = resultValueSize;
+    updateScanButtons();
+    statusBar()->showMessage(lastResult_->hasWriteError() ? QStringLiteral("Scan results are incomplete.") :
+        QStringLiteral("First scan complete. %1").arg(foundLabelText(lastResult_->count())), 4000);
+}
+
+void MainWindow::onNextScan() {
+    if (!process_) {
+        statusBar()->showMessage("No process attached; open one first (Ctrl+O) to scan.", 4000);
+        return;
+    }
+    if (!lastResult_) {
+        statusBar()->showMessage("Run a First Scan before a Next Scan.", 4000);
+        return;
+    }
+
+    ScanConfig config;
+    applyScanDataFormat(config);
+    // Ordinary typed samples keep their original stride. All samples carry
+    // candidate metadata, so the backend can select a concrete surviving type.
+    config.valueType = lastResultType_ == ValueType::All ? mapValueType(valueTypeCombo_->currentIndex()) : lastResultType_;
+    config.compareType = mapScanType(scanTypeCombo_->currentIndex());
+    config.alignment = alignEdit_->text().toInt();
+
+    auto text = scanValueEdit_->text();
+    int intBase = (hexCheck_ && hexCheck_->isEnabled() && hexCheck_->isChecked()) ? 16 : 10;
+    if (config.valueType == ValueType::String || config.valueType == ValueType::UnicodeString) {
+        config.stringValue = text.toStdString();
+        if (config.valueType == ValueType::String)
+            config.stringEncoding = stringEncodingCombo_->currentText().toStdString();
+        // Case sensitivity applies to both Text and Unicode Text (set unconditionally).
+        config.caseSensitive = !caseSensitiveCheck_ || caseSensitiveCheck_->isChecked();
+        config.alignment = 1;
+    } else if (config.valueType == ValueType::ByteArray) {
+        // parseAOB returns false for an empty pattern OR a token that isn't hex
+        // or a wildcard (a typo like "8Z") — reject both instead of scanning wrong.
+        if (!config.parseAOB(text.toStdString())) {
+            QMessageBox::warning(this, "Array of byte scan", "Enter a valid AOB pattern (e.g. \"7F 45 ?? 46\").");
+            return;
+        }
+        config.alignment = 1;
+    } else if (config.valueType == ValueType::Binary) {
+        config.parseBinary(text.toStdString());
+        // parseBinary returns void; an empty pattern means nothing was parsed.
+        if (config.byteArray.empty()) {
+            QMessageBox::warning(this, "Binary scan", "Enter a valid binary pattern (e.g. \"0110??01\").");
+            return;
+        }
+        config.alignment = 1;
+    } else if (config.valueType == ValueType::Grouped) {
+        std::string error;
+        if (!config.parseGrouped(text.toStdString(), &error)) {
+            QMessageBox::warning(this, "Grouped scan", QString::fromStdString(error));
+            return;
+        }
+        config.alignment = 1;
+    } else if (config.valueType == ValueType::Custom) {
+        config.customFormula = text.toStdString();
+        // The first scan fixed the size (it depends on Fast Scan then, not now).
+        config.customValueSize = lastResultValueSize_ ? lastResultValueSize_ : std::max<size_t>(1, static_cast<size_t>(config.alignment));
+        config.alignment = 1;
+    } else if (config.valueType == ValueType::Float || config.valueType == ValueType::Double) {
+        if (!config.parseFloatingValues(text.toStdString(), scanValue2Edit_->text().toStdString())) {
+            QMessageBox::warning(this, "Floating scan", "Enter valid numeric values for the selected comparison.");return;
+        }
+    } else if (config.valueType == ValueType::Pointer) {
+        auto value = scanIntegerInput(text, intBase == 16, /*pointer=*/true);
+        if (!value && scanTakesValue(config.compareType)) { warnBadScanValue(this, text); return; }
+        config.intValue = value.value_or(0);
+    } else if (config.valueType == ValueType::All) {
+        if (!config.parseAllValues(text.toStdString(), scanValue2Edit_->text().toStdString(), intBase == 16)) {
+            QMessageBox::warning(this, "All scan", "Enter valid numeric values for the selected comparison.");return;
+        }
+    } else {
+        auto value = scanIntegerInput(text, intBase == 16);
+        if (!value && scanTakesValue(config.compareType)) { warnBadScanValue(this, text); return; }
+        config.intValue = value.value_or(0);
+    }
+    if (config.compareType == ScanCompare::Between && config.valueType != ValueType::All &&
+        config.valueType != ValueType::Float && config.valueType != ValueType::Double) {
+        auto text2 = scanValue2Edit_->text();
+        if (config.valueType == ValueType::Float || config.valueType == ValueType::Double || config.valueType == ValueType::All)
+            config.floatValue2 = parseUserDouble(text2);
+        if (config.valueType != ValueType::Float && config.valueType != ValueType::Double) {
+            auto value = scanIntegerInput(text2, intBase == 16, config.valueType == ValueType::Pointer);
+            if (!value) { warnBadScanValue(this, text2); return; }
+            config.intValue2 = *value;
+        }
+    }
+    if (!applyFloatOptions(config, floatRoundingCombo_, floatToleranceEdit_)) {
+        QMessageBox::warning(this, "Floating tolerance", "Enter a finite nonnegative tolerance.");return;
+    }
+
+    if (percentCheck_->isChecked()) {
+        config.percentageScan = true;
+        // parseUserDouble accepts ',' or '.' (Turkish comma-decimal locale).
+        // An empty or junk box was 0%, which also matches unchanged values.
+        bool ok = false;
+        config.percentageValue = parseUserDouble(percentValueEdit_->text(), &ok);
+        if (!ok || !std::isfinite(config.percentageValue)) { warnBadScanValue(this, percentValueEdit_->text()); return; }
+        auto percent2Text = percentValue2Edit_->text().trimmed();
+        config.percentageValue2 = config.percentageValue;
+        if (!percent2Text.isEmpty()) {
+            config.percentageValue2 = parseUserDouble(percent2Text, &ok);
+            if (!ok || !std::isfinite(config.percentageValue2)) { warnBadScanValue(this, percent2Text); return; }
+        }
+    }
+    size_t resultValueSize = resultValueSizeForConfig(config);
+
+    nextScanBtn_->setEnabled(false);
+    // Scan on a worker thread with a live progress bar (see onFirstScan).
+    std::unique_ptr<ScanResult> result;
+    try {
+        result = runScanWithProgress(
+            [&] { return scanner_->nextScan(*process_, config, *lastResult_); });
+    } catch (const std::exception& e) {
+        // Guard the same way as onFirstScan: a bad_alloc (or a rejected
+        // next-scan, e.g. a changed value-size stride) must not terminate.
+        nextScanBtn_->setEnabled(true);
+        QMessageBox::warning(this, "Scan failed",
+            QString("The next scan could not complete: %1").arg(e.what()));
+        return;
+    }
+    nextScanBtn_->setEnabled(true);
+
+    foundLabel_->setText(foundLabelText(result->count()));
+    if (result->hasWriteError())
+        QMessageBox::warning(this, "Scan results truncated",
+            "A scan-result file could not be fully written (the disk may be full). "
+            "Some results are unreliable; free space and scan again.");
+    if (result->valueSize()) resultValueSize = result->valueSize();
+    resultsModel_->setResult(result.get(), config.valueType, resultValueSize, config.stringEncoding);
+
+    undoResult_ = std::move(lastResult_);
+    undoResultType_ = lastResultType_;
+    undoResultValueSize_ = lastResultValueSize_;
+    lastResult_ = std::move(result);
+    lastResultType_ = config.valueType;
+    lastResultValueSize_ = resultValueSize;
+    updateScanButtons();
+    statusBar()->showMessage(lastResult_->hasWriteError() ? QStringLiteral("Scan results are incomplete.") :
+        QStringLiteral("Next scan complete. %1").arg(foundLabelText(lastResult_->count())), 4000);
+}
+
+void MainWindow::onUndoScan() {
+    if (!undoResult_) return;
+    lastResult_ = std::move(undoResult_);
+    lastResultType_ = undoResultType_;
+    lastResultValueSize_ = undoResultValueSize_;
+    undoResultType_ = ValueType::Int32;
+    undoResultValueSize_ = 0;
+    resultsModel_->setResult(lastResult_.get(), lastResultType_, lastResultValueSize_, resultsModel_->stringEncoding());
+    foundLabel_->setText(foundLabelText(lastResult_->count()));
+    updateScanButtons();
+}
+
+void MainWindow::onResultDoubleClicked(const QModelIndex& index) {
+    if (!lastResult_ || !index.isValid() || index.row() < 0 || static_cast<size_t>(index.row()) >= lastResult_->count()) return;
+    auto addr = resultsModel_->addressAt(index.row());
+    auto type = lastResultType_;
+    size_t size = type == ValueType::All ? lastResult_->allTypeValueSize(index.row()) : lastResultValueSize_;
+    if (type == ValueType::All || type == ValueType::Grouped || type == ValueType::Custom || type == ValueType::Binary)
+        type = ValueType::ByteArray;
+    int id = addressListModel_->addEntry(addr, type, "No description", "", size);
+    if (lastResult_->hasDataFormat())
+        addressListModel_->setEntryDataFormat(addressListModel_->rowOfId(id), lastResult_->byteOrder(), lastResult_->pointerWidth());
+}
+
+void MainWindow::onDeleteAddresses() {
+    auto selected = addressListView_->selectionModel()->selectedRows();
+    if (selected.isEmpty()) return;
+    QList<int> rows;
+    for (auto& idx : selected) rows.append(idx.row());
+    addressListModel_->removeEntries(rows);
+}
+
+void MainWindow::moveSelectedEntry(int row, int delta) {
+    int nr = addressListModel_->moveEntry(row, delta);
+    if (nr != row) addressListView_->selectRow(nr);
+}
+
+void MainWindow::onCopyAddresses() {
+    auto selected = addressListView_->selectionModel()->selectedRows();
+    if (selected.isEmpty()) return;
+
+    std::sort(selected.begin(), selected.end(), [](const QModelIndex& a, const QModelIndex& b) {
+        return a.row() < b.row();
+    });
+
+    auto allEntries = addressListModel_->toJson();
+    // A group comes with its subtree, as Delete (and so Cut) takes it: a cut
+    // group pasted back must not be an empty header.
+    std::vector<int> indents;
+    for (const auto& e : addressListModel_->entries()) indents.push_back(e.indent);
+    std::vector<std::size_t> rows;
+    for (const auto& idx : selected)
+        if (idx.row() >= 0 && idx.row() < (int)indents.size()) rows.push_back(static_cast<std::size_t>(idx.row()));
+    QJsonArray copied;
+    for (auto row : ce::expandGroupDeletion(indents, rows))
+        if ((qsizetype)row < allEntries.size()) copied.append(allEntries[(qsizetype)row].toObject());
+
+    QApplication::clipboard()->setText(
+        QString::fromUtf8(QJsonDocument(copied).toJson(QJsonDocument::Compact)));
+}
+
+void MainWindow::onPasteAddresses() {
+    const QString clip = QApplication::clipboard()->text();
+    QJsonArray pasted;
+    // Cheat Engine copies records as a <CheatEntries> XML fragment; accept that too
+    // so entries can be pasted straight from a CE session (or a shared table
+    // snippet), not only from our own JSON copy.
+    if (clip.contains(QLatin1String("<CheatEntry"))) {
+        ce::CheatTable t;
+        if (t.loadFromString(clip.toStdString()))
+            pasted = cheatEntriesToJson(t);
+    } else {
+        QJsonParseError error{};
+        auto doc = QJsonDocument::fromJson(clip.toUtf8(), &error);
+        if (error.error != QJsonParseError::NoError)
+            return;
+        if (doc.isArray())
+            pasted = doc.array();
+        else if (doc.isObject())
+            pasted = doc.object()["entries"].toArray();
+    }
+    if (pasted.isEmpty())
+        return;
+
+    auto entries = addressListModel_->toJson();
+    for (auto value : pasted) {
+        auto obj = value.toObject();
+        if (obj.isEmpty())
+            continue;
+        obj["active"] = false;
+        // Drop the copied id so fromJson allocates a fresh unique one — otherwise
+        // pasting into a table that already holds that id yields duplicate ids,
+        // which make getMemoryRecordByID / byId / Lua references ambiguous. (The
+        // row/indent-based hierarchy is unaffected — it doesn't key on id.)
+        obj.remove("id");
+        entries.append(obj);
+    }
+    addressListModel_->fromJson(entries, true);
+}
+
+void MainWindow::onFreezeTimer() {
+    if (process_)
+        addressListModel_->freezeWrite(process_.get());
+}
+
+// What a save writes, without what changes on its own: live values, on/off
+// state, group folding, and the resolved address of a pointer record.
+QByteArray MainWindow::tableFingerprint() const {
+    QJsonArray entries;
+    for (const auto& value : addressListModel_->toJson()) {
+        auto record = value.toObject();
+        record.remove("value"); record.remove("active"); record.remove("collapsed");
+        if (!record.value("addressExpr").toString().isEmpty()) record.remove("address");
+        entries.append(record);
+    }
+    QByteArray print = QJsonDocument(entries).toJson(QJsonDocument::Compact);
+    print += '\0'; print += tableComment_.toUtf8();
+    print += '\0'; print += tableLuaScript_.toUtf8();
+    for (const auto& c : disasmAnnotations_) {
+        print += '\0'; print += QByteArray::fromStdString(c.address + '\x1f' + c.comment + '\x1f' + c.label);
+    }
+    return print;
+}
+
+void MainWindow::markTableSaved() { savedTableFingerprint_ = tableFingerprint(); }
+
+// Before the table is replaced or the window closes: Save, Discard or Cancel
+// when it has changes no file holds. Nothing tracked this, so edits were
+// dropped without a word.
+bool MainWindow::maybeSaveTable() {
+    // Headless (the offscreen test platform): nobody can answer a prompt.
+    const auto platform = QGuiApplication::platformName();
+    if (platform == "offscreen" || platform == "minimal") return true;
+    // Nothing loaded or saved yet: only content is a change.
+    if (savedTableFingerprint_.isNull() && addressListModel_->rowCount() == 0 && tableComment_.isEmpty() &&
+        tableLuaScript_.isEmpty() && disasmAnnotations_.empty())
+        return true;
+    if (tableFingerprint() == savedTableFingerprint_) return true;
+    const auto answer = QMessageBox::question(this, "Unsaved changes",
+        "The cheat table has changes that are not saved. Save them?",
+        QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel, QMessageBox::Save);
+    if (answer == QMessageBox::Discard) return true;
+    if (answer != QMessageBox::Save) return false;
+    onSaveTable();
+    return tableFingerprint() == savedTableFingerprint_;   // saved (not cancelled or failed)
+}
+
+void MainWindow::closeEvent(QCloseEvent* ev) {
+    if (!maybeSaveTable()) { ev->ignore(); return; }
+    if (!releaseTargetUsers()) { ev->ignore(); return; }
+    // Remember where the user put the window and how they sized the panels, so
+    // the next launch comes up the same (restored in the constructor).
+    QSettings s;
+    s.setValue("mainwindow/geometry", saveGeometry());
+    for (auto* sp : findChildren<QSplitter*>())
+        if (!sp->objectName().isEmpty())
+            s.setValue("mainwindow/splitter/" + sp->objectName(), sp->saveState());
+    QMainWindow::closeEvent(ev);
+}
+
+bool MainWindow::releaseTargetUsers(bool force) {
+    // A scan worker is reading process_: the target cannot change under it.
+    // Callers retry (the exit check runs again, attachToPid re-queues).
+    if (scanInProgress_ && !force) return false;
+    const bool released = releaseTargetUsersOnce(force);
+    // The models stop using the old process at once: the caller may open a
+    // dialog (an event loop with timers and hotkeys) before it hands them the
+    // new one, and the old handle is about to be freed.
+    if (released || force) {
+        if (addressListModel_) addressListModel_->setProcess(nullptr);
+        if (resultsModel_) resultsModel_->setProcess(nullptr);
+    }
+    return released;
+}
+
+bool MainWindow::releaseTargetUsersOnce(bool force) {
+    AutoAsmUiOperation retirement(&autoAsm_, AutoAsmUiOperation::Purpose::Retire);
+    if (!retirement && !force) return false;
+    // Release debugger traces before restoring injected code. Editors must keep
+    // their original dependencies and recovery UI until cleanup succeeds.
+    if (debuggerWindow_) delete debuggerWindow_;
+    for (auto& finder : codeFinders_) if (finder) finder->stop();
+    const auto windows = targetWindows_;
+    for (const auto& window : windows)
+        if (window && !qobject_cast<ScriptEditor*>(window.data())) delete window.data();
+    struct Owner { uint64_t order; int id; QPointer<ScriptEditor> editor; };
+    std::vector<Owner> owners;
+    for (const auto& window : targetWindows_)
+        if (auto* editor = qobject_cast<ScriptEditor*>(window.data()); editor && editor->injectionOrder())
+            owners.push_back({editor->injectionOrder(), -1, editor});
+    if (addressListModel_) for (const auto& entry : addressListModel_->entries())
+        if (entry.autoAsmOrder) owners.push_back({entry.autoAsmOrder, entry.id, {}});
+    std::stable_sort(owners.begin(), owners.end(), [](const Owner& a, const Owner& b) { return a.order > b.order; });
+    bool cleaned = true;
+    for (const auto& owner : owners) {
+        if (owner.editor) {
+            if (!owner.editor->cleanupInjection(!force)) {
+                cleaned = false;
+                if (!force) { owner.editor->show(); owner.editor->raise(); return false; }
+            }
+        } else if (owner.id >= 0 && addressListModel_->byId(owner.id) && !addressListModel_->setActive(owner.id, false)) {
+            cleaned = false;
+            if (!force) return false;
+        }
+    }
+    if (addressListModel_ && !addressListModel_->deactivateAll()) cleaned = false;
+    if (!cleaned && !force) return false;
+    // Delete windows while their target, finders and Lua engine still exist.
+    // QPointer also covers nested windows deleted with one of their parents.
+    while (!targetWindows_.empty()) {
+        const auto window = targetWindows_.back();
+        targetWindows_.pop_back();
+        if (window) delete window.data();
+    }
+    // Finder-window destruction callbacks and refresh timers borrow these.
+    codeFinders_.clear();
+    codeFinderDebuggers_.clear();
+    // Saved undo belongs to the current address space. Keep its process handle
+    // and records available if restoration fails, so the user can repair/retry.
+    if (scanByteOrderCombo_) scanByteOrderCombo_->setCurrentIndex(0);
+    if (scanPointerWidthCombo_) scanPointerWidthCombo_->setCurrentIndex(0);
+    for (auto& viewer : memoryViewers_) if (viewer) viewer->detachFromTarget();
+    memoryViewers_.clear();
+    for (auto& dissector : structDissectors_) if (dissector) dissector->detachFromTarget();
+    structDissectors_.clear();
+    if (advancedOptions_) advancedOptions_->setProcess(nullptr);
+    if (openAddressDialog_) openAddressDialog_->detachFromTarget();
+    // A paused target must not stay frozen once we leave it.
+    if (pauseAction_ && pauseAction_->isChecked()) {
+        if (auto pid = ce::localTargetPid(process_.get())) ::kill(*pid, SIGCONT);
+        QSignalBlocker quiet(pauseAction_);
+        pauseAction_->setChecked(false);
+    }
+    snapshot_.reset();
+    allocations_.clear();
+    luaEngine_.setProcess(nullptr);
+    luaResolver_.clear();
+    return cleaned;
+}
+
+MainWindow::~MainWindow() {
+    // Normal close can be refused on cleanup failure. Forced destruction still
+    // attempts cleanup while these borrowed dependencies are alive, without a
+    // modal dialog entering an event loop during object destruction.
+    if (addressListModel_) {
+        addressListModel_->setActivationErrorCallback({});
+        addressListModel_->setActivationCallback({});
+    }
+    releaseTargetUsers(true);
+
+    // Drop Lua GUI callback bindings before luaEngine_ (and its lua_State) is
+    // destroyed with this window's members, so a stray Qt timer/widget callback
+    // can't fire into a freed lua_State.
+    ce::shutdownLuaGuiBindings();
+}
+
+// Build a ce::CheatTable from the current address list (shared by Save Table and
+// Create Trainer). Mirrors the JSON field mapping the .CT saver expects.
+void MainWindow::wireBrowserAnnotations(MemoryBrowser* browser) {
+    // Seed the browser with the stored comments and have it push each edit back to
+    // the MainWindow-owned store (which is serialized with the cheat table). Edits
+    // merge one at a time, so two viewers never overwrite each other's comments.
+    browser->setAnnotationStore(disasmAnnotations_,
+        [this](const MemoryBrowser::AnnotationChange& change) {
+            // A loaded table may spell the same address differently ("game+1234"),
+            // so match an entry by its key or by where it resolves.
+            ce::ExpressionParser parser(process_.get(), &luaResolver_);
+            auto sameAddress = [&](const ce::DisassemblerComment& c) {
+                if (c.address == change.expression) return true;
+                if (!process_ || !change.address) return false;
+                auto resolved = parser.parse(c.address);
+                return resolved && *resolved == change.address;
+            };
+            auto it = std::find_if(disasmAnnotations_.begin(), disasmAnnotations_.end(), sameAddress);
+            if (it == disasmAnnotations_.end() && !change.text.empty())
+                it = disasmAnnotations_.insert(disasmAnnotations_.end(), {change.expression, {}, {}});
+            if (it != disasmAnnotations_.end()) {
+                (change.label ? it->label : it->comment) = change.text;
+                if (it->comment.empty() && it->label.empty()) disasmAnnotations_.erase(it);
+            }
+            // Labels reach the other viewers through setUserSymbol; comments here.
+            if (!change.label)
+                for (const auto& viewer : memoryViewers_)
+                    if (viewer) viewer->setComment(change.address, change.text);
+            rebuildDebuggerComments();   // keep an open debugger's inline comments in sync
+        });
+    // The browser's step buttons open the full Debugger (which owns the debug
+    // session and does real single-stepping).
+    browser->setDebuggerLauncher([this](uintptr_t /*addr*/) { showDebugger(); });
+    // In-Memory-Viewer stepping (CE parity): F7/F8/F9 in the viewer drive the debug
+    // session hosted in the Debugger window. Each is a no-op unless a target is
+    // paused; the onStep*/onContinue slots run on the debugger and re-emit stopped(),
+    // which this window forwards to open viewers to advance the highlighted line.
+    browser->setStepControls(
+        [this]() { if (debuggerWindow_ && debuggerWindow_->debugStopped())
+                       QMetaObject::invokeMethod(debuggerWindow_, "onStepInto"); },
+        [this]() { if (debuggerWindow_ && debuggerWindow_->debugStopped())
+                       QMetaObject::invokeMethod(debuggerWindow_, "onStepOver"); },
+        [this]() { if (debuggerWindow_ && debuggerWindow_->debugStopped())
+                       QMetaObject::invokeMethod(debuggerWindow_, "onContinue"); });
+    // Run to cursor (F4): run to the viewer's own selected line, not the Debugger's.
+    browser->setRunToCursor([this](uintptr_t addr) {
+        if (addr && debuggerWindow_ && debuggerWindow_->debugStopped())
+            debuggerWindow_->runToAddress(addr);
+    });
+    // "Auto Assemble > Create code/AOB injection here" opens a script editor
+    // pre-filled with the generated template.
+    browser->setAutoAssembleOpener([this](const QString& script, uintptr_t address, size_t size) {
+        auto* editor = new ScriptEditor(process_.get(), &autoAsm_, this);
+        trackTargetWindow(editor);
+        editor->setAttribute(Qt::WA_DeleteOnClose);
+        editor->setAddToTable([this](const QString& d, const QString& s) {
+            addressListModel_->addScriptEntry(d, s);
+        });
+        editor->setBeforeExecute([this]() { stopCodeFindersForInjection(); });
+        editor->setScript(script.toStdString());
+        editor->setInjectionAddress(address, size);
+        editor->show();
+    });
+    // Tools > Dissect data/structures opens a Structure Dissector at the address.
+    browser->setDissectOpener([this](uintptr_t addr) {
+        if (!process_) return;
+        auto* sd = new StructureDissector(process_.get(), addr, this);
+        sd->setAttribute(Qt::WA_DeleteOnClose);
+        sd->setAddToListCallback([this](uintptr_t a, ce::ValueType t, const QString& d) {
+            addressListModel_->addEntry(a, t, d);
+        });
+        trackStructDissector(sd);
+        sd->show();
+    });
+    // File > New window: open through openMemoryView so the new viewer is tracked
+    // (and frozen on target exit), not left holding a stale ProcessHandle.
+    browser->setNewWindowOpener([this](uintptr_t addr) { openMemoryView(addr); });
+}
+
+void MainWindow::editScriptEntry(int row) {
+    const auto& entries = addressListModel_->entries();
+    if (row < 0 || row >= (int)entries.size() || entries[row].autoAsmScript.isEmpty())
+        return;
+    int id = entries[row].id;
+    QString desc = entries[row].description;
+    QString script = entries[row].autoAsmScript;
+
+    auto* editor = new ScriptEditor(process_.get(), &autoAsm_, this);
+    trackTargetWindow(editor);
+    editor->setAttribute(Qt::WA_DeleteOnClose);
+    editor->setWindowTitle("Auto Assembler: " + desc);
+    editor->setDefaultDescription(desc);
+    editor->setTableButtonText("Save to Table");
+    editor->setScript(script.toStdString());
+    // Save back to THIS entry (found by stable id, so it survives reordering)
+    // instead of appending a duplicate row.
+    editor->setAddToTable([this, id](const QString& d, const QString& s) {
+        addressListModel_->updateScriptEntryById(id, d, s);
+    });
+    editor->setBeforeExecute([this]() { stopCodeFindersForInjection(); });
+    editor->show();
+}
+
+ce::CheatTable MainWindow::buildCheatTable() const {
+    ce::CheatTable table=tableMetadata_;
+    if (table.gameName.empty()) table.gameName = (currentProcessName_.isEmpty() ? processLabel_->text() : currentProcessName_).toStdString();
+    table.comment = tableComment_.toStdString();   // table notes (Comments window)
+    table.luaScript = tableLuaScript_.toStdString();  // table-level Lua (CE <LuaScript>)
+    auto json = addressListModel_->toJson();
+    int saveIdx = 0;
+    for (auto val : json) {
+        auto obj = val.toObject();
+        ce::CheatEntry e;
+        // Keep stable record IDs; translate the GUI parent row to its ID below.
+        e.id = obj.value("id").toInt(saveIdx++);
+        e.description = obj["description"].toString().toStdString();
+        e.address = obj["address"].toString().toULongLong(nullptr, 16);
+        auto exprStr = obj["addressExpr"].toString();
+        if (!exprStr.isEmpty()) e.addressString = exprStr.toStdString();
+        // A loaded pointer path is shown as one expression ("[[game.exe+1C]+8]+10");
+        // a table keeps it as a base and offsets. Split back only what
+        // buildPointerExpression made, so a hand-written expression stays as typed.
+        // A script record's table entry has an address but no offsets.
+        if (auto chain = ce::parsePointerExpression(e.addressString);
+            chain && obj["asm"].toString().isEmpty() &&
+            ce::buildPointerExpression(chain->base, chain->offsets) == e.addressString) {
+            e.addressString = chain->base;
+            e.offsets = chain->offsets;
+            // A numeric base is written the way Cheat Engine writes addresses.
+            QString base = QString::fromStdString(chain->base);
+            bool plain = false;
+            if (base.startsWith("0x")) (void)base.mid(2).toULongLong(&plain, 16);
+            if (plain) e.addressString = base.mid(2).toStdString();
+        }
+        auto typeStr = obj["type"].toString().toStdString();
+        if (typeStr == "byte") e.type = ce::ValueType::Byte;
+        else if (typeStr == "i16") e.type = ce::ValueType::Int16;
+        else if (typeStr == "i32") e.type = ce::ValueType::Int32;
+        else if (typeStr == "i64") e.type = ce::ValueType::Int64;
+        else if (typeStr == "pointer") e.type = ce::ValueType::Pointer;
+        else if (typeStr == "float") e.type = ce::ValueType::Float;
+        else if (typeStr == "double") e.type = ce::ValueType::Double;
+        else if (typeStr == "string") e.type = ce::ValueType::String;
+        else if (typeStr == "unicode") e.type = ce::ValueType::UnicodeString;
+        else if (typeStr == "aob") e.type = ce::ValueType::ByteArray;
+        else if (typeStr == "binary") e.type = ce::ValueType::Binary;
+        else if (typeStr == "grouped") e.type = ce::ValueType::Grouped;
+        else if (typeStr == "custom") e.type = ce::ValueType::Custom;
+        else e.type = ce::ValueType::Int32;
+        e.length = obj["byteCount"].toInt(0);   // String/AoB element length -> CE <Length>
+        e.value = obj["value"].toString().toStdString();
+        e.active = obj["active"].toBool();
+        e.showAsHex = obj["showAsHex"].toBool();
+        e.showAsSigned = obj["showAsSigned"].toBool(true);
+        const auto order = obj["dataByteOrder"].toString();
+        e.dataByteOrder = order == "big" || (order.isEmpty() && obj["bigEndian"].toBool()) ? ByteOrder::Big : order == "little" ? ByteOrder::Little : ByteOrder::Unknown;
+        e.pointerWidth = static_cast<uint8_t>(obj["pointerWidth"].toInt());
+        e.freezeMode = (ce::FreezeMode)obj["freezeMode"].toInt();
+        e.autoAsmScript = obj["asm"].toString().toStdString();
+        e.color = obj["color"].toString().toStdString();
+        e.dropdownList = obj["dropdown"].toString().toStdString();
+        e.hotkeyKeys = obj["hotkeys"].toString().toStdString();
+        e.increaseHotkeyKeys = obj["increaseHotkey"].toString().toStdString();
+        e.setValueHotkeyKeys = obj["setValueHotkey"].toString().toStdString();
+        e.setValueHotkeyValue = obj["setValueHotkeyValue"].toString().toStdString();
+        e.decreaseHotkeyKeys = obj["decreaseHotkey"].toString().toStdString();
+        e.hotkeyStep = obj["hotkeyStep"].toString().toStdString();
+        e.isGroup = obj["group"].toBool();
+        e.collapsed = obj["collapsed"].toBool();
+        e.activateChildren = obj["activateChildren"].toBool(true);
+        e.deactivateChildren = obj["deactivateChildren"].toBool(true);
+        e.optionsXml = obj["optionsXml"].toString().toStdString();
+        e.luaScript = obj["lua"].toString().toStdString();
+        e.customTypeName = obj["customType"].toString().toStdString();
+        e.asyncScript = obj["async"].toBool();
+        e.dropdownAttributes = obj["dropdownAttributes"].toString().toStdString();
+        e.unparsedAddress = obj["unparsedAddress"].toString().toStdString();
+        for (const auto& text : obj["unparsedOffsets"].toArray())
+            e.unparsedOffsets.push_back(text.toString().toStdString());
+        e.extraHotkeysXml = obj["extraHotkeys"].toString().toStdString();
+        e.extraXml = obj["extraXml"].toString().toStdString();
+        const int parentRow=obj["parent"].toInt(-1);
+        e.parentId=parentRow>=0 && parentRow<json.size()
+            ? json[parentRow].toObject().value("id").toInt(parentRow) : -1;
+        table.entries.push_back(e);
+    }
+    table.disassemblerComments = disasmAnnotations_;
+    return table;
+}
+
+void MainWindow::onCreateTrainer() {
+    auto path = QFileDialog::getSaveFileName(this, "Create Trainer (C source)",
+        "trainer.c", "C source (*.c);;All Files (*)");
+    if (path.isEmpty()) return;
+    try {
+        ce::CheatTable table = buildCheatTable();
+        ce::TrainerGenerator gen;
+        std::string src = gen.generateSource(table);
+        QFile f(path);
+        if (!f.open(QIODevice::WriteOnly)) {
+            QMessageBox::warning(this, "Create Trainer", "Could not write the trainer source file.");
+            return;
+        }
+        f.write(src.data(), (qint64)src.size());
+        statusBar()->showMessage(
+            QString("Trainer C source written to %1 (compile with gcc)").arg(path), 6000);
+    } catch (const std::exception& ex) {
+        QMessageBox::critical(this, "Create Trainer",
+            QString("Trainer generation failed:\n%1").arg(ex.what()));
+    }
+}
+
+std::optional<uintptr_t> MainWindow::parseAddressExpr(const QString& text) {
+    QString t = text.trimmed();
+    if (t.isEmpty()) return std::nullopt;
+    // Lazily load module/symbol info so "target2+0x100" and symbols resolve.
+    if (process_ && luaResolver_.count() == 0) luaResolver_.loadProcess(*process_);
+    ce::ExpressionParser parser(process_.get(), &luaResolver_);
+    if (auto a = parser.parse(t.toStdString()); a) return a;
+    bool ok = false;
+    uintptr_t v = t.toULongLong(&ok, 16);
+    return ok ? std::optional<uintptr_t>(v) : std::nullopt;
+}
+
+void MainWindow::rebuildValueHotkeys() {
+    for (auto* shortcut : valueHotkeyShortcuts_)
+        shortcut->deleteLater();
+    valueHotkeyShortcuts_.clear();
+    if (globalHotkeys_) globalHotkeys_->clear();
+    hotkeyActions_.clear();
+    int nextId = 1;
+
+    const auto& entries = addressListModel_->entries();
+    for (int row = 0; row < (int)entries.size(); ++row) {
+        const auto& entry = entries[row];
+
+        bool ok = false;
+        // Accept a comma decimal separator like every other value field, so a "0,5"
+        // step in a comma-locale isn't silently dropped to the default (QString::
+        // toDouble is C-locale only).
+        double step = QString(entry.hotkeyStep).replace(',', '.').toDouble(&ok);
+        if (!ok || step == 0.0)
+            step = 1.0;
+
+        // Register a hotkey system-wide (X11) so it fires while the game is
+        // focused; if that fails (non-X11 / unmappable key), fall back to a
+        // Qt::ApplicationShortcut that only works when a Neversnooze CE window is focused.
+        // Toggle and set-value act once per press; increase and decrease repeat
+        // while the key is held, as in CE. The portal name comes from the
+        // record id, not the row, so a desktop's binding stays with its record.
+        auto addHotkey = [&](const QString& keys, const char* slot, bool repeats, std::function<void()> action) {
+            QKeySequence sequence(keys);
+            if (sequence.isEmpty())
+                return;
+            int id = nextId++;
+            const QString name = QStringLiteral("ce_%1_%2").arg(entry.id).arg(QLatin1String(slot));
+            const QString description = QStringLiteral("%1 (%2)").arg(entry.description, QLatin1String(slot));
+            if (globalHotkeys_ && globalHotkeys_->registerHotkey(id, sequence, name, description)) {
+                hotkeyActions_.insert(id, {std::move(action), repeats});
+                return;
+            }
+            auto* shortcut = new QShortcut(sequence, this);
+            shortcut->setContext(Qt::ApplicationShortcut);
+            shortcut->setAutoRepeat(repeats);
+            connect(shortcut, &QShortcut::activated, this, action);
+            valueHotkeyShortcuts_.push_back(shortcut);
+        };
+
+        // Capture the entry's stable id, not its row: a reorder (Move Up/Down, drag) or
+        // a delete shifts row indices, but these hotkeys are only rebuilt on insert/
+        // remove/reset, so a row-based capture would fire on the wrong entry. Resolve the
+        // current row from the id each time the key is pressed.
+        const int id = entry.id;
+        // Toggle-active hotkey: flip the entry's active state. A group header
+        // carries one too (CE tables), and toggles its children with it.
+        addHotkey(entry.hotkeyKeys, "toggle", false, [this, id]() {
+            int r = addressListModel_->rowOfId(id);
+            if (r >= 0) addressListModel_->toggleActive(r);
+        });
+        if (entry.isGroup) continue;
+        addHotkey(entry.increaseHotkeyKeys, "increase", true, [this, id, step]() {
+            int r = addressListModel_->rowOfId(id);
+            if (r < 0 || !addressListModel_->adjustEntryValue(r, step * 1.0))
+                QApplication::beep();
+        });
+        addHotkey(entry.decreaseHotkeyKeys, "decrease", true, [this, id, step]() {
+            int r = addressListModel_->rowOfId(id);
+            if (r < 0 || !addressListModel_->adjustEntryValue(r, step * -1.0))
+                QApplication::beep();
+        });
+        // Set-value hotkey: write a fixed value (e.g. bind a key to "health = 999").
+        addHotkey(entry.setValueHotkeyKeys, "set", false, [this, id, val = entry.setValueHotkeyValue]() {
+            int r = addressListModel_->rowOfId(id);
+            if (r >= 0) addressListModel_->setEntryValueTo(r, val);
+        });
+    }
+}
+
+void MainWindow::onSaveScanResults() {
+    if (!resultsModel_ || !resultsModel_->resultCount()) { statusBar()->showMessage("No scan results to save.", 4000); return; }
+    const QString path = QFileDialog::getSaveFileName(this, "Save all current scan results",
+        "scanresults.txt", "Text (*.txt);;CSV (*.csv);;All files (*)");
+    if (path.isEmpty()) return;
+    const size_t rows = resultsModel_->resultCount();
+    if (!rows) { statusBar()->showMessage("No scan results to save.", 4000); return; }
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        statusBar()->showMessage(file.errorString(), 4000); return;
+    }
+    const bool csv = path.endsWith(".csv", Qt::CaseInsensitive);
+    const QChar separator = csv ? QChar(',') : QChar('\t');
+    auto field = [csv](QString text) {
+        if (csv) return QString('"') + text.replace("\"", "\"\"") + '"';
+        return text.replace("\t", "\\t").replace("\r", "\\r").replace("\n", "\\n");
+    };
+    QProgressDialog progress("Saving all scan results...", "Cancel", 0, 1000, this);
+    progress.setWindowModality(Qt::WindowModal);
+    bool changed = false;
+    connect(resultsModel_, &QAbstractItemModel::modelReset, &progress, [&] { changed = true; });
+    QTextStream output(&file);
+    output << "Address" << separator << "Value" << '\n';
+    for (size_t row = 0; row < rows; ++row) {
+        if (row % 1000 == 0) {
+            progress.setValue(static_cast<int>(static_cast<long double>(row) / rows * 1000));
+            QCoreApplication::processEvents();
+            if (changed || progress.wasCanceled()) {
+                file.cancelWriting();
+                statusBar()->showMessage(changed ? "Scan results changed; export canceled." : "Export canceled.", 4000);
+                return;
+            }
+        }
+        output << field(resultsModel_->displayValueAt(row, 0)) << separator
+               << field(resultsModel_->displayValueAt(row, 1)) << '\n';
+    }
+    output.flush();
+    if (output.status() != QTextStream::Ok || !file.flush() || !file.commit()) {
+        statusBar()->showMessage("Could not save scan results: " + file.errorString(), 6000); return;
+    }
+    statusBar()->showMessage(QString("Saved %1 results to %2").arg(qulonglong(rows)).arg(QFileInfo(path).fileName()), 6000);
+}
+
+namespace {
+class TableDeviceBuffer : public std::streambuf {
+    QIODevice& device_;
+protected:
+    std::streamsize xsputn(const char* bytes,std::streamsize size) override {
+        auto written=device_.write(bytes,static_cast<qint64>(size));
+        return written<0 ? 0 : static_cast<std::streamsize>(written);
+    }
+    int_type overflow(int_type c) override {
+        if (traits_type::eq_int_type(c,traits_type::eof())) return traits_type::not_eof(c);
+        char byte=traits_type::to_char_type(c);
+        return device_.write(&byte,1)==1 ? c : traits_type::eof();
+    }
+public:
+    explicit TableDeviceBuffer(QIODevice& device) : device_(device) {}
+};
+}
+
+void MainWindow::onSaveTable() {
+    // A deleted file is simply written again; saveTableToPath reports real errors.
+    if (currentTablePath_.isEmpty()) { onSaveTableAs(); return; }
+    // The saver picks the format from the name (.ct: XML, otherwise JSON). A
+    // table loaded from something else (a password-protected .CETRAINER, CE
+    // XML without .ct) would be replaced by a different format, a protected
+    // one in plain text: ask where to save instead.
+    const auto onDisk = ce::detectTableFormat(currentTablePath_.toStdString());
+    const bool ct = currentTablePath_.endsWith(".ct", Qt::CaseInsensitive);
+    if (onDisk == ce::TableFormat::Protected || (onDisk == ce::TableFormat::Xml && !ct) ||
+        (onDisk == ce::TableFormat::Json && ct)) {
+        onSaveTableAs();
+        return;
+    }
+    saveTableToPath(currentTablePath_);
+}
+
+// Cheat Engine writes ".CT"; GTK's file chooser matches patterns case-sensitively,
+// so list both spellings or a user's existing tables would be hidden.
+static const char* kTableFileFilter =
+    "Cheat Tables (*.ct *.CT);;JSON Tables (*.json *.JSON);;All Files (*)";
+
+void MainWindow::onSaveTableAs() {
+    QString filter;
+    auto path=QFileDialog::getSaveFileName(this,"Save Cheat Table",currentTablePath_,kTableFileFilter,&filter);
+    if (path.isEmpty()) return;
+    // Native choosers don't add an extension; take it from the chosen file type,
+    // since saveTableToPath picks the format from the name.
+    if (QFileInfo(path).suffix().isEmpty())
+        path += filter.startsWith("JSON") ? ".json" : ".CT";
+    saveTableToPath(path);
+}
+
+bool MainWindow::saveTableToPath(const QString& path) {
+    auto fail=[&](const QString& reason) {
+        QMessageBox::critical(this,"Save Cheat Table",QString("Could not save %1:\n%2").arg(path,reason));
+        return false;
+    };
+    try {
+        QSaveFile file(path);
+        // Never fall back to truncating the previous table if staging fails.
+        file.setDirectWriteFallback(false);
+        if (!file.open(QIODevice::WriteOnly)) return fail(file.errorString());
+        if (path.endsWith(".ct",Qt::CaseInsensitive)) {
+            auto table=buildCheatTable();
+            TableDeviceBuffer buffer(file);std::ostream output(&buffer);
+            if (!ce::writeTableXml(table,output)) {file.cancelWriting();return fail("Invalid table data or incomplete write.");}
+        } else {
+            // Keep the GUI's richer native records (including codecs), while
+            // serializing shared table metadata through the core JSON writer.
+            auto metadata=tableMetadata_;
+            if (metadata.gameName.empty()) metadata.gameName=(currentProcessName_.isEmpty() ? processLabel_->text() : currentProcessName_).toStdString();
+            metadata.comment=tableComment_.toStdString();metadata.luaScript=tableLuaScript_.toStdString();
+            metadata.disassemblerComments=disasmAnnotations_;
+            std::ostringstream output;
+            if (!ce::writeTableJson(metadata,output)) {file.cancelWriting();return fail("Invalid table metadata.");}
+            auto root=QJsonDocument::fromJson(QByteArray::fromStdString(output.str())).object();
+            root["process"]=processLabel_->text();root["entries"]=addressListModel_->toJson();
+            const auto bytes=QJsonDocument(root).toJson();
+            if (file.write(bytes)!=bytes.size()) {const auto error=file.errorString();file.cancelWriting();return fail(error);}
+        }
+        // Older Qt can commit a partial buffered write without reporting its
+        // flush error. Check the device flush before replacing the old table.
+        if (!file.flush()) {const auto error=file.errorString();file.cancelWriting();return fail(error);}
+        if (!file.commit()) return fail(file.errorString());
+        addRecentTable(path);
+        statusBar()->showMessage(QString("Saved table to %1").arg(QFileInfo(path).fileName()),4000);
+        return true;
+    } catch (const std::exception& ex) {return fail(QString::fromUtf8(ex.what()));}
+      catch (...) {return fail("Unknown save error.");}
+}
+
+void MainWindow::onLoadTable() {
+    if (!maybeSaveTable()) return;
+    auto path = QFileDialog::getOpenFileName(this, "Load Cheat Table",
+        currentTablePath_.isEmpty() ? QString() : QFileInfo(currentTablePath_).absolutePath(), kTableFileFilter);
+    if (path.isEmpty()) return;
+    loadTableFromPath(path);
+}
+
+// Load a cheat table from a path (no dialog). Shared by onLoadTable and the
+// command-line "neversnooze-ce <table.ct>" entry point.
+// Convert a parsed CheatTable's records into the address-list JSON schema
+// (the same shape AddressListModel::toJson emits), computing each record's indent
+// from the parentId tree. Shared by full-table load (replace) and clipboard paste
+// of CE XML (append).
+static QJsonArray cheatEntriesToJson(const ce::CheatTable& table) {
+    QJsonArray arr;
+    // Compute each entry's nesting level from the parentId tree (entries are in
+    // document order, parents before children) so imported groups indent in the
+    // address list, which tracks hierarchy by indent depth.
+    std::unordered_map<int, int> indentById;
+    for (const auto& e : table.entries) {
+        QJsonObject obj;
+        obj["id"]=e.id;
+        int indent = 0;
+        if (e.parentId != -1) {
+            auto it = indentById.find(e.parentId);
+            if (it != indentById.end()) indent = it->second + 1;
+        }
+        indentById[e.id] = indent;
+        obj["indent"] = indent;
+        obj["description"] = QString::fromStdString(e.description);
+        obj["address"] = QString("0x%1").arg(e.address, 0, 16);
+        // Preserve CE symbolic bases ("game.exe+1C") and pointer offset chains
+        // as an address expression that is re-evaluated each refresh.
+        if (!e.addressString.empty() || !e.offsets.empty()) {
+            std::string base = e.addressString.empty()
+                ? "0x" + QString::number(e.address, 16).toStdString()
+                : e.addressString;
+            obj["addressExpr"] = QString::fromStdString(ce::buildPointerExpression(base, e.offsets));
+        }
+        obj["type"] = QString::number((int)e.type);
+        obj["value"] = QString::fromStdString(e.value);
+        // CE <Length> for String / Array-of-byte elements; without it the record
+        // reads/displays at the 64-byte default and a re-save drops the length.
+        if (e.length > 0) obj["byteCount"] = (int)e.length;
+        obj["active"] = e.active;
+        obj["showAsHex"] = e.showAsHex;
+        obj["showAsSigned"] = e.showAsSigned;
+        if (e.dataByteOrder != ByteOrder::Unknown) obj["dataByteOrder"] = e.dataByteOrder == ByteOrder::Big ? "big" : "little";
+        if (e.pointerWidth) obj["pointerWidth"] = e.pointerWidth;
+        obj["freezeMode"] = (int)e.freezeMode;
+        obj["asm"] = QString::fromStdString(e.autoAsmScript);
+        obj["color"] = QString::fromStdString(e.color);
+        obj["dropdown"] = QString::fromStdString(e.dropdownList);
+        obj["hotkeys"] = QString::fromStdString(e.hotkeyKeys);
+        obj["increaseHotkey"] = QString::fromStdString(e.increaseHotkeyKeys);
+        obj["setValueHotkey"] = QString::fromStdString(e.setValueHotkeyKeys);
+        obj["setValueHotkeyValue"] = QString::fromStdString(e.setValueHotkeyValue);
+        obj["decreaseHotkey"] = QString::fromStdString(e.decreaseHotkeyKeys);
+        obj["hotkeyStep"] = QString::fromStdString(e.hotkeyStep);
+        obj["group"] = e.isGroup;
+        obj["collapsed"] = e.collapsed;
+        obj["activateChildren"] = e.activateChildren;
+        obj["deactivateChildren"] = e.deactivateChildren;
+        obj["optionsXml"] = QString::fromStdString(e.optionsXml);
+        obj["lua"] = QString::fromStdString(e.luaScript);
+        // Fields the list only keeps for the save, under the table JSON names.
+        if (!e.customTypeName.empty()) obj["customType"] = QString::fromStdString(e.customTypeName);
+        if (e.asyncScript) obj["async"] = true;
+        if (!e.dropdownAttributes.empty()) obj["dropdownAttributes"] = QString::fromStdString(e.dropdownAttributes);
+        if (!e.unparsedOffsets.empty()) {
+            QJsonArray texts;
+            for (const auto& text : e.unparsedOffsets) texts.append(QString::fromStdString(text));
+            obj["unparsedAddress"] = QString::fromStdString(e.unparsedAddress);
+            obj["unparsedOffsets"] = texts;
+        }
+        if (!e.extraHotkeysXml.empty()) obj["extraHotkeys"] = QString::fromStdString(e.extraHotkeysXml);
+        if (!e.extraXml.empty()) obj["extraXml"] = QString::fromStdString(e.extraXml);
+        obj["parent"] = e.parentId;
+        arr.append(obj);
+    }
+    return arr;
+}
+
+// Populate the address list (and table comment / disassembler annotations / table
+// Lua) from a parsed CheatTable. Shared by every load path that yields a
+// CheatTable model (CE XML .CT and password-protected .CETRAINER), so they behave
+// identically. JSON may add codec/presentation settings to the common records.
+bool MainWindow::loadCheatTableModel(const ce::CheatTable& table,const QJsonArray* originalJson) {
+    QJsonArray arr = cheatEntriesToJson(table);
+    if (originalJson && originalJson->size()==arr.size()) {
+        for (qsizetype i=0;i<arr.size();++i) {
+            auto record=arr[i].toObject();const auto original=(*originalJson)[i].toObject();
+            for (const auto* field:{"codec","indent"})
+                if (original.contains(field)) record[field]=original[field];
+            arr[i]=record;
+        }
+    }
+    // A table's saved <Activated> is not acted on: enabling a record writes to
+    // the game or runs its script (and the script's {$lua}) before the user was
+    // asked anything. Records load switched off, as paste does.
+    for (qsizetype i=0;i<arr.size();++i) {
+        auto record=arr[i].toObject();
+        record["active"]=false;
+        arr[i]=record;
+    }
+    if (!loadAddressEntries(arr)) return false;
+    tableMetadata_.gameName=table.gameName;tableMetadata_.gameVersion=table.gameVersion;
+    tableMetadata_.author=table.author;tableMetadata_.structures=table.structures;
+    tableMetadata_.rawFormsXml=table.rawFormsXml;tableMetadata_.rawSectionsXml=table.rawSectionsXml;
+    // An open Comments or Lua Script window holds the previous table's text,
+    // and its next edit would overwrite the loaded table's.
+    for (auto& window : tableTextWindows_) if (window) window->close();
+    tableTextWindows_.clear();
+    tableComment_ = QString::fromStdString(table.comment);
+    // Retain the table-level Lua script so it can be viewed/edited (Table > Show
+    // Cheat Table Lua Script) and re-saved, not just run once on load.
+    tableLuaScript_ = QString::fromStdString(table.luaScript);
+    // Run the table-level Lua script (CE's <LuaScript>) after the records are
+    // loaded, so it can define trainer functions/hooks and reference records.
+    if (!table.luaScript.empty()) {
+        // CE asktorunluascript: never auto-run an untrusted table's Lua, ask first.
+        auto answer = QMessageBox::question(this, "Execute this lua script?",
+            "This cheat table contains a Lua script.\n\n"
+            "Only execute scripts from tables you trust, a table's Lua can hook "
+            "and manipulate the target. Execute it?",
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (answer == QMessageBox::Yes) {
+            luaEngine_.setProcess(process_.get());
+            luaEngine_.setAddressList(addressListModel_);
+            auto res = luaEngine_.evalToString(table.luaScript);
+            if (!res.has_value())
+                statusBar()->showMessage(
+                    QString("Table Lua error: %1").arg(QString::fromStdString(res.error())), 8000);
+        }
+    }
+    // Open Memory Viewers hold the previous table's comments and labels; their
+    // next save would write those over the loaded table's.
+    for (auto& viewer : memoryViewers_)
+        if (viewer) viewer->replaceAnnotations(disasmAnnotations_, table.disassemblerComments);
+    disasmAnnotations_ = table.disassemblerComments;
+    return true;
+}
+
+void MainWindow::addRecentTable(const QString& path) {
+    QString abs = QFileInfo(path).absoluteFilePath();
+    if (abs.isEmpty()) return;
+    QSettings s;
+    QStringList recent = s.value("recentTables").toStringList();
+    recent.removeAll(abs);        // de-dup, then promote to the front (most recent)
+    recent.prepend(abs);
+    while (recent.size() > 10) recent.removeLast();
+    s.setValue("recentTables", recent);
+    rebuildRecentMenu();
+    // Every successful load and save lands here: that file is now the table's own,
+    // so File > Save writes back to it and the title names it.
+    currentTablePath_ = abs;
+    markTableSaved();   // what this file holds is now the unchanged state
+    updateWindowTitle();
+}
+
+// "Neversnooze CE - Game (1234) - table.ct": the process, then the table's file.
+void MainWindow::updateWindowTitle() {
+    QString title = "Neversnooze CE";
+    if (process_ && !currentProcessName_.isEmpty())
+        title += currentPid_ > 0 ? QString(" - %1 (%2)").arg(currentProcessName_).arg(currentPid_)
+                                 : " - " + currentProcessName_;
+    if (!currentTablePath_.isEmpty()) title += " - " + QFileInfo(currentTablePath_).fileName();
+    setWindowTitle(title);
+    syncAgentTarget();   // every change of target ends here
+    if (process_) {
+        // Script editors opened before any target take this one.
+        for (auto& editor : unboundEditors_)
+            if (editor) { editor->attachProcess(process_.get()); trackTargetWindow(editor); }
+        unboundEditors_.clear();
+    }
+}
+
+void MainWindow::syncAgentTarget() {
+    if (!agentPanel_) return;
+    // The agent tools work on local processes only: a ceserver PID belongs to
+    // another machine, and a GDB target has none.
+    const bool local = process_ && !ceserverClient_ && currentPid_ > 0;
+    agentPanel_->setTarget(local ? currentPid_ : 0, process_ ? currentProcessName_ : QString());
+}
+
+void MainWindow::rebuildRecentMenu() {
+    if (!recentMenu_) return;
+    recentMenu_->clear();
+    const QStringList recent = QSettings().value("recentTables").toStringList();
+    if (recent.isEmpty()) {
+        recentMenu_->addAction("(no recent tables)")->setEnabled(false);
+        return;
+    }
+    for (const QString& p : recent) {
+        // Basename in the menu, full path in the tooltip; a missing file is greyed
+        // (it stays listed so the user can see what went away, like CE).
+        const bool exists = QFileInfo::exists(p);
+        auto* a = recentMenu_->addAction(QFileInfo(p).fileName());
+        a->setToolTip(exists ? p : p + "  (missing)");
+        a->setEnabled(exists);
+        if (exists) connect(a, &QAction::triggered, this, [this, p]() { if (maybeSaveTable()) loadTableFromPath(p); });
+    }
+    recentMenu_->addSeparator();
+    connect(recentMenu_->addAction("Clear list"), &QAction::triggered, this, [this]() {
+        QSettings().remove("recentTables");
+        rebuildRecentMenu();
+    });
+}
+
+void MainWindow::loadTableFromPath(const QString& path) {
+  try {
+    // Detect the format from the file's contents, not its extension: CE tables are
+    // commonly `.CT` (uppercase) or extensionless when downloaded, which a
+    // case-sensitive ".ct" check silently rejected.
+    const ce::TableFormat fmt = ce::detectTableFormat(path.toStdString());
+    if (fmt == ce::TableFormat::Protected) {
+        bool ok = false;
+        QString pw = QInputDialog::getText(this, "Protected Cheat Table",
+            "This table is password-protected (.CETRAINER).\nEnter its password:",
+            QLineEdit::Password, QString(), &ok);
+        if (!ok) return;
+        CheatTable table;
+        if (!table.loadProtected(path.toStdString(), pw.toStdString())) {
+            QMessageBox::warning(this, "Load Cheat Table",
+                "Could not decrypt the table (wrong password or corrupt file).");
+            return;
+        }
+        if (!loadCheatTableModel(table)) return;
+        addRecentTable(path);
+        return;
+    }
+    if (fmt != ce::TableFormat::Json) {
+        // CE XML .CT format (Xml, or Unknown which load() self-validates).
+        CheatTable table;
+        if (!table.load(path.toStdString())) {QMessageBox::warning(this,"Load Cheat Table","Could not read a valid cheat table.");return;}
+        if (!loadCheatTableModel(table)) return;
+        addRecentTable(path);
+    } else {
+        QFile f(path);
+        if (!f.open(QIODevice::ReadOnly)) {QMessageBox::warning(this,"Load Cheat Table",f.errorString());return;}
+        const auto bytes=f.readAll();
+        if (f.error()!=QFileDevice::NoError) {QMessageBox::warning(this,"Load Cheat Table",f.errorString());return;}
+        QJsonParseError parseError;auto doc=QJsonDocument::fromJson(bytes,&parseError);
+        if (!doc.isObject() || !doc.object()["entries"].isArray()) {
+            QMessageBox::warning(this,"Load Cheat Table","Invalid JSON cheat table.");return;
+        }
+        for (const auto& value:doc.object()["entries"].toArray()) if (!value.isObject()) {
+            QMessageBox::warning(this,"Load Cheat Table","Invalid JSON record.");return;
+        }
+        CheatTable parsed;
+        if (!parsed.loadJsonFromString(bytes.toStdString())) {QMessageBox::warning(this,"Load Cheat Table","Invalid JSON record data.");return;}
+        // Use the exact validated common fields for either JSON schema. Only
+        // GUI codec/presentation settings come from Qt's parsed representation.
+        const auto original=doc.object()["entries"].toArray();
+        if (!loadCheatTableModel(parsed,&original)) return;
+        addRecentTable(path);
+    }
+  } catch (const std::exception& ex) {
+    // A parse/load path (e.g. ct_file) may throw; never let it escape the slot
+    // into std::terminate.
+    QMessageBox::critical(this, "Load Cheat Table",
+        QString("Failed to load table:\n%1").arg(ex.what()));
+  } catch (...) {
+    QMessageBox::critical(this, "Load Cheat Table", "Failed to load table (unknown error).");
+  }
+}
+
+static bool validRecordFormats(const QJsonArray& entries) {
+    for (const auto& value : entries) {
+        const auto object = value.toObject();
+        const auto order = object.value("dataByteOrder"), width = object.value("pointerWidth");
+        if ((!order.isUndefined() && (!order.isString() ||
+             (order.toString() != "auto" && order.toString() != "little" && order.toString() != "big"))) ||
+            (!width.isUndefined() && (!width.isDouble() ||
+             (width.toDouble() != 0 && width.toDouble() != 4 && width.toDouble() != 8)))) return false;
+    }
+    return true;
+}
+
+bool MainWindow::loadAddressEntries(const QJsonArray& entries) {
+    // The model owns both activation and its resulting undo state.
+    return addressListModel_->fromJson(entries);
+}
+
+void MainWindow::startCodeFinder(int row, bool writesOnly) {
+    if (!process_) return;
+    const auto& entries = addressListModel_->entries();
+    if (row < 0 || row >= (int)entries.size()) return;
+    const auto& entry = entries[row];
+    if (entry.isGroup) return;
+    // Size the watchpoint to the record's type (Byte -> 1, Qword -> 8, ...); scalarWidth
+    // returns 0 for String/AoB, which falls back to the configured default.
+    size_t size = ce::scalarWidth(entry.type);
+    if (entry.type == ValueType::Pointer)
+        size = entry.pointerWidth ? entry.pointerWidth : process_ ? process_->pointerWidth(entry.address) : 0;
+    else if (entry.type == ValueType::ByteArray) size = entry.byteCount;
+    startCodeFinderForAddress(entry.address, writesOnly, static_cast<int>(std::min<size_t>(size, 8)));
+}
+
+void MainWindow::stopCodeFindersForInjection() {
+    // A target can have only one ptrace tracer. If a "find what accesses/writes"
+    // monitor is running, it holds that trace, so an injection's attach fails
+    // (surfacing as a mmap "Cannot allocate memory"). Stop the monitors, which
+    // detach, freeing the target for the injection.
+    for (auto& f : codeFinders_)
+        if (f) f->stop();
+}
+
+std::unique_ptr<Debugger> MainWindow::createDebuggerForCurrentProcess() {
+    if (AutoAsmUiOperation::retiring(&autoAsm_)) return nullptr;
+    if (!process_) return nullptr;
+    if (process_->targetDescription().transport==ce::TargetTransport::Gdb) return nullptr;
+    if (auto* remote = dynamic_cast<os::RemoteProcessHandle*>(process_.get())) {
+        if (!ceserverClient_) return nullptr;
+        return std::make_unique<os::RemoteDebugger>(*ceserverClient_, remote->serverHandle());
+    }
+    return std::make_unique<os::LinuxDebugger>();
+}
+
+// A Wine/Proton target runs a Windows .exe, and /proc/PID/cmdline carries that
+// .exe path (Steam/Proton, PortProton, Lutris, Heroic and Bottles all keep it
+// there). Used to warn before arming a hardware watchpoint, which Wine's own
+// debug-register handling often turns into a game crash.
+static bool targetLooksLikeWine(pid_t pid) {
+    std::ifstream f("/proc/" + std::to_string(pid) + "/cmdline", std::ios::binary);
+    if (!f) return false;
+    std::string cmd;
+    char buf[4096];
+    while (f.read(buf, sizeof(buf)) || f.gcount())
+        cmd.append(buf, static_cast<size_t>(f.gcount()));
+    for (auto& c : cmd) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
+    return cmd.find(".exe") != std::string::npos;
+}
+
+void MainWindow::showInstructionAccesses(uintptr_t instructionAddr) {
+    if (!process_) return;
+    // Release any active find-what-writes monitor first: it holds the target thread
+    // ptrace-traced, and the instruction-access monitor's SEIZE would then fail.
+    for (auto& f : codeFinders_)
+        if (f) f->stop();
+
+    // Runs synchronously: plant an execute breakpoint on the instruction, resolve the
+    // data address of its memory operand from the live registers on each hit, until
+    // 32 hits or a 4s timeout. Usually fast for a hot instruction; brief wait otherwise.
+    statusBar()->showMessage(QString("Monitoring the instruction at 0x%1…").arg(instructionAddr, 0, 16));
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    QApplication::processEvents();
+    auto results = ce::findInstructionAccesses(*process_, instructionAddr);
+    QApplication::restoreOverrideCursor();
+
+    if (results.empty()) {
+        statusBar()->clearMessage();
+        QMessageBox::information(this, "What this instruction accesses",
+            QString("No data accesses were recorded for the instruction at 0x%1.\n\nIt may not have "
+                    "run during the sample window, or it has no memory operand.").arg(instructionAddr, 0, 16));
+        return;
+    }
+
+    auto* dlg = new QDialog(this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->setWindowTitle(QString("Addresses accessed by 0x%1").arg(instructionAddr, 0, 16));
+    dlg->resize(440, 360);
+    auto* lay = new QVBoxLayout(dlg);
+    lay->addWidget(new QLabel(QString("%1 distinct address(es) accessed (double-click to add to the list):")
+        .arg(results.size())));
+    auto* table = new QTableWidget((int)results.size(), 2, dlg);
+    table->setHorizontalHeaderLabels({"Address", "Hits"});
+    table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    table->setSelectionBehavior(QAbstractItemView::SelectRows);
+    for (int i = 0; i < (int)results.size(); ++i) {
+        std::string modOff = ce::moduleOffsetString(process_->modules(), results[i].address);
+        QString label = modOff.empty() ? QString("0x%1").arg(results[i].address, 0, 16)
+            : QString("%1 (0x%2)").arg(QString::fromStdString(modOff)).arg(results[i].address, 0, 16);
+        auto* a = new QTableWidgetItem(label);
+        a->setData(Qt::UserRole, (qulonglong)results[i].address);
+        table->setItem(i, 0, a);
+        table->setItem(i, 1, new QTableWidgetItem(QString::number(results[i].hitCount)));
+    }
+    table->resizeColumnsToContents();
+    connect(table, &QTableWidget::cellDoubleClicked, this, [this, table](int row, int) {
+        if (auto* it = table->item(row, 0))
+            addressListModel_->addEntry((uintptr_t)it->data(Qt::UserRole).toULongLong(),
+                                        ce::ValueType::Int32, "Accessed address");
+    });
+    lay->addWidget(table);
+    auto* close = new QPushButton("Close");
+    connect(close, &QPushButton::clicked, dlg, &QDialog::accept);
+    lay->addWidget(close, 0, Qt::AlignRight);
+    dlg->show();
+    statusBar()->showMessage(QString("%1 address(es) accessed by 0x%2")
+        .arg(results.size()).arg(instructionAddr, 0, 16), 5000);
+}
+
+int MainWindow::runAutorunScripts() {
+    // CE runs every .lua in its autorun/ folder at startup. Ours lives under the user's
+    // config dir and is opt-in (only runs if the user creates it). These are the user's
+    // own scripts (like a shell rc file), and they run in the same sandboxed engine as
+    // any Lua, so shellExecute and file writes stay gated behind CECORE_LUA_ALLOW_UNSAFE.
+    QDir d(QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation) + "/autorun");
+    if (!d.exists()) return 0;
+    const QStringList files = d.entryList(QStringList{"*.lua", "*.LUA"}, QDir::Files, QDir::Name);
+    int ran = 0, failed = 0;
+    for (const QString& f : files) {
+        QFile file(d.filePath(f));
+        if (!file.open(QIODevice::ReadOnly)) continue;
+        const QString code = QString::fromUtf8(file.readAll());
+        file.close();
+        const auto err = luaEngine_.execute(code.toStdString());
+        ++ran;
+        if (!err.empty()) {
+            ++failed;
+            statusBar()->showMessage(QString("autorun %1: %2").arg(f, QString::fromStdString(err)), 8000);
+        }
+    }
+    if (ran > 0 && failed == 0)
+        statusBar()->showMessage(QString("Ran %1 autorun script(s).").arg(ran), 4000);
+    return ran;
+}
+
+void MainWindow::startCodeFinderForAddress(uintptr_t addr, bool writesOnly, int watchSize) {
+    if (!process_) return;
+
+    // A previous "find what writes/accesses" monitor still holds the target thread
+    // ptrace-traced. A new one's PTRACE_SEIZE of the same thread would then fail, so
+    // the second attempt would silently find nothing. Stop finished finders first to
+    // release the trace (and the debug register).
+    for (auto& f : codeFinders_)
+        if (f) f->stop();
+
+    // Watchpoint backend selection. On a Wine/Proton game we must NOT seize the
+    // whole thread group (that deadlocks the game against wineserver / esync-fsync /
+    // GPU threads) and must NOT use the software page-guard (its mprotect fights
+    // Proton's kernel write-watch/userfaultfd and freezes the game). So for Wine we
+    // arm a HARDWARE watchpoint on the MAIN thread only — the game-logic thread that
+    // writes gameplay values. Native Linux keeps the full all-thread hardware watch.
+    const bool wine = targetLooksLikeWine(process_->pid());
+    bool software = QSettings().value("codefinder/forceSoftware", false).toBool();
+    bool singleThread = wine && !software;
+    // Test override: CE_CODEFINDER_MODE = hw (all-thread hardware) | sw (software) |
+    // st (single-thread hardware).
+    const QByteArray modeOverride = qgetenv("CE_CODEFINDER_MODE");
+    if (modeOverride == "hw") { software = false; singleThread = false; }
+    else if (modeOverride == "sw") { software = true;  singleThread = false; }
+    else if (modeOverride == "st") { software = false; singleThread = true;  }
+
+    if (wine && !codeFinderNoPrompt_ && !software) {
+        auto r = QMessageBox::information(this, "Wine / Proton game",
+            "This is a Wine/Proton (Windows) game. Neversnooze CE will watch the game's "
+            "main thread for writes, which is where gameplay values (money, HP, …) are "
+            "usually changed.\n\n"
+            "If nothing shows up, the value may be written by a background thread; "
+            "tell me and it can be widened. Start monitoring?",
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
+        if (r != QMessageBox::Yes) return;
+    }
+
+    auto debugger = createDebuggerForCurrentProcess();
+    if (!debugger) return;
+    auto finder = std::make_unique<CodeFinder>();
+    // Use the caller's type-derived watch size when valid (e.g. a Byte record watches 1
+    // byte); otherwise fall back to the configured default.
+    if (watchSize != 1 && watchSize != 2 && watchSize != 4 && watchSize != 8)
+        watchSize = QSettings().value("codefinder/watchSize", "4").toInt();
+    if (watchSize != 1 && watchSize != 2 && watchSize != 4 && watchSize != 8) watchSize = 4;
+    if (!finder->start(*process_, *debugger, addr, writesOnly, watchSize, software, singleThread)) {
+        QMessageBox::warning(this, "Code finder unavailable", QString::fromStdString(ce::targetOperationError(*process_,
+            software ? ce::TargetFeature::SoftwareWatchpoint : ce::TargetFeature::HardwareWatchpoint, finder->lastError())));
+        return;
+    }
+
+    auto* finderPtr = finder.get();
+    codeFinderDebuggers_.push_back(std::move(debugger));
+    codeFinders_.push_back(std::move(finder));
+
+    auto title = writesOnly ? "Find what writes" : "Find what accesses";
+    auto* window = new CodeFinderWindow(finderPtr,
+        QString("%1 0x%2").arg(title).arg(addr, 0, 16), process_.get(), this);
+    trackTargetWindow(window);
+    window->setAttribute(Qt::WA_DeleteOnClose);
+    // Closing the window stops the monitor so it releases the traced thread / debug
+    // register (otherwise a later find-what-writes could not seize it). `this`
+    // context makes the connection auto-drop if the main window goes away first.
+    connect(window, &QObject::destroyed, this, [finderPtr]() { finderPtr->stop(); });
+    // CE: "Add to the code list" sends the found opcodes to Advanced Options
+    // (the Code list), where they can be disassembled / NOP'd / restored.
+    window->setAddToList([this](uintptr_t a, const QString& desc) {
+        showAdvancedOptions();
+        advancedOptions_->addCode(a, desc.isEmpty() ? QString("code 0x%1").arg(a, 0, 16) : desc);
+    });
+    // CE: "Show this address in the disassembler" jumps the Memory Viewer to the
+    // writing/accessing instruction (the found row's recovered address).
+    window->setShowInDisassembler([this](uintptr_t a) { openMemoryView(a); });
+    window->show();
+}
+
+void MainWindow::onMemoryView() {
+    if (!process_) {
+        statusBar()->showMessage("No process attached; open one first (Ctrl+O) to view memory.", 4000);
+        return;
+    }
+    openMemoryView(0);
+}
+
+void MainWindow::showDebugger() {
+    if (AutoAsmUiOperation::retiring(&autoAsm_)) return;
+    if (!process_) { QMessageBox::warning(this, "No process", "Open a process first."); return; }
+    // Reuse the existing window: it holds the ptrace attachment, so a second one
+    // would fail to attach. Just raise it if it is already open.
+    if (debuggerWindow_) {
+        debuggerWindow_->show();
+        debuggerWindow_->raise();
+        debuggerWindow_->activateWindow();
+        return;
+    }
+    auto* w = new ce::gui::DebuggerWindow(process_.get(), this);
+    w->setAttribute(Qt::WA_DeleteOnClose);
+    debuggerWindow_ = w;   // QPointer auto-nulls on close
+    // Drive the current-instruction highlight in open Memory Viewers from the
+    // debugger's stops, like CE. The first viewer follows execution (scrolls to the
+    // current line); the rest just light the line up where it is already visible.
+    connect(w, &ce::gui::DebuggerWindow::stopped, this, [this, w](uintptr_t rip) {
+        bool first = true;
+        const ce::CpuContext& ctx = w->currentStopContext();
+        for (auto& mv : memoryViewers_)
+            if (mv) { mv->showCurrentInstruction(rip, first, ctx); first = false; }
+    });
+    connect(w, &ce::gui::DebuggerWindow::resumed, this, [this]() {
+        for (auto& mv : memoryViewers_) if (mv) mv->clearCurrentInstruction();
+    });
+    rebuildDebuggerComments();   // show the same inline comments as the Memory Viewer
+    w->show();
+}
+
+void MainWindow::trackStructDissector(StructureDissector* sd) {
+    std::erase_if(structDissectors_, [](const QPointer<StructureDissector>& p) { return p.isNull(); });
+    structDissectors_.push_back(sd);
+}
+
+void MainWindow::openMonoDissector() {
+    if (!process_) { QMessageBox::warning(this, "No process", "Open a process first."); return; }
+    auto* w = new ce::gui::MonoDissectorWindow(process_.get(), this);
+    trackTargetWindow(w);
+    w->setAttribute(Qt::WA_DeleteOnClose);
+    // Double-clicking a field asks for the object's base address, then adds
+    // base+offset to the address list with the field's mapped type.
+    connect(w, &ce::gui::MonoDissectorWindow::addFieldRequested, this,
+            [this](quint32 offset, int valueType, const QString& label, bool isStatic) {
+        bool ok = false;
+        // A static field's offset is into the class's static data, not an object.
+        QString base = QInputDialog::getText(this, "Add Mono field",
+            QString("%1 for '%2' (field at +0x%3):")
+                .arg(isStatic ? "Static data address of the class" : "Object base address")
+                .arg(label).arg(offset, 0, 16),
+            QLineEdit::Normal, "", &ok);
+        if (!ok || base.trimmed().isEmpty()) return;
+        QString expr = QString("%1+0x%2").arg(base.trimmed()).arg(offset, 0, 16);
+        // Resolve now for the initial address; keep the expression so it
+        // re-evaluates each refresh (the base may be a pointer/symbol).
+        ce::ExpressionParser parser(process_.get(), &luaResolver_);
+        auto addr = parser.parse(expr.toStdString());
+        addressListModel_->addEntry(addr.value_or(0),
+            static_cast<ce::ValueType>(valueType), label, expr);
+    });
+    w->show();
+}
+
+void MainWindow::scheduleAddressListRefresh() {
+    if (addressListRefreshQueued_) return;
+    addressListRefreshQueued_ = true;
+    QTimer::singleShot(0, this, [this] {
+        addressListRefreshQueued_ = false;
+        reapplyGroupCollapse();
+        rebuildValueHotkeys();
+    });
+}
+
+void MainWindow::reapplyGroupCollapse() {
+    const auto& ents = addressListModel_->entries();
+    std::vector<int> indents;
+    std::vector<bool> collapsed;
+    indents.reserve(ents.size());
+    collapsed.reserve(ents.size());
+    for (const auto& e : ents) {
+        indents.push_back(e.indent);
+        collapsed.push_back(e.isGroup && e.collapsed);
+    }
+    const auto hidden = ce::hiddenByCollapse(indents, collapsed);
+    for (int r = 0; r < (int)hidden.size(); ++r)
+        addressListView_->setRowHidden(r, hidden[r]);
+}
+
+void MainWindow::rebuildDebuggerComments() {
+    if (!debuggerWindow_ || !process_) return;
+    // Resolve each annotation's symbolic address ("libgame.so+0x1234") to a number so the
+    // debugger can show the same inline comments the Memory Viewer does.
+    std::map<uintptr_t, std::string> m;
+    ce::ExpressionParser parser(process_.get(), &luaResolver_);
+    for (const auto& c : disasmAnnotations_) {
+        if (c.comment.empty()) continue;
+        if (auto a = parser.parse(c.address); a && *a) m[*a] = c.comment;
+    }
+    debuggerWindow_->setComments(std::move(m));
+}
+
+QWidget* MainWindow::openPanelByName(const QString& name) {
+    auto tryIn = [this, &name](QWidget* host) -> QWidget* {
+        QSet<QWidget*> before;
+        for (auto* w : QApplication::topLevelWidgets()) before.insert(w);
+        bool matched = false;
+        for (QAction* a : host->findChildren<QAction*>()) {
+            if (a->menu() || a->isSeparator()) continue;
+            QString t = a->text(); t.remove('&');
+            if (t.contains(name, Qt::CaseInsensitive)) { a->trigger(); matched = true; break; }
+        }
+        if (!matched) return nullptr;
+        QApplication::processEvents();
+        for (auto* w : QApplication::topLevelWidgets())
+            if (!before.contains(w) && w->isWindow() && w != this) return w;
+        return nullptr;
+    };
+    if (auto* w = tryIn(menuBar())) return w;
+    // Many analysis panels live in the Memory Viewer's own menus; open it and look.
+    if (auto* mv = openMemoryView(0))
+        if (auto* w = tryIn(mv)) return w;
+    return nullptr;
+}
+
+AgentPanel* MainWindow::showAgentPanel() {
+    if (!agentPanel_) {
+        agentDock_ = new QDockWidget("AI Assistant", this);
+        agentDock_->setObjectName("aiAssistantDock");
+        agentPanel_ = new AgentPanel(agentDock_);
+        agentDock_->setWidget(agentPanel_);
+        agentDock_->setMinimumWidth(340);
+        addDockWidget(Qt::RightDockWidgetArea, agentDock_);
+        agentPanel_->setTableSink([this](const std::vector<ce::CheatEntry>& entries) { addTableEntries(entries); });
+        connect(agentPanel_, &AgentPanel::settingsRequested, this, [this]() { openSettingsDialog("AI Assistant"); });
+        syncAgentTarget();
+    }
+    agentDock_->show();
+    agentDock_->raise();
+    return agentPanel_;
+}
+
+void MainWindow::addTableEntries(const std::vector<ce::CheatEntry>& entries) {
+    ce::CheatTable table;
+    table.entries = entries;
+    auto list = addressListModel_->toJson();
+    for (auto value : cheatEntriesToJson(table)) {
+        auto obj = value.toObject();
+        obj["active"] = false;   // the user turns them on
+        obj.remove("id");        // fresh ids, as when pasting
+        list.append(obj);
+    }
+    addressListModel_->fromJson(list, true);
+}
+
+QDialog* MainWindow::openSettingsDialog(const QString& page) {
+    // One dialog: a second one opened earlier would write back, on OK, the
+    // values it read when it opened, reverting changes made meanwhile.
+    auto selectPage = [](QDialog* dialog, const QString& name) {
+        if (name.isEmpty()) return;
+        if (auto* nav = dialog->findChild<QListWidget*>("settingsNav")) {
+            auto matches = nav->findItems(name, Qt::MatchContains);
+            if (!matches.isEmpty()) nav->setCurrentItem(matches.first());
+        }
+    };
+    if (settingsDialog_) {
+        selectPage(settingsDialog_, page);
+        settingsDialog_->show();
+        settingsDialog_->raise();
+        settingsDialog_->activateWindow();
+        return settingsDialog_;
+    }
+    auto* dlg = new SettingsDialog(this);
+    settingsDialog_ = dlg;
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    connect(dlg, &SettingsDialog::settingsApplied, this, [this]() {
+        if (agentPanel_) agentPanel_->reloadSettings();
+        // A scan blocks user input, so Apply can't land mid-scan; the scanner is idle.
+        if (int threads = QSettings().value("scan/threads", 0).toInt(); threads != scannerThreads_) {
+            scannerThreads_ = threads;
+            scanner_ = std::make_unique<MemoryScanner>(threads);
+        }
+        if (valueRefreshTimer_)
+            valueRefreshTimer_->start(kValueRefreshMs);
+        addressDisplay() = loadAddressDisplay();   // repainted below
+        const QFont font = settingsMonospaceFont();
+        resultsView_->setFont(font);
+        addressListView_->setFont(font);
+        addressListView_->setColumnWidth(2, QFontMetrics(font).horizontalAdvance("GameAssembly.so+0x123456") + 18);
+        resultsView_->viewport()->update();
+        addressListView_->viewport()->update();
+    });
+    // Optionally jump straight to a named category (used by the UI screenshot
+    // harness, and handy for deep-linking to a settings page).
+    selectPage(dlg, page);
+    dlg->show();
+    dlg->raise();
+    return dlg;
+}
+
+MemoryBrowser* MainWindow::openMemoryView(uintptr_t addr) {
+    if (!process_) return nullptr;
+    auto* browser = new MemoryBrowser(process_.get(), this);
+    browser->setAttribute(Qt::WA_DeleteOnClose);
+    wireBrowserAnnotations(browser);
+
+    // Breakpoints are armed by the debugger window, which holds the ptrace
+    // session: open it (attaching) on first use, then plant through it.
+    browser->setBreakpointSetter([this](uintptr_t addr, bool hardware) {
+        if (!debuggerWindow_) showDebugger();
+        if (!debuggerWindow_ || !debuggerWindow_->debugAttached()) {
+            statusBar()->showMessage("The debugger could not attach; no breakpoint was set.", 5000);
+            return;
+        }
+        if (!debuggerWindow_->debugStopped()) {
+            statusBar()->showMessage("Pause the target in the debugger to set a breakpoint.", 5000);
+            return;
+        }
+        debuggerWindow_->addBreakpointAt(addr);
+        if (hardware)
+            statusBar()->showMessage("Execute breakpoints are software breakpoints in this debugger.", 5000);
+    });
+    browser->setBreakpointRemover([this](uintptr_t addr) {
+        if (debuggerWindow_ && !debuggerWindow_->removeBreakpointAt(addr))
+            statusBar()->showMessage("Could not remove the breakpoint; see the debugger window.", 5000);
+    });
+    browser->setBreakpointQuery([this]() {
+        return debuggerWindow_ ? debuggerWindow_->breakpointAddresses() : std::set<uintptr_t>{};
+    });
+    browser->setCodeFinderLauncher([this](uintptr_t addr, bool writesOnly) {
+        startCodeFinderForAddress(addr, writesOnly);
+    });
+    browser->setInstructionAccessLauncher([this](uintptr_t addr) {
+        showInstructionAccesses(addr);
+    });
+    browser->setAddToList([this](uintptr_t addr, ce::ValueType type) {
+        addressListModel_->addEntry(addr, type);
+        statusBar()->showMessage(QString("Added 0x%1 to the cheat table").arg(addr, 0, 16), 3000);
+    });
+    // Global user-defined symbols: a label set in one Memory Viewer must resolve
+    // everywhere (records, Lua, other views). Seed this view with the app-wide labels,
+    // and mirror any new label back into the shared resolver the address list uses.
+    browser->addUserSymbols(luaResolver_.userSymbols());
+    browser->setUserSymbolCallback([this](uintptr_t addr, const std::string& name) {
+        if (name.empty()) luaResolver_.removeUserSymbol(addr);
+        else              luaResolver_.addUserSymbol(addr, name);
+        // Re-point any record addressed by that label at the new resolution immediately.
+        if (process_) addressListModel_->updateValues(process_.get());
+        // Fan the label out to every other open Memory Viewer so they display it too.
+        for (const auto& mv : memoryViewers_)
+            if (mv) mv->setUserSymbol(addr, name);
+    });
+
+    // An explicit address wins; otherwise open at a selected scan result.
+    if (addr) {
+        browser->gotoAddress(addr);
+    } else if (lastResult_) {
+        auto sel = resultsView_->selectionModel()->selectedRows();
+        if (!sel.isEmpty())
+            browser->gotoAddress(resultsModel_->addressAt(sel.first().row()));
+    }
+
+    populateBrowserMenus(browser);   // add the CE Memory-Viewer tools to its menu bar
+    browser->show();
+    // Track it so a target exit can freeze it before its process handle is freed.
+    // Drop any stale (already-closed) entries while we are here.
+    std::erase_if(memoryViewers_, [](const QPointer<MemoryBrowser>& p) { return p.isNull(); });
+    memoryViewers_.push_back(browser);
+    // If the debugger is already paused, light up the current line in this new viewer
+    // too (highlight only, without yanking it away from the address it opened at).
+    if (debuggerWindow_ && debuggerWindow_->debugStopped())
+        browser->showCurrentInstruction(debuggerWindow_->currentStopRip(), false,
+                                        debuggerWindow_->currentStopContext());
+    return browser;
+}
+
+// Fill a Memory Viewer's View/Tools/Debug menus with the tools that CE keeps in
+// that window (they need MainWindow's process + address list).
+void MainWindow::populateBrowserMenus(MemoryBrowser* b) {
+    QMenu* view = b->viewMenu();
+    QMenu* tools = b->toolsMenu();
+    if (!view || !tools) return;
+
+    // Navigating from these info windows opens the same full-featured viewer as
+    // the Memory View button (breakpoints, add-to-list, Tools/Debug menus), not a
+    // stripped-down clone. openMemoryView() no-ops safely when no process is open.
+    auto openAt = [this](uintptr_t addr) { openMemoryView(addr); };
+    auto needProc = [this]() { return process_ != nullptr; };
+
+    // ── View: navigable info windows ──
+    view->addAction("Memory Regions", this, [this, openAt]() {
+        if (!process_) return;
+        auto* w = new MemoryRegionsWindow(process_.get(), this);
+        trackTargetWindow(w);
+        w->setAttribute(Qt::WA_DeleteOnClose);
+        connect(w, &MemoryRegionsWindow::navigateTo, this, [openAt](uintptr_t a){ openAt(a); });
+        w->show();
+    });
+    view->addAction("Heap list", this, [this, openAt]() {
+        if (!process_) return;
+        auto* w = new HeapRegionsWindow(process_.get(), this);
+        trackTargetWindow(w);
+        w->setAttribute(Qt::WA_DeleteOnClose);
+        connect(w, &HeapRegionsWindow::navigateTo, this, [openAt](uintptr_t a){ openAt(a); });
+        w->show();
+    });
+    view->addAction("Module list", this, [this, openAt]() {
+        if (!process_) return;
+        auto* w = new ModuleListWindow(process_.get(), this);
+        trackTargetWindow(w);
+        w->setAttribute(Qt::WA_DeleteOnClose);
+        connect(w, &ModuleListWindow::navigateTo, this, [openAt](uintptr_t a){ openAt(a); });
+        w->show();
+    });
+    view->addAction("Referenced strings / functions", this, [this, openAt]() {
+        if (!process_) return;
+        auto* w = new CodeReferencesWindow(process_.get(), this);
+        trackTargetWindow(w);
+        w->setAttribute(Qt::WA_DeleteOnClose);
+        connect(w, &CodeReferencesWindow::navigateTo, this, [openAt](uintptr_t a){ openAt(a); });
+        w->show();
+    });
+    view->addAction("Thread list", this, [this]() {
+        if (!process_) return;
+        auto* w = new ThreadListWindow(process_.get(), this);
+        trackTargetWindow(w);
+        w->setAttribute(Qt::WA_DeleteOnClose); w->show();
+    });
+    view->addAction("Stacktrace", this, [this]() {
+        if (!process_) return;
+        auto* w = new StackViewWindow(process_.get(), this);
+        trackTargetWindow(w);
+        w->setAttribute(Qt::WA_DeleteOnClose); w->show();
+    });
+    view->addAction("Graphical memory view", this, [this]() {
+        if (!process_) return;
+        auto* w = new ce::gui::GraphicalMemoryView(process_.get(), this);
+        trackTargetWindow(w);
+        w->setAttribute(Qt::WA_DeleteOnClose); w->show();
+    });
+
+    // ── Debug ──
+    QMenu* dbg = b->debugMenu();
+    if (dbg) {
+        dbg->addSeparator();
+        dbg->addAction("Registers", this, [this]() {
+            if (!process_) return;
+            auto* w = new RegisterEditorWindow(process_.get(), this);
+            trackTargetWindow(w);
+            w->setAttribute(Qt::WA_DeleteOnClose); w->show();
+        });
+        // The debugger window holds the breakpoints that are actually armed
+        // (set there, or from the Memory Viewer); its list is the real one.
+        dbg->addAction("Breakpoint list", this, [this]() { showDebugger(); });
+        dbg->addAction("Full debugger", this, [this]() { showDebugger(); });
+        dbg->addAction("Break and trace", this, [this]() {
+            if (!process_) return;
+            auto* tw = new TracerWindow(process_.get(),
+                [this]() { return createDebuggerForCurrentProcess(); }, this);
+            trackTargetWindow(tw);
+            tw->setAttribute(Qt::WA_DeleteOnClose); tw->show();
+        });
+        dbg->addAction("Branch mapper (LBR)", this, [this]() {
+            if (!process_) return;
+            auto* bm = new BranchMapper(process_.get(), this);
+            trackTargetWindow(bm);
+            bm->setAttribute(Qt::WA_DeleteOnClose); bm->show();
+        });
+    }
+
+    // Analysis tools (shared with the main window Tools menu). The viewer already
+    // has address-aware Auto Assemble and Dissect entries, so drop the generic copies.
+    tools->addSeparator();
+    const auto own = tools->actions();
+    addAnalysisToolsMenu(tools);
+    for (QAction* action : tools->actions())
+        if (!own.contains(action) &&
+            (action->text() == "Auto Assemble..." || action->text() == "Dissect data/structures..."))
+            tools->removeAction(action);
+    (void)needProc;
+}
+
+void MainWindow::addAnalysisToolsMenu(QMenu* tools) {
+    tools->addAction("Auto Assemble...", this, [this]() {
+        auto* editor = new ScriptEditor(process_.get(), &autoAsm_, this);
+        trackTargetWindow(editor);
+        editor->setAttribute(Qt::WA_DeleteOnClose);
+        editor->setAddToTable([this](const QString& d, const QString& s) { addressListModel_->addScriptEntry(d, s); });
+        editor->setBeforeExecute([this]() { stopCodeFindersForInjection(); });
+        editor->show();
+    });
+    tools->addAction("Pointer scan...", this, [this]() {
+        if (!process_) return;
+        auto* dlg = new PointerScanDialog(process_.get(), this);
+        trackTargetWindow(dlg);
+        connect(dlg, &PointerScanDialog::addressSelected, this,
+                [this](uintptr_t a, const QString& expr) {
+                    // Add the pointer path AS the address expression so it re-resolves live.
+                    addressListModel_->addEntry(a, ce::ValueType::Int32, expr, expr);
+                });
+        dlg->setAttribute(Qt::WA_DeleteOnClose); dlg->show();
+    });
+    tools->addAction("Emulator guest scan...", this, [this]() {
+        if (!process_) { QMessageBox::warning(this, "No process", "Open a process first."); return; }
+        auto* dlg = new GuestScanDialog(process_.get(), this);
+        trackTargetWindow(dlg);
+        connect(dlg, &GuestScanDialog::addressSelected, this,
+                [this](uintptr_t a, ce::ValueType t, bool be, const QString& d) {
+                    addressListModel_->addEntry(a, t, d);
+                    if (be) addressListModel_->setEntryBigEndian(addressListModel_->rowCount() - 1, true);
+                });
+        dlg->setAttribute(Qt::WA_DeleteOnClose); dlg->show();
+    });
+    tools->addAction("Dissect data/structures...", this, [this]() {
+        if (!process_) return;
+        auto* sd = new StructureDissector(process_.get(), 0, this);
+        sd->setAttribute(Qt::WA_DeleteOnClose);
+        sd->setAddToListCallback([this](uintptr_t a, ce::ValueType t, const QString& d) { addressListModel_->addEntry(a, t, d); });
+        trackStructDissector(sd);
+        sd->show();
+    });
+    tools->addAction("Find static addresses...", this, [this]() {
+        if (!process_) { QMessageBox::warning(this, "No process", "Open a process first."); return; }
+        auto* w = new FindStaticsWindow(process_.get(), this);
+        trackTargetWindow(w);
+        w->setAttribute(Qt::WA_DeleteOnClose); w->show();
+    });
+    tools->addAction("Mono dissector...", this, &MainWindow::openMonoDissector);
+    tools->addAction("Lua Engine...", this, [this]() {
+        luaEngine_.setProcess(process_.get());
+        luaEngine_.setAddressList(addressListModel_);   // so getMemoryRecord etc. work
+        if (process_) { luaResolver_.loadProcess(*process_); luaEngine_.setResolver(&luaResolver_); }
+        // One console: the engine has a single output callback, which each
+        // new console took over, so print() in an older one went to a closed one.
+        if (luaConsole_) { luaConsole_->show(); luaConsole_->raise(); luaConsole_->activateWindow(); return; }
+        auto* console = new LuaConsole(&luaEngine_, this);
+        luaConsole_ = console;
+        console->setAttribute(Qt::WA_DeleteOnClose); console->show();
+    });
+    tools->addAction("ELF Inspector...", this, [this]() {
+        QString initial;
+        // Only a local target's module path names a file readelf can open here
+        // (modules() already maps a sandboxed target's paths through /proc).
+        if (process_ && process_->targetDescription().transport == ce::TargetTransport::Local) {
+            auto mods = process_->modules();
+            if (!mods.empty()) initial = QString::fromStdString(mods.front().path);
+        }
+        auto* dlg = new ElfInspector(initial, this);
+        dlg->setAttribute(Qt::WA_DeleteOnClose); dlg->show();
+    });
+}
+
+void MainWindow::applyScanDataFormat(ScanConfig& config) const {
+    config.byteOrder = static_cast<ByteOrder>(scanByteOrderCombo_->currentData().toInt());
+    config.pointerWidth = static_cast<uint8_t>(scanPointerWidthCombo_->currentData().toInt());
+}
+
+void MainWindow::updateScanButtons() {
+    bool hasProcess = (process_ != nullptr);
+    bool scanActive = (lastResult_ != nullptr);   // a First Scan has been run
+    bool hasResults = (scanActive && lastResult_->count() > 0);
+    firstScanBtn_->setEnabled(hasProcess);
+    if (auto* button = findChild<QPushButton*>("memoryViewButton")) button->setEnabled(hasProcess);
+    // CE-style: once a scan session is open, "First Scan" becomes "New Scan" (a
+    // reset). Ordinary typed scans lock the value type; All scans permit
+    // selection of a surviving numeric type. A fresh state allows any type.
+    firstScanBtn_->setText(scanActive ? "New Scan" : "First Scan");
+    nextScanBtn_->setEnabled(hasResults);
+    undoScanBtn_->setEnabled(undoResult_ != nullptr);
+    if (valueTypeCombo_) valueTypeCombo_->setEnabled(!scanActive || lastResultType_ == ValueType::All);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ScanResultsModel
+// ═══════════════════════════════════════════════════════════════
+
+ScanResultsModel::ScanResultsModel(QObject* parent) : QAbstractTableModel(parent) {}
+
+size_t ScanResultsModel::valueSizeBytes() const {
+    switch (valueType_) {
+        case ValueType::Byte:    return 1;
+        case ValueType::Int16:   return 2;
+        case ValueType::Int32:   return 4;
+        case ValueType::Int64:   return 8;
+        case ValueType::Pointer: return valueSize_ == 4 || valueSize_ == 8 ? valueSize_ : sizeof(uintptr_t);
+        case ValueType::Float:   return 4;
+        case ValueType::Double:  return 8;
+        case ValueType::All: return std::max<size_t>(1,valueSize_);
+        // Variable-width types carry their byte length in valueSize_ (set at scan
+        // time from the pattern / string length). Without this, AOB and string
+        // results read only 4 bytes and rendered as "?".
+        case ValueType::Grouped:
+        case ValueType::Custom:
+        case ValueType::ByteArray:
+        case ValueType::Binary:
+        case ValueType::String:
+        case ValueType::UnicodeString: return std::max<size_t>(1, valueSize_);
+        default:                 return 4;
+    }
+}
+
+void ScanResultsModel::refreshRange(int firstRow, int lastRow) {
+    if (!result_ || !proc_) return;
+    int n = rowCount();
+    if (n == 0) return;
+    firstRow = std::max(0, firstRow);
+    lastRow  = std::min(n - 1, lastRow);
+    if (firstRow > lastRow) return;
+
+    size_t vs = valueSizeBytes();
+    // Bound the cache to what's on screen — drop rows outside the window.
+    for (auto it = liveValues_.begin(); it != liveValues_.end(); ) {
+        if (it->first < firstRow || it->first > lastRow) {
+            changed_.erase(it->first);
+            it = liveValues_.erase(it);
+        } else ++it;
+    }
+    for (int row = firstRow; row <= lastRow; ++row) {
+        const size_t readSize=result_->hasAllTypeCandidates() ? result_->allTypeValueSize(row) : vs;
+        std::vector<uint8_t> buf(readSize);
+        auto r=readSize ? proc_->read(result_->address(row),buf.data(),readSize) :
+            Result<size_t>(std::unexpected(std::make_error_code(std::errc::invalid_argument)));
+        std::vector<uint8_t> nv = (r && *r >= readSize) ? std::move(buf) : std::vector<uint8_t>{};
+        // Flag rows whose value changed since the previous refresh (CE-style
+        // red highlight for live-changing values).
+        auto it = liveValues_.find(row);
+        changed_[row] = (it != liveValues_.end()) && !it->second.empty()
+                        && !nv.empty() && it->second != nv;
+        liveValues_[row] = std::move(nv);
+    }
+    emit dataChanged(index(firstRow, 1), index(lastRow, 1), {Qt::DisplayRole, Qt::ForegroundRole});
+}
+
+void ScanResultsModel::setResult(ScanResult* result, ValueType vt, size_t valueSize,
+                                 const std::string& stringEncoding) {
+    beginResetModel();
+    result_ = result;
+    shownRows_ = result ? static_cast<int>(std::min<size_t>(result->count(), kResultBatchSize)) : 0;
+    valueType_ = vt;
+    valueSize_ = result && result->valueSize() ? result->valueSize() : valueSize;
+    stringEncoding_ = stringEncoding.empty() ? "UTF-8" : stringEncoding;
+    liveValues_.clear();
+    changed_.clear();
+    // Cache the module map so the Address column can flag "static" results (those
+    // inside a loaded module) in green — CE's cue for pointer-stable addresses
+    // that survive a restart, the ones worth turning into a pointer path.
+    modules_ = proc_ ? proc_->modules() : std::vector<ce::ModuleInfo>{};
+    endResetModel();
+}
+
+void ScanResultsModel::clear() {
+    beginResetModel();
+    result_ = nullptr;
+    shownRows_ = 0;
+    valueSize_ = 0;
+    liveValues_.clear();
+    changed_.clear();
+    endResetModel();
+}
+
+int ScanResultsModel::rowCount(const QModelIndex& parent) const {
+    return parent.isValid() ? 0 : shownRows_;
+}
+
+bool ScanResultsModel::canFetchMore(const QModelIndex& parent) const {
+    return !parent.isValid() && static_cast<size_t>(shownRows_) < resultCount() && shownRows_ < INT_MAX;
+}
+
+void ScanResultsModel::fetchMore(const QModelIndex& parent) {
+    if (!canFetchMore(parent)) return;
+    int next = static_cast<int>(std::min<size_t>(resultCount(),
+        std::min<size_t>(INT_MAX, static_cast<size_t>(shownRows_) + kResultBatchSize)));
+    beginInsertRows({}, shownRows_, next - 1);
+    shownRows_ = next;
+    endInsertRows();
+}
+
+int ScanResultsModel::columnCount(const QModelIndex& parent) const { return parent.isValid() ? 0 : 3; }
+
+QVariant ScanResultsModel::headerData(int section, Qt::Orientation o, int role) const {
+    if (role != Qt::DisplayRole || o != Qt::Horizontal) return {};
+    switch (section) {
+        case 0:  return "Address";
+        case 1:  return "Value";       // current (live) value
+        default: return "Previous";    // value captured at scan time
+    }
+}
+
+// Format `vs` bytes at `buf` as `vt` (shared by the live Value and the scan-time
+// Previous columns).
+static QString formatScanValue(ValueType vt,bool displayHex,const uint8_t* buf,size_t size,
+                               const std::string& encoding="UTF-8",ByteOrder order=ByteOrder::Little) {
+    if (vt==ValueType::Binary || vt==ValueType::Grouped || vt==ValueType::Custom || vt==ValueType::All) vt=ValueType::ByteArray;
+    ce::ValueIoOptions options;options.hex=displayHex;options.size=size;options.encoding=encoding;
+    options.byteOrder=order;options.pointerWidth=static_cast<int>(size);
+    auto decoded=ce::decodeTypedValue(vt,{buf,size},options);
+    return decoded ? QString::fromStdString(*decoded) : QStringLiteral("??");
+}
+
+QVariant ScanResultsModel::data(const QModelIndex& index, int role) const {
+    if (!index.isValid() || index.row() >= shownRows_ || !result_) return {};
+    // Red foreground on the Value column when it changed since the last refresh.
+    if (role == Qt::ForegroundRole) {
+        if (index.column() == 1) {
+            auto it = changed_.find(index.row());
+            if (it != changed_.end() && it->second)
+                return QBrush(ce::gui::editorPalette().error);  // theme-aware red (was low-contrast pink on white)
+        } else if (index.column() == 0 && !modules_.empty()) {
+            // Green address = "static": lives inside a loaded module, so it keeps
+            // the same module+offset across restarts (CE's green cue).
+            if (!ce::moduleOffsetString(modules_, result_->address(index.row())).empty())
+                return QBrush(ce::gui::editorPalette().success);  // theme-aware green
+        }
+        return {};
+    }
+    // Hovering a static address reveals its module+offset (the durable identity).
+    if (role == Qt::ToolTipRole && index.column() == 0 && !modules_.empty()) {
+        std::string modOff = ce::moduleOffsetString(modules_, result_->address(index.row()));
+        if (!modOff.empty()) return QString::fromStdString(modOff);
+    }
+    if (role != Qt::DisplayRole && role != Qt::ToolTipRole) return {};
+
+    return displayValueAt(static_cast<size_t>(index.row()), index.column());
+}
+
+QString ScanResultsModel::displayValueAt(size_t row, int column) const {
+    if (!result_ || row >= result_->count() || column < 0 || column > 2) return {};
+    if (column == 0) {
+        return formatListAddress(result_->address(row));
+    }
+
+    const size_t vs=valueSizeBytes();
+    const size_t shownSize=result_->hasAllTypeCandidates() ? result_->allTypeValueSize(row) : vs;
+    if (!shownSize) return QStringLiteral("??");
+    std::vector<uint8_t> buf(vs);
+    if (column == 2) {
+        // Previous: always the value captured at scan time.
+        result_->value(row, buf.data(), vs);
+        return formatScanValue(valueType_, displayHex_, buf.data(), shownSize, stringEncoding_, result_->hasDataFormat() ? result_->byteOrder() : valueType_==ValueType::UnicodeString ? ce::ByteOrder::Little : std::endian::native==std::endian::big ? ce::ByteOrder::Big : ce::ByteOrder::Little);
+    }
+    // Value: prefer the live re-read for on-screen rows; fall back to the
+    // scan-time value for rows not currently refreshed.
+    auto it = row <= INT_MAX ? liveValues_.find(static_cast<int>(row)) : liveValues_.end();
+    if (it != liveValues_.end()) {
+        if (it->second.size() == shownSize) std::copy(it->second.begin(),it->second.end(),buf.begin());
+        else return QStringLiteral("??");   // unreadable this refresh
+    } else {
+        result_->value(row, buf.data(), vs);
+    }
+    return formatScanValue(valueType_, displayHex_, buf.data(), shownSize, stringEncoding_, result_->hasDataFormat() ? result_->byteOrder() : valueType_==ValueType::UnicodeString ? ce::ByteOrder::Little : std::endian::native==std::endian::big ? ce::ByteOrder::Big : ce::ByteOrder::Little);
+}
+
+uintptr_t ScanResultsModel::addressAt(int row) const {
+    return result_ ? result_->address(row) : 0;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// AddressListModel
+// ═══════════════════════════════════════════════════════════════
+
+AddressListModel::AddressListModel(QObject* parent) : QAbstractTableModel(parent) {}
+
+int AddressListModel::allocId() {
+    const int first=nextId_;
+    do {
+        const int candidate=nextId_;
+        if (nextId_==std::numeric_limits<int>::max()) {nextId_=1;idWrapped_=true;}
+        else ++nextId_;
+        // Ordinary sequential allocation stays constant-time. After wrapping,
+        // imported sparse IDs can occupy the next slot, so search for a gap.
+        if (!idWrapped_ || rowOfId(candidate)<0) return candidate;
+    } while (nextId_!=first);
+    throw std::overflow_error("No unused record ID is available");
+}
+
+int AddressListModel::addEntry(uintptr_t addr, ValueType type, const QString& desc,
+                               const QString& addressExpr, size_t byteCount) {
+    beginInsertRows({}, entries_.size(), entries_.size());
+    AddressEntry entry;
+    entry.id = allocId();
+    entry.description = desc;
+    entry.address = addr;
+    entry.addressExpr = addressExpr;  // non-empty => pointer record, re-resolved live
+    entry.type = type;
+    entry.byteCount = byteCount;       // element length for AOB/string (0 = unknown)
+    entry.currentValue = "?";
+    int id = entry.id;
+    entries_.push_back(std::move(entry));
+    endInsertRows();
+    return id;
+}
+
+void AddressListModel::addScriptEntry(const QString& desc, const QString& script) {
+    beginInsertRows({}, entries_.size(), entries_.size());
+    AddressEntry entry;
+    entry.id = allocId();
+    entry.description = desc.isEmpty() ? "Auto Assembler script" : desc;
+    entry.autoAsmScript = script;   // toggling the checkbox runs [ENABLE]/[DISABLE]
+    entry.type = ValueType::Int32;
+    entry.currentValue = "(Auto Assembler script)";
+    entries_.push_back(std::move(entry));
+    endInsertRows();
+}
+
+bool AddressListModel::isScriptEntry(int row) const {
+    return row >= 0 && row < (int)entries_.size() && !entries_[row].autoAsmScript.isEmpty();
+}
+
+bool AddressListModel::updateScriptEntryById(int id, const QString& desc, const QString& script) {
+    if (scriptBusy_ || mutationBusy_ || AutoAsmUiOperation::retiring(autoAsm_)) return false;
+    QScopedValueRollback mutation(mutationBusy_, true);
+    int row = rowOfId(id);
+    if (row < 0 || !setEntryActive(row, false)) return false;
+    row = rowOfId(id);
+    if (row < 0) return false;
+    auto& e = entries_[row];
+    e.autoAsmScript = script;
+    if (!desc.isEmpty()) e.description = desc;
+    emit dataChanged(index(row, 0), index(row, columnCount() - 1));
+    return true;
+}
+
+void AddressListModel::setEntryAddress(int row, uintptr_t addr, const QString& expr) {
+    if (row < 0 || row >= (int)entries_.size()) return;
+    auto& e = entries_[row];
+    if (e.isGroup || !e.autoAsmScript.isEmpty()) return;  // not addressable
+    e.address = addr;
+    e.addressExpr = expr;      // pointer expression re-resolves each refresh
+    e.currentValue.clear();    // force a re-read at the new address
+    emit dataChanged(index(row, 2), index(row, columnCount() - 1),
+                     {Qt::DisplayRole, Qt::EditRole});
+}
+
+void AddressListModel::setEntryDescription(int row, const QString& desc) {
+    if (row < 0 || row >= (int)entries_.size()) return;
+    entries_[row].description = desc;
+    emit dataChanged(index(row, 1), index(row, 1), {Qt::DisplayRole, Qt::EditRole});
+}
+
+void AddressListModel::addGroup(const QString& desc) {
+    beginInsertRows({}, entries_.size(), entries_.size());
+    AddressEntry entry;
+    entry.id = allocId();
+    entry.description = desc;
+    entry.currentValue.clear();
+    entry.isGroup = true;
+    entries_.push_back(std::move(entry));
+    endInsertRows();
+}
+
+static const char* typeToStr(ValueType vt) {
+    switch (vt) {
+        case ValueType::Byte:   return "byte";
+        case ValueType::Int16:  return "i16";
+        case ValueType::Int32:  return "i32";
+        case ValueType::Int64:  return "i64";
+        case ValueType::Pointer: return "pointer";
+        case ValueType::Float:  return "float";
+        case ValueType::Double: return "double";
+        case ValueType::String: return "string";
+        case ValueType::UnicodeString: return "unicode";
+        case ValueType::ByteArray: return "aob";
+        case ValueType::Binary: return "binary";
+        case ValueType::Grouped: return "grouped";
+        case ValueType::Custom: return "custom";
+        default: return "i32";
+    }
+}
+
+static ValueType strToType(const QString& s) {
+    if (s == "byte")   return ValueType::Byte;
+    if (s == "i16")    return ValueType::Int16;
+    if (s == "i32")    return ValueType::Int32;
+    if (s == "i64")    return ValueType::Int64;
+    if (s == "pointer") return ValueType::Pointer;
+    if (s == "float")  return ValueType::Float;
+    if (s == "double") return ValueType::Double;
+    if (s == "string") return ValueType::String;
+    if (s == "unicode") return ValueType::UnicodeString;
+    if (s == "aob")    return ValueType::ByteArray;
+    if (s == "binary") return ValueType::Binary;
+    if (s == "grouped") return ValueType::Grouped;
+    if (s == "custom") return ValueType::Custom;
+    bool ok = false;
+    int raw = s.toInt(&ok);
+    if (ok) {
+        switch (raw) {
+            case 0: return ValueType::Byte;
+            case 1: return ValueType::Int16;
+            case 2: return ValueType::Int32;
+            case 3: return ValueType::Int64;
+            case 4: return ValueType::Float;
+            case 5: return ValueType::Double;
+            case 6: return ValueType::String;
+            case 7: return ValueType::UnicodeString;
+            case 8: return ValueType::ByteArray;
+            case 9: return ValueType::Binary;
+            case 10: return ValueType::All;
+            case 13: return ValueType::Pointer;
+            case 11: return ValueType::Grouped;
+            case 12: return ValueType::Custom;
+            default: break;
+        }
+    }
+    return ValueType::Int32;
+}
+
+// Cheat Engine keeps one dropdown choice per line; older tables of this program
+// put ';' between them.
+static QString normalizedDropdownList(QString list) {
+    list.remove('\r');
+    if (!list.contains('\n')) list.replace(';', '\n');
+    return list;
+}
+
+static QMap<QString, QString> parseDropdownList(const QString& dropdownList) {
+    QMap<QString, QString> choices;
+    for (const auto& rawItem : normalizedDropdownList(dropdownList).split('\n', Qt::SkipEmptyParts)) {
+        auto item = rawItem.trimmed();
+        auto sep = item.indexOf(':');
+        if (sep <= 0) continue;
+        auto value = item.left(sep).trimmed();
+        auto label = item.mid(sep + 1).trimmed();
+        if (!value.isEmpty())
+            choices[value] = label.isEmpty() ? value : label;
+    }
+    return choices;
+}
+
+static QString displayDropdownValue(const QString& value, const QString& dropdownList) {
+    auto choices = parseDropdownList(dropdownList);
+    auto it = choices.find(value.trimmed());
+    return it == choices.end() ? value : QString("%1 (%2)").arg(it.value(), it.key());
+}
+
+static QString resolveDropdownInput(const QString& input, const QString& dropdownList) {
+    auto choices = parseDropdownList(dropdownList);
+    auto trimmed = input.trimmed();
+    if (choices.contains(trimmed))
+        return trimmed;
+    for (auto it = choices.begin(); it != choices.end(); ++it) {
+        if (QString::compare(it.value(), trimmed, Qt::CaseInsensitive) == 0)
+            return it.key();
+    }
+    return input;
+}
+
+static QVariant entryForeground(const QString& color) {
+    if (color.isEmpty())
+        return {};
+    auto name = color.startsWith('#') ? color : "#" + color;
+    QColor parsed(name);
+    return parsed.isValid() ? QVariant(parsed) : QVariant();
+}
+
+// Parse a user-entered decimal accepting either '.' or ',' as the separator.
+// QString::toDouble is C-locale ('.') only; comma-locale users type "2,5".
+static double parseUserDouble(const QString& s, bool* ok) {
+    return QString(s).replace(',', '.').toDouble(ok);
+}
+
+// Parse an integer value field tolerantly: accept a leading '-', an optional 0x
+// hex prefix, and both signed and full-width-unsigned magnitudes. Returns a wide
+// value the caller truncates to the target width — so "-1" -> byte 0xFF and
+// An integer scan value, or nullopt when the text is not one: scanning for 0
+// instead would quietly find the wrong thing. Pointers are unsigned.
+static std::optional<long long> scanIntegerInput(const QString& text, bool hex, bool pointer) {
+    if (pointer) {
+        bool ok = false;
+        const QString trimmed = text.trimmed();
+        const bool prefixed = trimmed.startsWith("0x", Qt::CaseInsensitive);
+        const qulonglong value = (prefixed ? trimmed.mid(2) : trimmed).toULongLong(&ok, hex || prefixed ? 16 : 10);
+        return ok ? std::optional<long long>(static_cast<long long>(value)) : std::nullopt;
+    }
+    bool ok = false;
+    const long long value = ce::parseIntegerScalar(text.toStdString(), hex, ok);
+    return ok ? std::optional<long long>(value) : std::nullopt;
+}
+
+static bool scanTakesValue(ScanCompare compare) {
+    return compare == ScanCompare::Exact || compare == ScanCompare::Greater || compare == ScanCompare::Less ||
+           compare == ScanCompare::Between || compare == ScanCompare::IncreasedBy || compare == ScanCompare::DecreasedBy;
+}
+
+static void warnBadScanValue(QWidget* parent, const QString& text) {
+    QMessageBox::warning(parent, "Scan value", text.trimmed().isEmpty()
+        ? QString("Enter a value for this scan.")
+        : QString("\"%1\" is not a number (or does not fit in 64 bits).").arg(text.trimmed()));
+}
+
+// "40000" -> int16 fits, matching how CE accepts either sign for a fixed width.
+static long long parseIntField(const QString& valStr, bool hex = false) {
+    // In hex-display mode a bare token is hex (CE); a "0x" prefix is always hex.
+    bool ok = false;
+    long long v = ce::parseIntegerScalar(valStr.toStdString(), hex, ok);
+    return ok ? v : 0;
+}
+
+// Adapt a GUI value to shared typed I/O, terminating shortened strings within
+// their known capacity.
+static std::expected<size_t, std::string> writeValueToProcess(
+    ProcessHandle* proc, uintptr_t addr, ValueType type, const QString& value,
+    const ce::ValueCodec& codec = {}, bool bigEndian = false, bool showHex = false, size_t capacity = 0,
+    ByteOrder order = ByteOrder::Unknown, uint8_t pointerWidth = 0) {
+    ce::ValueIoOptions options;
+    options.codec = codec; options.bigEndian = bigEndian; options.hex = showHex;
+    if (order != ByteOrder::Unknown) options.byteOrder = order;
+    if (pointerWidth) options.pointerWidthOverride = pointerWidth;
+    if (!proc) return std::unexpected("No process attached");
+    auto resolved = ce::valueOptionsForTarget(*proc, addr, type, options);
+    if (!resolved) return std::unexpected(resolved.error());
+    options = *resolved;
+    if (type == ValueType::String || type == ValueType::UnicodeString) {
+        auto bytes = ce::encodeTypedValue(type, value.toStdString(), options);
+        if (!bytes) return std::unexpected(bytes.error());
+        options.terminate = bytes->empty() || bytes->size() < capacity;
+    }
+    return ce::writeTypedValue(*proc, addr, type, value.toStdString(), options);
+}
+
+static bool parseComparableValue(ValueType type, const QString& valStr, double& value);
+static bool readComparableValue(ProcessHandle* proc, uintptr_t addr, ValueType type,
+                                double& value, const ce::ValueCodec& codec = {},
+                                bool bigEndian = false, bool isSigned = true,
+                                ByteOrder order = ByteOrder::Unknown, uint8_t pointerWidth = 0) {
+    if (!proc) return false;
+    ce::ValueIoOptions options;
+    options.codec = codec; options.bigEndian = bigEndian; options.isSigned = isSigned;
+    if (order != ByteOrder::Unknown) options.byteOrder = order;
+    if (pointerWidth) options.pointerWidthOverride = pointerWidth;
+    auto decoded = ce::readTypedValue(*proc, addr, type, options);
+    return decoded && parseComparableValue(type, QString::fromStdString(*decoded), value);
+}
+
+static bool parseComparableValue(ValueType type, const QString& valStr, double& value) {
+    bool ok = false;
+    switch (type) {
+        case ValueType::Byte:
+        case ValueType::Int16:
+        case ValueType::Int32:
+        case ValueType::Int64:
+            // Parse via the shared helper so a hex-display record's value ("0xff", with
+            // the prefix the formatter emits) compares correctly. Base-10 toLongLong
+            // failed on it, which silently degraded a directional freeze to unconditional.
+            value = static_cast<double>(ce::parseIntegerScalar(valStr.toStdString(), false, ok));
+            return ok;
+        case ValueType::Pointer:
+            value = static_cast<double>(valStr.toULongLong(&ok, 0));
+            return ok;
+        case ValueType::Float:
+        case ValueType::Double:
+            // Accept ',' or '.' as the decimal separator, matching
+            // writeValueToProcess — otherwise a comma-locale frozen value would
+            // silently degrade a directional freeze to an unconditional write.
+            value = QString(valStr).replace(',', '.').toDouble(&ok);
+            return ok;
+        default:
+            return false;
+    }
+}
+
+bool AddressListModel::reresolveAddress(AddressEntry& e, const ExpressionParser* parser) {
+    if (e.addressExpr.isEmpty() || !proc_) return true;
+    std::string expr = e.addressExpr.toStdString();
+    // CE: an address starting with + or - is relative to the nearest ancestor
+    // that has an address of its own (an address group header or a record).
+    auto chain = ce::parsePointerExpression(expr);
+    std::string base = chain ? chain->base : expr;
+    const auto first = base.find_first_not_of(" \t");
+    const auto row = &e - entries_.data();
+    if (first != std::string::npos && (base[first] == '+' || base[first] == '-') &&
+        row > 0 && row < static_cast<std::ptrdiff_t>(entries_.size())) {
+        for (auto r = row - 1, indent = static_cast<std::ptrdiff_t>(e.indent) - 1; r >= 0 && indent >= 0; --r) {
+            auto& ancestor = entries_[static_cast<size_t>(r)];
+            if (ancestor.indent != indent) continue;
+            --indent;
+            const QString text = ancestor.addressExpr.trimmed();
+            if (!text.isEmpty() && text != "0" && text != "0x0") {
+                if (!reresolveAddress(ancestor, parser)) return false;
+            } else if (!(text.isEmpty() && !ancestor.isGroup && ancestor.address)) {
+                continue;   // no address here: ask the next ancestor
+            }
+            base = QString("0x%1").arg(ancestor.address, 0, 16).toStdString() + base.substr(first);
+            expr = chain ? ce::buildPointerExpression(base, chain->offsets) : base;
+            break;
+        }
+    }
+    // Pass the shared resolver so a record can be addressed by a user-defined label
+    // (or a module export) set in the Memory Viewer, not just a raw/module+offset expr.
+    std::optional<ExpressionParser> own;
+    if (!parser) parser = &own.emplace(proc_, symbolResolver_);
+    auto v = parser->parse(expr);
+    if (!v) return false;   // keep e.address for display, but nothing may write there:
+    e.address = *v;         // the object it pointed into may be freed by now
+    return true;
+}
+
+void AddressListModel::freezeWrite(ProcessHandle* proc) {
+    // One parser for the pass: it reads the module list once, when a record needs it.
+    const ExpressionParser parser(proc_, symbolResolver_);
+    for (auto& e : entries_) {
+        if (e.isGroup) continue;
+        if (!e.active || (e.frozenValue.isEmpty() && e.type != ValueType::String && e.type != ValueType::UnicodeString)) continue;
+
+        // Re-resolve pointer records so the freeze writes to the current target, not the
+        // up-to-500ms-stale cached address (the value refresh runs slower than this 100ms
+        // freeze); a moved pointer would otherwise clobber unrelated memory.
+        if (!reresolveAddress(e, &parser)) continue;   // a broken chain freezes nothing
+
+        if (e.freezeMode == FreezeMode::Normal) {
+            (void)writeValueToProcess(proc, e.address, e.type, e.frozenValue, e.codec, e.bigEndian, e.showAsHex, e.byteCount, e.dataByteOrder, e.pointerWidth);
+            continue;
+        }
+
+        ce::ValueIoOptions options;
+        options.hex = e.showAsHex; options.isSigned = e.showAsSigned;
+        options.codec = e.codec; options.bigEndian = e.bigEndian;
+        if (e.dataByteOrder != ByteOrder::Unknown) options.byteOrder = e.dataByteOrder;
+        if (e.pointerWidth) options.pointerWidthOverride = e.pointerWidth;
+        auto comparison = ce::compareTypedValue(*proc, e.address, e.type, e.frozenValue.toStdString(), options);
+        if (comparison && ((e.freezeMode == ce::FreezeMode::NeverDecrease || e.freezeMode == ce::FreezeMode::IncreaseOnly) ? *comparison < 0 : *comparison > 0))
+            (void)writeValueToProcess(proc, e.address, e.type, e.frozenValue, e.codec, e.bigEndian, e.showAsHex, e.byteCount, e.dataByteOrder, e.pointerWidth);
+    }
+}
+
+QJsonArray AddressListModel::toJson() const {
+    QJsonArray arr;
+    std::vector<int> lastRowAtIndent;
+    for (int row = 0; row < (int)entries_.size(); ++row) {
+        const auto& e = entries_[row];
+        QJsonObject obj;
+        obj["id"] = e.id;
+        obj["description"] = e.description;
+        obj["address"] = QString("0x%1").arg(e.address, 0, 16);
+        if (!e.addressExpr.isEmpty()) obj["addressExpr"] = e.addressExpr;
+        obj["type"] = typeToStr(e.type);
+        if (e.byteCount > 0) obj["byteCount"] = (int)e.byteCount;   // AOB/string length
+        // A frozen record saves the value it holds, as before the list showed live values.
+        obj["value"] = e.active && e.autoAsmScript.isEmpty() && !e.isGroup ? e.frozenValue : e.currentValue;
+        obj["active"] = e.active;
+        obj["asm"] = e.autoAsmScript;
+        obj["color"] = e.color;
+        obj["dropdown"] = e.dropdownList;
+        obj["hotkeys"] = e.hotkeyKeys;
+        obj["increaseHotkey"] = e.increaseHotkeyKeys;
+        obj["setValueHotkey"] = e.setValueHotkeyKeys;
+        obj["setValueHotkeyValue"] = e.setValueHotkeyValue;
+        obj["decreaseHotkey"] = e.decreaseHotkeyKeys;
+        obj["hotkeyStep"] = e.hotkeyStep;
+        obj["indent"] = e.indent;
+        obj["group"] = e.isGroup;
+        obj["collapsed"] = e.collapsed;
+        obj["activateChildren"] = e.activateChildren;
+        obj["deactivateChildren"] = e.deactivateChildren;
+        if (!e.optionsXml.isEmpty()) obj["optionsXml"] = e.optionsXml;
+        if (!e.luaScript.isEmpty()) obj["lua"] = e.luaScript;
+        for (auto it = e.tableFields.begin(); it != e.tableFields.end(); ++it) obj[it.key()] = it.value();
+        obj["showAsHex"] = e.showAsHex;
+        obj["showAsSigned"] = e.showAsSigned;
+        obj["freezeMode"] = (int)e.freezeMode;
+        if (e.codec.active())   // obfuscation codec, as its round-trippable spec string
+            obj["codec"] = QString::fromStdString(e.codec.describe());
+        if (e.bigEndian) obj["bigEndian"] = true;
+        if (e.dataByteOrder != ByteOrder::Unknown) obj["dataByteOrder"] = e.dataByteOrder == ByteOrder::Big ? "big" : "little";
+        if (e.pointerWidth) obj["pointerWidth"] = e.pointerWidth;
+        if (e.indent > 0 && e.indent - 1 < (int)lastRowAtIndent.size())
+            obj["parent"] = lastRowAtIndent[e.indent - 1];
+        arr.append(obj);
+
+        if (e.indent >= (int)lastRowAtIndent.size())
+            lastRowAtIndent.resize(e.indent + 1, -1);
+        lastRowAtIndent[e.indent] = row;
+        if ((int)lastRowAtIndent.size() > e.indent + 1)
+            lastRowAtIndent.resize(e.indent + 1);
+    }
+    return arr;
+}
+
+static bool hasSavedUndo(const ce::DisableInfo& info) {
+    return info.ownership || info.image || !info.originals.empty() || !info.allocs.empty() ||
+        !info.protections.empty() || !info.symbols.empty();
+}
+
+// The longest String / Array of byte record: its bytes are read on every refresh.
+constexpr int kMaxRecordBytes = 65536;
+
+bool AddressListModel::fromJson(const QJsonArray& arr, bool preserveExisting) {
+    if (scriptBusy_ || mutationBusy_ || AutoAsmUiOperation::retiring(autoAsm_)) return false;
+    QScopedValueRollback mutation(mutationBusy_, true);
+    if (!validRecordFormats(arr)) {
+        reportActivationError("Table format", "Invalid record data order or pointer size."); return false;
+    }
+    std::unordered_set<int> reserved,assigned;
+    int largest=0;
+    for (const auto& value:arr) {
+        const int id=value.toObject().value("id").toInt(-1);
+        if (id>=0) {reserved.insert(id);largest=std::max(largest,id);}
+    }
+    int fresh=largest==std::numeric_limits<int>::max() ? 1:largest+1;
+    auto nextFresh=[&] {
+        const int first=fresh;
+        while (reserved.contains(fresh) || assigned.contains(fresh)) {
+            fresh=fresh==std::numeric_limits<int>::max() ? 1:fresh+1;
+            if (fresh==first) throw std::overflow_error("No unused record ID is available");
+        }
+        const int result=fresh;
+        fresh=fresh==std::numeric_limits<int>::max() ? 1:fresh+1;
+        assigned.insert(result);
+        return result;
+    };
+    std::vector<AddressEntry> incoming;
+    incoming.reserve(arr.size());
+    std::vector<int> activate;
+    std::unordered_set<int> retained;
+    std::vector<int> parentIndentById;
+    for (auto val : arr) {
+        auto obj = val.toObject();
+        AddressEntry e;
+        const int imported=obj.value("id").toInt(-1);
+        e.id=imported>=0 && assigned.insert(imported).second ? imported:nextFresh();
+        largest=std::max(largest,e.id);
+        e.description = obj["description"].toString();
+        e.address = obj["address"].toString().toULongLong(nullptr, 16);
+        e.addressExpr = obj["addressExpr"].toString();
+        e.type = strToType(obj["type"].toString());
+        // AOB/string length (0 if absent). Read on every refresh: a table or the
+        // clipboard must not make it huge.
+        e.byteCount = (size_t)std::clamp(obj["byteCount"].toInt(0), 0, kMaxRecordBytes);
+        e.currentValue = obj["value"].toString();
+        e.active = obj["active"].toBool();
+        e.autoAsmScript = obj["asm"].toString();
+        e.color = obj["color"].toString();
+        e.dropdownList = normalizedDropdownList(obj["dropdown"].toString());
+        e.hotkeyKeys = obj["hotkeys"].toString();
+        e.increaseHotkeyKeys = obj["increaseHotkey"].toString();
+        e.setValueHotkeyKeys = obj["setValueHotkey"].toString();
+        e.setValueHotkeyValue = obj["setValueHotkeyValue"].toString();
+        e.decreaseHotkeyKeys = obj["decreaseHotkey"].toString();
+        e.hotkeyStep = obj["hotkeyStep"].toString("1");
+        e.luaScript = obj["lua"].toString();
+        for (const char* key : {"customType", "async", "dropdownAttributes", "unparsedAddress", "unparsedOffsets",
+                                "extraHotkeys", "extraXml"})
+            if (obj.contains(key)) e.tableFields[key] = obj[key];
+        e.indent = std::max(0, obj.contains("indent")
+            ? obj["indent"].toInt()
+            : (obj["parent"].toInt(-1) >= 0 && obj["parent"].toInt(-1) < (int)parentIndentById.size()
+                ? parentIndentById[obj["parent"].toInt()] + 1
+                : 0));
+        // A record nests at most one level below the one before it; a huge
+        // indent from a table would build a prefix of that many characters.
+        const int previousIndent = !incoming.empty() ? incoming.back().indent
+                                 : preserveExisting && !entries_.empty() ? entries_.back().indent : -1;
+        e.indent = std::min(e.indent, previousIndent + 1);
+        e.isGroup = obj["group"].toBool();
+        e.collapsed = obj["collapsed"].toBool();
+        e.activateChildren = obj["activateChildren"].toBool(true);
+        e.deactivateChildren = obj["deactivateChildren"].toBool(true);
+        e.optionsXml = obj["optionsXml"].toString();
+        e.showAsHex = obj["showAsHex"].toBool();
+        e.showAsSigned = obj["showAsSigned"].toBool(true);
+        if (obj.contains("freezeMode"))
+            e.freezeMode = (ce::FreezeMode)obj["freezeMode"].toInt();
+        if (obj.contains("codec")) {
+            if (auto c = ce::ValueCodec::parse(obj["codec"].toString().toStdString()))
+                e.codec = *c;
+        }
+        e.bigEndian = obj["bigEndian"].toBool();
+        const auto order = obj["dataByteOrder"].toString();
+        e.dataByteOrder = order == "little" ? ByteOrder::Little : order == "big" ||
+            (!obj.contains("dataByteOrder") && e.bigEndian) ? ByteOrder::Big : ByteOrder::Unknown;
+        if (obj.contains("dataByteOrder")) e.bigEndian = e.dataByteOrder == ByteOrder::Big;
+        const auto width = obj["pointerWidth"].toInt();
+        e.pointerWidth = width == 4 || width == 8 ? width : 0;
+        if (e.isGroup) {
+            e.address = 0;
+            e.currentValue.clear();
+            e.frozenValue.clear();
+        }
+        if (e.active) e.frozenValue = e.currentValue;
+        const int oldRow = preserveExisting ? rowOfId(e.id) : -1;
+        if (oldRow >= 0 && entries_[oldRow].autoAsmScript == e.autoAsmScript &&
+            entries_[oldRow].active == e.active) {
+            e.autoAsmDisableInfo = entries_[oldRow].autoAsmDisableInfo;
+            e.autoAsmOrder = entries_[oldRow].autoAsmOrder;
+            e.frozenValue = entries_[oldRow].frozenValue;
+            retained.insert(e.id);
+        } else if (e.active && !e.autoAsmScript.isEmpty()) {
+            e.active = false;
+            e.frozenValue.clear();
+            activate.push_back(e.id);
+        }
+        parentIndentById.push_back(e.indent);
+        incoming.push_back(std::move(e));
+    }
+    // Parse first, then retire owners while their original process is valid.
+    // On failure retain every row, including the remaining undo for retry.
+    for (int id : cleanupOrder()) {
+        const int row = rowOfId(id);
+        if (!retained.contains(id) && row >= 0 && !setEntryActive(row, false)) return false;
+    }
+    beginResetModel();
+    entries_ = std::move(incoming);
+    if (!preserveExisting) ++replaceGeneration_;   // ids now come from the loaded table
+    const auto revision = ++targetRevision_;
+    idWrapped_=largest==std::numeric_limits<int>::max();
+    nextId_=idWrapped_ ? 1:largest+1;
+    endResetModel();
+    mutationBusy_ = false;
+    for (int id : activate) {
+        // A completed activation callback may replace the table or target.
+        // Remaining IDs then belong to a different import, even if reused.
+        if (targetRevision_ != revision) break;
+        setActive(id, true);
+    }
+    return true;
+}
+
+void AddressListModel::setFreezeMode(int row, FreezeMode mode) {
+    if (row < 0 || row >= (int)entries_.size()) return;
+    entries_[row].freezeMode = mode;
+    emit dataChanged(index(row, 0), index(row, columnCount() - 1));
+}
+
+// A frozen value is text in the record's format: written with another type,
+// codec or byte order it would change what memory holds (100 frozen as 4 Bytes
+// written as the float 100.0, or as 8 bytes over the next field). The freeze
+// ends with the old format, as in setEntryType.
+bool AddressListModel::endFreezeForFormatChange(int& row) {
+    if (!entries_[row].active || !entries_[row].autoAsmScript.isEmpty() || entries_[row].isGroup) return true;
+    const int id = entries_[row].id;
+    if (!setEntryActive(row, false)) return false;
+    row = rowOfId(id);
+    return row >= 0;
+}
+
+void AddressListModel::setEntryCodec(int row, ce::ValueCodec codec) {
+    if (row < 0 || row >= (int)entries_.size()) return;
+    if (entries_[row].codec.describe() != codec.describe() && !endFreezeForFormatChange(row)) return;
+    entries_[row].codec = codec;
+    entries_[row].currentValue.clear();   // force a re-read/reformat through the codec
+    emit dataChanged(index(row, 4), index(row, 4), {Qt::DisplayRole, Qt::EditRole});
+}
+
+std::string AddressListModel::entryCodecSpec(int row) const {
+    if (row < 0 || row >= (int)entries_.size()) return "none";
+    return entries_[row].codec.describe();
+}
+
+void AddressListModel::setEntryBigEndian(int row, bool bigEndian) {
+    if (row < 0 || row >= (int)entries_.size()) return;
+    if (entries_[row].dataByteOrder != (bigEndian ? ByteOrder::Big : ByteOrder::Little) &&
+        !endFreezeForFormatChange(row)) return;
+    entries_[row].bigEndian = bigEndian;
+    entries_[row].dataByteOrder = bigEndian ? ByteOrder::Big : ByteOrder::Little;
+    entries_[row].currentValue.clear();   // re-read/reformat in the new byte order
+    emit dataChanged(index(row, 4), index(row, 4), {Qt::DisplayRole, Qt::EditRole});
+}
+
+void AddressListModel::setEntryDataFormat(int row, ByteOrder order, uint8_t width) {
+    if (row < 0 || row >= rowCount() || (width && width != 4 && width != 8) ||
+        (order != ByteOrder::Unknown && order != ByteOrder::Little && order != ByteOrder::Big)) return;
+    if ((entries_[row].dataByteOrder != order || entries_[row].pointerWidth != width) &&
+        !endFreezeForFormatChange(row)) return;
+    auto& entry = entries_[row];
+    entry.dataByteOrder = order; entry.pointerWidth = width;
+    entry.bigEndian = order == ByteOrder::Big;
+    entry.currentValue.clear();
+    emit dataChanged(index(row, 3), index(row, 4));
+}
+
+bool AddressListModel::entryBigEndian(int row) const {
+    return (row >= 0 && row < (int)entries_.size()) && entries_[row].bigEndian;
+}
+
+void AddressListModel::setShowAsHex(int row, bool hex) {
+    if (row < 0 || row >= (int)entries_.size()) return;
+    auto& e = entries_[row];
+    // The frozen value is text in the old base: "100" frozen in decimal would
+    // be written as 0x100 once hex is on. Re-express it (and the shown value)
+    // through its bytes.
+    const bool integer = e.type == ValueType::Byte || e.type == ValueType::Int16 || e.type == ValueType::Int32 ||
+                         e.type == ValueType::Int64 || e.type == ValueType::Pointer;
+    if (integer && e.showAsHex != hex) {
+        ce::ValueIoOptions from;
+        from.hex = e.showAsHex; from.isSigned = e.showAsSigned; from.codec = e.codec;
+        if (e.pointerWidth) { from.pointerWidth = e.pointerWidth; from.pointerWidthOverride = e.pointerWidth; }
+        else if (proc_) from.pointerWidth = static_cast<int>(proc_->pointerWidth(e.address));
+        ce::ValueIoOptions to = from;
+        to.hex = hex;
+        for (QString* text : {&e.frozenValue, &e.currentValue}) {
+            if (text->isEmpty() || *text == QStringLiteral("??")) continue;
+            auto bytes = ce::encodeTypedValue(e.type, text->toStdString(), from);
+            if (!bytes) continue;
+            if (auto converted = ce::decodeTypedValue(e.type, *bytes, to)) *text = QString::fromStdString(*converted);
+        }
+    }
+    e.showAsHex = hex;
+    emit dataChanged(index(row, 4), index(row, 4));
+}
+
+void AddressListModel::setEntryType(int row, ValueType t) {
+    if (row < 0 || row >= (int)entries_.size()) return;
+    if (entries_[row].isGroup || entries_[row].type == t) return;
+    if (!endFreezeForFormatChange(row)) return;
+    entries_[row].type = t;
+    entries_[row].currentValue.clear();   // re-read and format with the new type
+    emit dataChanged(index(row, 0), index(row, columnCount() - 1));
+}
+
+void AddressListModel::setHotkeyKeys(int row, const QString& keys) {
+    if (row < 0 || row >= (int)entries_.size()) return;
+    entries_[row].hotkeyKeys = keys;
+    emit dataChanged(index(row, 0), index(row, columnCount() - 1));
+}
+
+void AddressListModel::setValueHotkeys(int row, const QString& increaseKeys, const QString& decreaseKeys,
+                                       const QString& step, const QString& setKeys, const QString& setValue) {
+    if (row < 0 || row >= (int)entries_.size()) return;
+    entries_[row].increaseHotkeyKeys = increaseKeys;
+    entries_[row].decreaseHotkeyKeys = decreaseKeys;
+    entries_[row].hotkeyStep = step.isEmpty() ? "1" : step;
+    entries_[row].setValueHotkeyKeys = setKeys;
+    entries_[row].setValueHotkeyValue = setValue;
+    emit dataChanged(index(row, 0), index(row, columnCount() - 1));
+}
+
+bool AddressListModel::adjustEntryValue(int row, double delta) {
+    if (row < 0 || row >= (int)entries_.size() || !proc_) return false;
+    auto& e = entries_[row];
+    if (e.isGroup) return false;
+
+    // Re-resolve pointer records so the hotkey acts on the current target, not a stale
+    // cached address (a moved pointer would otherwise hit unrelated memory).
+    if (!reresolveAddress(e)) return false;
+
+    // Integers with a whole step: exact 64-bit arithmetic. Through a double,
+    // an Int64 above 2^53 lost its low bits (+1 on 9007199254740993 wrote
+    // 9007199254740992).
+    const bool integer = e.type == ValueType::Byte || e.type == ValueType::Int16 ||
+                         e.type == ValueType::Int32 || e.type == ValueType::Int64;
+    if (integer && delta == std::trunc(delta) && std::abs(delta) < 9.2e18) {
+        ce::ValueIoOptions options;
+        options.hex = false; options.isSigned = e.showAsSigned;
+        options.codec = e.codec; options.bigEndian = e.bigEndian;
+        if (e.dataByteOrder != ByteOrder::Unknown) options.byteOrder = e.dataByteOrder;
+        if (auto text = ce::readTypedValue(*proc_, e.address, e.type, options)) {
+            const char* first = text->data();
+            const char* last = first + text->size();
+            const auto step = static_cast<int64_t>(delta);
+            uint64_t bits = 0;
+            bool parsed = false;
+            if (e.showAsSigned) {
+                int64_t v = 0;
+                parsed = std::from_chars(first, last, v).ec == std::errc{};
+                bits = static_cast<uint64_t>(v) + static_cast<uint64_t>(step);   // wraps like the target's integer
+            } else {
+                uint64_t v = 0;
+                parsed = std::from_chars(first, last, v).ec == std::errc{};
+                bits = v + static_cast<uint64_t>(step);
+            }
+            if (parsed) {
+                const QString nextText = QString::fromStdString(
+                    ce::formatIntegerScalar(bits, ce::scalarWidth(e.type), e.showAsSigned, e.showAsHex));
+                auto written = writeValueToProcess(proc_, e.address, e.type, nextText, e.codec, e.bigEndian, e.showAsHex, 0, e.dataByteOrder, e.pointerWidth);
+                if (!written) { reportActivationError("Value edit failed", QString::fromStdString(written.error())); return false; }
+                e.currentValue = nextText;
+                if (e.active) e.frozenValue = nextText;
+                emit dataChanged(index(row, 4), index(row, 4), {Qt::DisplayRole, Qt::EditRole});
+                return true;
+            }
+        }
+    }
+
+    double current = 0;
+    if (!readComparableValue(proc_, e.address, e.type, current, e.codec, e.bigEndian, e.showAsSigned, e.dataByteOrder, e.pointerWidth) &&
+        !parseComparableValue(e.type, e.currentValue, current)) {
+        return false;
+    }
+
+    double next = current + delta;
+    QString nextText;
+    switch (e.type) {
+        case ValueType::Byte:
+        case ValueType::Int16:
+        case ValueType::Int32:
+        case ValueType::Int64: {
+            // Render in the record's display format (hex/signed). This is both what the
+            // column shows until the next refresh AND what writeValueToProcess parses
+            // back: a hex record must NOT receive a bare decimal, which its hex-aware
+            // parse would misread (e.g. "256" as 0x256).
+            uint64_t bits = static_cast<uint64_t>(static_cast<int64_t>(std::llround(next)));
+            nextText = QString::fromStdString(
+                ce::formatIntegerScalar(bits, ce::scalarWidth(e.type), e.showAsSigned, e.showAsHex));
+            break;
+        }
+        case ValueType::Pointer:
+            nextText = QString("0x%1").arg(static_cast<qulonglong>(std::llround(next)), 0, 16);
+            break;
+        case ValueType::Float:
+            nextText = QString::fromStdString(ce::formatFloatScalar(next, false));
+            break;
+        case ValueType::Double:
+            nextText = QString::fromStdString(ce::formatFloatScalar(next, true));
+            break;
+        default:
+            return false;
+    }
+
+    auto written = writeValueToProcess(proc_, e.address, e.type, nextText, e.codec, e.bigEndian, e.showAsHex, 0, e.dataByteOrder, e.pointerWidth);
+    if (!written) { reportActivationError("Value edit failed", QString::fromStdString(written.error())); return false; }
+    e.currentValue = nextText;
+    if (e.active) e.frozenValue = nextText;
+    emit dataChanged(index(row, 4), index(row, 4), {Qt::DisplayRole, Qt::EditRole});
+    return true;
+}
+
+// Shift each selected record's indent by delta, together with the rows nested
+// under it (taken before any change): indenting a group header alone turned
+// its children into its siblings.
+void AddressListModel::shiftIndentRows(QList<int> rows, int delta) {
+    if (scriptBusy_ || mutationBusy_) return;
+    if (rows.isEmpty()) return;
+    std::sort(rows.begin(), rows.end());
+    std::vector<int> indents;
+    indents.reserve(entries_.size());
+    for (const auto& e : entries_) indents.push_back(e.indent);
+    int done = -1;   // rows below this were already shifted with their parent
+    // A layout change, so the view hides a row indented into a collapsed group.
+    emit layoutAboutToBeChanged();
+    for (int row : rows) {
+        if (row < 0 || row >= (int)entries_.size() || row < done) continue;
+        const auto sub = ce::descendantRange(indents, static_cast<std::size_t>(row));
+        int shift = delta;
+        if (delta > 0) {
+            if (row == 0) continue;
+            shift = std::min(delta, entries_[row - 1].indent + 1 - entries_[row].indent);   // at most one under the row above
+        } else {
+            shift = std::max(delta, -entries_[row].indent);
+        }
+        if (shift == 0) { done = static_cast<int>(sub.second); continue; }
+        for (std::size_t i = static_cast<std::size_t>(row); i < sub.second; ++i)
+            entries_[i].indent = std::max(0, entries_[i].indent + shift);
+        done = static_cast<int>(sub.second);
+    }
+    emit layoutChanged();
+    emit dataChanged(index(rows.first(), 0), index(std::max(rows.last(), done - 1), columnCount() - 1));
+}
+
+void AddressListModel::indentRows(QList<int> rows) { shiftIndentRows(std::move(rows), +1); }
+void AddressListModel::outdentRows(QList<int> rows) { shiftIndentRows(std::move(rows), -1); }
+
+void AddressListModel::reportActivationError(const QString& title, const QString& message) {
+    if (activationErrorCb_)
+        activationErrorCb_(title, message);
+}
+
+void AddressListModel::setAllActive(bool active) {
+    if (!active) { deactivateAll(); return; }
+    for (int id : ids()) {
+        const int row = rowOfId(id);
+        if (row >= 0 && !entries_[row].isGroup) setEntryActive(row, active);
+    }
+    if (!entries_.empty())
+        emit dataChanged(index(0, 0), index((int)entries_.size() - 1, columnCount() - 1));
+}
+
+// The check box path, so a group header's toggle reaches its children when
+// the group says so.
+void AddressListModel::toggleActive(int row) {
+    if (row < 0 || row >= (int)entries_.size()) return;
+    setData(index(row, 0), entries_[row].active ? Qt::Unchecked : Qt::Checked, Qt::CheckStateRole);
+}
+
+bool AddressListModel::toggleGroupCollapse(int row) {
+    if (row < 0 || row >= (int)entries_.size() || !entries_[row].isGroup) return false;
+    entries_[row].collapsed = !entries_[row].collapsed;
+    emit dataChanged(index(row, 0), index(row, columnCount() - 1));  // refresh the ▸/▾ marker
+    return true;
+}
+
+void AddressListModel::setEntryValueTo(int row, const QString& value) {
+    if (row < 0 || row >= (int)entries_.size() || !proc_) return;
+    setData(index(row, 4), value, Qt::EditRole);
+}
+
+bool AddressListModel::setEntryActive(int row, bool active) {
+    if (row < 0 || row >= (int)entries_.size()) return false;
+    if (scriptBusy_ || (active && (mutationBusy_ || AutoAsmUiOperation::retiring(autoAsm_)))) return false;
+    const int id = entries_[row].id;
+    const bool pending = hasSavedUndo(entries_[row].autoAsmDisableInfo);
+    if (entries_[row].active == active && !(pending && !active)) return true;
+    // A flag-only disable must not permit a second enable over live patches.
+    if (active && pending && !entries_[row].active) {
+        if (!setEntryActive(row, false)) return false;
+        row = rowOfId(id);
+        if (row < 0) return false;
+    }
+    const QString script = entries_[row].autoAsmScript;
+    if (!script.isEmpty() || pending) {
+        if (!proc_ || !autoAsm_) {
+            reportActivationError("Process required",
+                "Open a process before activating this auto-assembler record.");
+            return false;
+        }
+
+        AutoAsmUiOperation operation(autoAsm_, active ? AutoAsmUiOperation::Purpose::Execute : AutoAsmUiOperation::Purpose::Cleanup);
+        if (!operation) return false;
+        QScopedValueRollback busy(scriptBusy_, true);
+        // Both hooks and Lua evaluation may append records and reallocate the
+        // vector. Keep a stable ID and reacquire the row after each callback.
+        const auto before = beforeAaExecute_;
+        if (before) before();
+        row = rowOfId(id);
+        if (row < 0) return false;
+        const auto undo = entries_[row].autoAsmDisableInfo;
+        auto result = active ? autoAsm_->execute(*proc_, script.toStdString())
+                             : autoAsm_->disable(*proc_, script.toStdString(), undo);
+        row = rowOfId(id);
+        if (row < 0) return false;
+        entries_[row].autoAsmDisableInfo = std::move(result.disableInfo);
+        if (active && hasSavedUndo(entries_[row].autoAsmDisableInfo))
+            entries_[row].autoAsmOrder = AutoAsmUiOperation::nextOrder();
+        else if (!hasSavedUndo(entries_[row].autoAsmDisableInfo)) entries_[row].autoAsmOrder = 0;
+        if (!result.success) {
+            if (hasSavedUndo(entries_[row].autoAsmDisableInfo)) entries_[row].active = true;
+            emit dataChanged(index(row, 0), index(row, columnCount() - 1));
+            reportActivationError(active ? "Auto-assembler activation failed" : "Auto-assembler deactivation failed",
+                QString::fromStdString(result.error));
+            return false;
+        }
+    }
+    auto& e = entries_[row];
+    // Freeze what memory holds now, not the cached display text: right after a
+    // record is made or edited that is "?" or empty until the next refresh.
+    // "??"/"?" are placeholders, not values: frozen into a String record they
+    // would be written into the game as text.
+    if (active && e.autoAsmScript.isEmpty() && !e.isGroup) {
+        if (proc_) {
+            const int id = e.id;
+            const auto live = liveValue(id);
+            row = rowOfId(id);
+            if (row < 0) return false;
+            if (!live.empty()) entries_[row].currentValue = QString::fromStdString(live);
+        }
+        const auto& current = entries_[row].currentValue;
+        const bool text = entries_[row].type == ValueType::String || entries_[row].type == ValueType::UnicodeString;
+        // An empty string is a value a String record can hold (and freeze).
+        if (current == QStringLiteral("??") || current == QStringLiteral("?") || (current.isEmpty() && !text)) {
+            reportActivationError("Freeze failed", "The value cannot be read right now, so there is nothing to freeze.");
+            return false;
+        }
+    }
+    e.active = active;
+    if (e.active)
+        e.frozenValue = e.currentValue;
+    else
+        e.frozenValue.clear();
+    emit dataChanged(index(row, 0), index(row, columnCount() - 1));
+    const auto callback = activationCb_;
+    if (callback) callback(id, active);
+    return true;
+}
+
+bool AddressListModel::deactivateAll() {
+    if (scriptBusy_ || mutationBusy_) return false;
+    QScopedValueRollback mutation(mutationBusy_, true);
+    for (int id : cleanupOrder()) {
+        const int row = rowOfId(id);
+        if (row >= 0 && !setEntryActive(row, false)) return false;
+    }
+    if (!entries_.empty()) emit dataChanged(index(0, 0), index(entries_.size() - 1, columnCount() - 1));
+    return true;
+}
+
+bool AddressListModel::setProcess(ce::ProcessHandle* proc) {
+    if (scriptBusy_ || mutationBusy_ || AutoAsmUiOperation::busy(autoAsm_)) return false;
+    if (proc_ != proc && !deactivateAll()) return false;
+    if (proc_ != proc) ++targetRevision_;
+    proc_ = proc;
+    refreshModuleCache();
+    return true;
+}
+
+bool AddressListModel::removeEntry(int row) {
+    return removeEntries({row});
+}
+
+bool AddressListModel::removeEntries(QList<int> rows) {
+    if (scriptBusy_ || mutationBusy_ || AutoAsmUiOperation::retiring(autoAsm_)) return false;
+    QScopedValueRollback mutation(mutationBusy_, true);
+    // Deleting a group header takes its whole subtree with it (CE: a group carries its
+    // descendants), so children are never left orphaned at a now-invalid indent.
+    std::vector<int> indents;
+    indents.reserve(entries_.size());
+    for (const auto& e : entries_) indents.push_back(e.indent);
+    std::vector<std::size_t> sel;
+    sel.reserve(rows.size());
+    for (int r : rows) if (r >= 0 && r < (int)entries_.size()) sel.push_back((std::size_t)r);
+    auto expanded = ce::expandGroupDeletion(indents, sel);
+    auto cleanup = expanded;
+    std::stable_sort(cleanup.begin(), cleanup.end(), [&](auto a, auto b) { return entries_[a].autoAsmOrder > entries_[b].autoAsmOrder; });
+    for (auto row : cleanup) if (!setEntryActive(static_cast<int>(row), false)) return false;
+    // Delete high-to-low so earlier indices stay valid as rows are removed, a
+    // run of adjacent rows (a group and its subtree) at a time.
+    for (auto it = expanded.rbegin(); it != expanded.rend();) {
+        const int last = static_cast<int>(*it);
+        int first = last;
+        for (++it; it != expanded.rend() && static_cast<int>(*it) == first - 1; ++it) --first;
+        beginRemoveRows({}, first, last);
+        entries_.erase(entries_.begin() + first, entries_.begin() + last + 1);
+        endRemoveRows();
+    }
+    return !expanded.empty();
+}
+
+// Move a record, with the rows nested under it, past its previous or next
+// sibling (and that sibling's subtree). Swapping single rows left a group's
+// children behind and could move a record into or out of a group.
+int AddressListModel::moveEntry(int row, int delta) {
+    if (scriptBusy_ || mutationBusy_) return row;
+    const int n = (int)entries_.size();
+    if (row < 0 || row >= n || delta == 0) return row;
+    std::vector<int> indents;
+    indents.reserve(n);
+    for (const auto& e : entries_) indents.push_back(e.indent);
+    const int level = indents[row];
+    const int end = static_cast<int>(ce::descendantRange(indents, static_cast<std::size_t>(row)).second);
+    if (delta < 0) {
+        int previous = row - 1;
+        while (previous >= 0 && indents[previous] > level) --previous;
+        if (previous < 0 || indents[previous] != level) return row;   // first in its group
+        moveEntryBlock(row, previous, -1);
+        return previous;
+    }
+    if (end >= n || indents[end] != level) return row;   // last in its group
+    const int nextEnd = static_cast<int>(ce::descendantRange(indents, static_cast<std::size_t>(end)).second);
+    moveEntryBlock(row, nextEnd, -1);
+    return row + (nextEnd - end);
+}
+
+// Read+format a variable-length value (String/UnicodeString/ByteArray) for display.
+// nullopt if `type` isn't variable-length; "??" on read failure. Shared by the
+// address-list refresh and the Lua mr.Value read so both agree.
+static std::optional<QString> formatVariableLengthValue(ProcessHandle* proc, uintptr_t addr,
+                                                        ValueType type, size_t byteCount, bool bigEndian, ByteOrder order) {
+    if (type != ValueType::String && type != ValueType::UnicodeString && type != ValueType::ByteArray)
+        return std::nullopt;
+    ce::ValueIoOptions options;
+    options.size = byteCount ? byteCount : (type == ValueType::ByteArray ? 16 : 64);
+    options.bigEndian = bigEndian;
+    if (order != ByteOrder::Unknown) options.byteOrder = order;
+    auto value = ce::readTypedValue(*proc, addr, type, options);
+    return value ? QString::fromStdString(*value) : QStringLiteral("??");
+}
+
+void AddressListModel::updateValues(ProcessHandle* proc) {
+    const ExpressionParser parser(proc_, symbolResolver_);   // one module list per pass
+    for (size_t i = 0; i < entries_.size(); ++i) {
+        auto& e = entries_[i];
+        if (e.isGroup) continue;
+        if (!e.autoAsmScript.isEmpty()) continue;   // a script has no value to read (it would show "??")
+        // Frozen records show what memory holds too (an Increase Only floor, a
+        // broken pointer); the freeze writes frozenValue, not this text.
+
+        // Pointer records: re-evaluate the address expression so a moving pointer
+        // chain is followed live (CE re-resolves every refresh).
+        if (!reresolveAddress(e, &parser)) { e.currentValue = QStringLiteral("??"); continue; }
+
+        // Variable-length types: read the element (exact length if known) and format.
+        if (auto fv = formatVariableLengthValue(proc, e.address, e.type, e.byteCount, e.bigEndian, e.dataByteOrder)) {
+            e.currentValue = *fv;
+            continue;
+        }
+
+        ce::ValueIoOptions options;
+        options.hex = e.showAsHex; options.isSigned = e.showAsSigned;
+        options.codec = e.codec; options.bigEndian = e.bigEndian;
+        if (e.dataByteOrder != ByteOrder::Unknown) options.byteOrder = e.dataByteOrder;
+        if (e.pointerWidth) options.pointerWidthOverride = e.pointerWidth;
+        auto value = ce::readTypedValue(*proc, e.address, e.type, options);
+        e.currentValue = value ? QString::fromStdString(*value) : "??";
+    }
+    if (!entries_.empty())
+        emit dataChanged(index(0, 4), index(entries_.size() - 1, 4));
+}
+
+std::string AddressListModel::liveValue(int id) {
+    int row = rowOfId(id);
+    if (row < 0 || !proc_) return {};
+    auto& e = entries_[row];
+    if (e.isGroup) return {};
+    // Re-resolve pointer expressions and read the process now (CE's mr.Value does a
+    // live read on access, not a cached refresh value).
+    if (!reresolveAddress(e)) return {};
+    if (auto fv = formatVariableLengthValue(proc_, e.address, e.type, e.byteCount, e.bigEndian, e.dataByteOrder))
+        return fv->toStdString();
+
+    ce::ValueIoOptions options;
+    options.hex = e.showAsHex; options.isSigned = e.showAsSigned;
+    options.codec = e.codec; options.bigEndian = e.bigEndian;
+    if (e.dataByteOrder != ByteOrder::Unknown) options.byteOrder = e.dataByteOrder;
+    if (e.pointerWidth) options.pointerWidthOverride = e.pointerWidth;
+    auto value = ce::readTypedValue(*proc_, e.address, e.type, options);
+    return value ? *value : "??";
+}
+
+int AddressListModel::rowCount(const QModelIndex&) const { return entries_.size(); }
+int AddressListModel::columnCount(const QModelIndex&) const { return 5; }
+
+QVariant AddressListModel::headerData(int section, Qt::Orientation o, int role) const {
+    if (role != Qt::DisplayRole || o != Qt::Horizontal) return {};
+    switch (section) {
+        case 0: return "Active";
+        case 1: return "Description";
+        case 2: return "Address";
+        case 3: return "Type";
+        case 4: return "Value";
+        default: return {};
+    }
+}
+
+void AddressListModel::refreshModuleCache() {
+    moduleCache_ = proc_ ? proc_->modules() : std::vector<ce::ModuleInfo>{};
+}
+
+QVariant AddressListModel::data(const QModelIndex& index, int role) const {
+    if (!index.isValid() || index.row() < 0 || index.row() >= (int)entries_.size())
+        return {};
+    if (role == Qt::CheckStateRole && index.column() == 0)
+        return entries_[index.row()].active ? Qt::Checked : Qt::Unchecked;
+
+    auto& e = entries_[index.row()];
+    if (role == Qt::ToolTipRole) {
+        if (index.column() == 1) return e.description;
+        if (index.column() == 2 && !e.addressExpr.isEmpty()) return e.addressExpr;
+        return data(index, Qt::DisplayRole);
+    }
+    if (role == Qt::ForegroundRole)
+        return entryForeground(e.color);
+    if (role == Qt::EditRole) {
+        if (index.column() == 1) return e.description;
+        // Pre-fill the address editor with the pointer expression if it is a
+        // pointer record, otherwise the plain hex address.
+        if (index.column() == 2)
+            return e.addressExpr.isEmpty()
+                ? QString("0x%1").arg(e.address, 0, 16) : e.addressExpr;
+        // The type editor starts from the record's type: an empty editor
+        // committed by clicking away changed every record to 4 Bytes.
+        if (index.column() == 3) return QString(ce::valueTypeName(e.type));
+        if (index.column() == 4) return e.currentValue;
+        return {};
+    }
+    if (role != Qt::DisplayRole) return {};
+
+    switch (index.column()) {
+        case 1: {
+            QString prefix;
+            for (int i = 0; i < e.indent; ++i) prefix += "  ";
+            // A group shows a collapse indicator (CE tree node): open vs collapsed.
+            if (e.isGroup) prefix += e.collapsed ? QString::fromUtf8("▸ ")
+                                                 : QString::fromUtf8("▾ ");
+            return prefix + e.description;
+        }
+        case 2: {
+            if (e.isGroup) return QString("");
+            // Show the address relative to its module ("game.bin+0x1234") when it
+            // falls inside one -- CE's convention, and stable across restarts.
+            // Otherwise a plain hex address. Pointer records keep the "P->" prefix.
+            std::string modOff = ce::moduleOffsetString(moduleCache_, e.address);
+            QString addrStr = modOff.empty()
+                ? formatListAddress(e.address)
+                : QString::fromStdString(modOff);
+            return e.addressExpr.isEmpty() ? addrStr : ("P->" + addrStr);
+        }
+        case 3: {
+            if (e.isGroup) return "";
+            // CE-canonical name; String/Array records also show their element length
+            // in brackets (e.g. "String[10]", "Array of byte[8]"), like Cheat Engine.
+            QString name = ce::valueTypeName(e.type);
+            if ((e.type == ValueType::String || e.type == ValueType::UnicodeString ||
+                 e.type == ValueType::ByteArray) && e.byteCount > 0)
+                name += QString("[%1]").arg(e.byteCount);
+            return name;
+        }
+        case 4: return e.isGroup ? QString("") : e.dropdownList.isEmpty()
+            ? e.currentValue
+            : displayDropdownValue(e.currentValue, e.dropdownList);
+        default: return {};
+    }
+}
+
+Qt::ItemFlags AddressListModel::flags(const QModelIndex& index) const {
+    auto f = QAbstractTableModel::flags(index);
+    // Empty area (invalid index) accepts drops so an entry can be moved to the end.
+    if (!index.isValid() || index.row() < 0 || index.row() >= (int)entries_.size())
+        return f | Qt::ItemIsDropEnabled;
+    const auto& e = entries_[index.row()];
+    bool isScript = !e.autoAsmScript.isEmpty();
+    if (index.column() == 0) f |= Qt::ItemIsUserCheckable;
+    // Description is always editable. Address/Type/Value are editable for real
+    // (non-group, non-script) entries — a script entry has no meaningful address,
+    // type, or value; edit its script via the context menu / double-click.
+    if (index.column() == 1)
+        f |= Qt::ItemIsEditable;
+    else if (!e.isGroup && !isScript &&
+             (index.column() == 2 || index.column() == 3 || index.column() == 4))
+        f |= Qt::ItemIsEditable;
+    // Rows are draggable, and drop-enabled so a drop onto a row targets that row.
+    f |= Qt::ItemIsDragEnabled | Qt::ItemIsDropEnabled;
+    return f;
+}
+
+QStringList AddressListModel::mimeTypes() const {
+    return {QStringLiteral("application/x-ce-addresslist-row")};
+}
+
+QMimeData* AddressListModel::mimeData(const QModelIndexList& indexes) const {
+    // Encode the single source row (the smallest selected row); dropMimeData extends it
+    // to the whole group block if it is a header. One row keeps the reorder unambiguous.
+    int src = -1;
+    for (const auto& idx : indexes)
+        if (idx.isValid() && (src < 0 || idx.row() < src)) src = idx.row();
+    if (src < 0) return nullptr;
+    auto* mime = new QMimeData;
+    QByteArray buf;
+    QDataStream st(&buf, QIODevice::WriteOnly);
+    st << src;
+    mime->setData(mimeTypes().first(), buf);
+    return mime;
+}
+
+bool AddressListModel::dropMimeData(const QMimeData* data, Qt::DropAction action, int row,
+                                    int /*column*/, const QModelIndex& parent) {
+    if (action != Qt::MoveAction || !data || !data->hasFormat(mimeTypes().first()))
+        return false;
+    QByteArray buf = data->data(mimeTypes().first());
+    QDataStream st(&buf, QIODevice::ReadOnly);
+    int src = -1; st >> src;
+    if (src < 0 || src >= (int)entries_.size()) return false;
+    // Qt's drop row: >=0 means "before this row" (drop between rows); onto a row gives
+    // row=-1 + parent; an empty-area drop gives row=-1 + invalid parent (append at end).
+    int dest, nestIndent = -1;
+    if (row >= 0) {
+        dest = row;                                   // between rows: flat move
+    } else if (parent.isValid()) {
+        int pr = parent.row();
+        if (pr >= 0 && pr < (int)entries_.size() && entries_[pr].isGroup && pr != src) {
+            // Dropped onto a group header: nest the entry as the group's first child (CE).
+            dest = pr + 1;
+            nestIndent = entries_[pr].indent + 1;
+        } else {
+            dest = pr;
+        }
+    } else {
+        dest = (int)entries_.size();                  // empty area: move to the end
+    }
+    moveEntryBlock(src, dest, nestIndent);
+    // Return false: the move is done here, so Qt must not also remove the source rows
+    // (its default InternalMove completion would corrupt the list).
+    return false;
+}
+
+void AddressListModel::moveEntryBlock(int srcRow, int destRow, int newRootIndent) {
+    if (scriptBusy_ || mutationBusy_) return;
+    const int n = (int)entries_.size();
+    if (srcRow < 0 || srcRow >= n) return;
+    // A group header drags its whole subtree; a leaf is a block of one.
+    std::vector<int> indents;
+    indents.reserve(n);
+    for (const auto& e : entries_) indents.push_back(e.indent);
+    // A record drags the rows nested under it: a group's subtree, and also the
+    // children Cheat Engine tables put under script records, which would
+    // otherwise be re-parented to whatever row precedes them.
+    auto sub = ce::descendantRange(indents, srcRow);
+    int len = (int)(sub.second - srcRow);
+    if (len < 1) len = 1;
+    // Dropping inside the moved block leaves the order unchanged, but a drop
+    // onto the group right above still nests the block (re-indent only).
+    if (destRow >= srcRow && destRow <= srcRow + len) {
+        if (newRootIndent < 0 || entries_[srcRow].indent == newRootIndent) return;
+        const int delta = newRootIndent - entries_[srcRow].indent;
+        emit layoutAboutToBeChanged();   // see shiftIndentRows
+        for (int i = srcRow; i < srcRow + len; ++i) entries_[i].indent = std::max(0, entries_[i].indent + delta);
+        emit layoutChanged();
+        emit dataChanged(index(srcRow, 0), index(srcRow + len - 1, columnCount() - 1));
+        return;
+    }
+    auto perm = ce::moveRangePermutation(n, srcRow, len, destRow);
+    if ((int)perm.size() != n) return;
+    // Re-indent the block before permuting (indents ride along with the entries), so a
+    // drop onto a group nests the whole subtree one level under it.
+    if (newRootIndent >= 0) {
+        int delta = newRootIndent - entries_[srcRow].indent;
+        for (int i = srcRow; i < srcRow + len; ++i) {
+            int ni = entries_[i].indent + delta;
+            entries_[i].indent = ni < 0 ? 0 : ni;
+        }
+    }
+    beginResetModel();
+    std::vector<AddressEntry> reordered;
+    reordered.reserve(n);
+    for (int oldIdx : perm) reordered.push_back(std::move(entries_[oldIdx]));
+    entries_ = std::move(reordered);
+    endResetModel();
+}
+
+void AddressListModel::groupSelectedRows(QList<int> rows, const QString& desc) {
+    if (scriptBusy_ || mutationBusy_) return;
+    const int n = (int)entries_.size();
+    std::vector<int> indents;
+    indents.reserve(n);
+    for (const auto& e : entries_) indents.push_back(e.indent);
+    std::vector<std::size_t> sel;
+    sel.reserve(rows.size());
+    for (int r : rows) if (r >= 0 && r < n) sel.push_back((std::size_t)r);
+    auto plan = ce::groupSelection(indents, sel);
+    if (!plan.ok) return;
+
+    // Each original index appears exactly once in plan.order (plus one -1 for the new
+    // header), so moving out of entries_ never double-moves.
+    beginResetModel();
+    std::vector<AddressEntry> rebuilt;
+    rebuilt.reserve(plan.order.size());
+    for (std::size_t i = 0; i < plan.order.size(); ++i) {
+        const int oldIdx = plan.order[i];
+        if (oldIdx < 0) {
+            AddressEntry g;
+            g.id = allocId();
+            g.description = desc;
+            g.isGroup = true;
+            g.indent = plan.indent[i];
+            rebuilt.push_back(std::move(g));
+        } else {
+            AddressEntry e = std::move(entries_[oldIdx]);
+            e.indent = plan.indent[i];
+            rebuilt.push_back(std::move(e));
+        }
+    }
+    entries_ = std::move(rebuilt);
+    endResetModel();
+}
+
+// Parse a Type-column display name back to a ValueType. First matches the canonical
+// name (ce::valueTypeName), so every name the column can show round-trips ("String",
+// "Unicode String", "Array of byte", "All", ...); then a few common synonyms. Int32 fallback.
+// A record's type from its name; nothing for an unknown name or a scan-only
+// type (All, Grouped), which a record cannot hold.
+static std::optional<ValueType> valueTypeFromDisplayName(const QString& s) {
+    QString n = s.trimmed().toLower();
+    if (const auto bracket = n.indexOf('['); bracket > 0) n = n.left(bracket).trimmed();   // "string[10]"
+    for (auto t : {ValueType::Byte, ValueType::Int16, ValueType::Int32, ValueType::Int64,
+                   ValueType::Float, ValueType::Double, ValueType::String, ValueType::UnicodeString,
+                   ValueType::ByteArray, ValueType::Binary, ValueType::Custom, ValueType::Pointer})
+        if (n == QString(ce::valueTypeName(t)).toLower()) return t;
+    if (n == "word" || n == "short") return ValueType::Int16;
+    if (n == "dword" || n == "int") return ValueType::Int32;
+    if (n == "qword" || n == "long" || n == "int64") return ValueType::Int64;
+    if (n == "text") return ValueType::String;
+    if (n == "unicode text" || n == "unicode" || n == "utf-16") return ValueType::UnicodeString;
+    if (n == "array of bytes" || n == "aob" || n == "bytes") return ValueType::ByteArray;
+    return std::nullopt;
+}
+
+bool AddressListModel::setData(const QModelIndex& index, const QVariant& value, int role) {
+    if (!index.isValid() || index.row() < 0 || index.row() >= (int)entries_.size() ||
+        index.column() < 0 || index.column() >= columnCount()) return false;
+    if (role == Qt::CheckStateRole && index.column() == 0) {
+        const int id = entries_[index.row()].id;
+        const bool group = entries_[index.row()].isGroup;
+        const int parentIndent = entries_[index.row()].indent;
+        bool requestedActive = (value.toInt() == Qt::Checked);
+        const bool cascade = requestedActive ? entries_[index.row()].activateChildren
+                                             : entries_[index.row()].deactivateChildren;
+        std::vector<std::pair<uint64_t, int>> children;
+        if (group && cascade) {
+            for (int i = index.row() + 1; i < (int)entries_.size() && entries_[i].indent > parentIndent; ++i)
+                children.emplace_back(entries_[i].autoAsmOrder, entries_[i].id);
+        }
+        if (group && !requestedActive) {
+            std::stable_sort(children.begin(), children.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+            for (const auto& child : children) {
+                if (rowOfId(child.second) >= 0 && !setActive(child.second, false)) return false;
+            }
+            children.clear();
+        }
+        const int parentRow = rowOfId(id);
+        if (parentRow < 0) return true;
+        if (!setEntryActive(parentRow, requestedActive))
+            return false;
+        const int row = rowOfId(id);
+        if (row >= 0) emit dataChanged(this->index(row, 0), this->index(row, 0));
+        bool success = true;
+        for (const auto& child : children) {
+            const int childRow = rowOfId(child.second);
+            if (childRow >= 0 && !setActive(child.second, requestedActive)) success = false;
+        }
+        return success;
+    }
+    if (role == Qt::EditRole) {
+        if (index.column() == 1) {
+            entries_[index.row()].description = value.toString();
+            emit dataChanged(index, index, {Qt::DisplayRole, Qt::EditRole});
+            return true;
+        }
+        if (index.column() == 2) {   // Address
+            auto& e = entries_[index.row()];
+            if (e.isGroup || !e.autoAsmScript.isEmpty()) return false;
+            QString text = value.toString().trimmed();
+            if (text.isEmpty()) return false;
+            std::optional<uintptr_t> addr;
+            if (addressResolver_) addr = addressResolver_(text);
+            if (!addr) {   // fall back to a bare hex address if no resolver
+                bool ok = false;
+                QString h = text;
+                if (h.startsWith("0x") || h.startsWith("0X")) h = h.mid(2);
+                uintptr_t v = h.toULongLong(&ok, 16);
+                if (ok) addr = v;
+            }
+            if (!addr) return false;
+            // Anything but a plain number (a [pointer] path, module+offset, a
+            // symbol) is kept as an expression that re-resolves on every
+            // refresh, so it survives ASLR and moving pointers (CE convention).
+            QString digits = text;
+            if (digits.startsWith("0x") || digits.startsWith("0X")) digits = digits.mid(2);
+            const bool plain = !digits.isEmpty() && std::all_of(digits.begin(), digits.end(),
+                [](QChar c) { return c.isDigit() || (c.toLower() >= 'a' && c.toLower() <= 'f'); });
+            setEntryAddress(index.row(), *addr, plain ? QString() : text);
+            return true;
+        }
+        if (index.column() == 3) {   // Type
+            if (entries_[index.row()].isGroup) return false;
+            const auto type = valueTypeFromDisplayName(value.toString());
+            if (!type) return false;   // a typo keeps the type it had
+            setEntryType(index.row(), *type);
+            return true;
+        }
+        if (index.column() == 4) {
+            auto& e = entries_[index.row()];
+            if (e.isGroup) return false;
+            auto rawValue = e.dropdownList.isEmpty()
+                ? value.toString()
+                : resolveDropdownInput(value.toString(), e.dropdownList);
+            // Keep the display form: a hex entry stays "0x..." and parseIntField
+            // reads the 0x prefix as hex. Pre-converting to a bare decimal here and
+            // still passing showHex=true re-read "255" as 0x255 (wrong value), and
+            // the decimal frozenValue was then written the same wrong way.
+            if (e.showAsHex && (ce::isIntegerScalar(e.type) || e.type == ValueType::Pointer)) {
+                QString h = rawValue.trimmed();
+                if (h.startsWith("0x") || h.startsWith("0X")) h = h.mid(2);
+                bool okh = false;
+                qulonglong hv = h.toULongLong(&okh, 16);
+                if (okh) rawValue = "0x" + QString::number(hv, 16);
+            }
+            ce::ValueIoOptions options;
+            options.codec = e.codec; options.bigEndian = e.bigEndian;
+            if (e.dataByteOrder != ByteOrder::Unknown) options.byteOrder = e.dataByteOrder;
+            if (e.pointerWidth) options.pointerWidthOverride = e.pointerWidth;
+            options.hex = e.showAsHex;
+            options.pointerWidth = e.pointerWidth ? e.pointerWidth : proc_ ? proc_->pointerWidth(e.address) : sizeof(uintptr_t);
+            if (proc_) {
+                if (!reresolveAddress(e)) {
+                    reportActivationError("Value edit failed", "The pointer path does not resolve right now.");
+                    return false;
+                }
+                auto resolved = ce::valueOptionsForTarget(*proc_, e.address, e.type, options);
+                if (!resolved) { reportActivationError("Value edit failed", QString::fromStdString(resolved.error())); return false; }
+                options = *resolved;
+            }
+            auto bytes = ce::encodeTypedValue(e.type, rawValue.toStdString(), options);
+            if (!bytes) { reportActivationError("Value edit failed", QString::fromStdString(bytes.error())); return false; }
+            size_t nextByteCount = bytes->size();
+            if (e.type == ValueType::String || e.type == ValueType::UnicodeString) {
+                size_t capacity = e.byteCount;
+                if (!capacity && e.currentValue != "?" && e.currentValue != "??") {
+                    auto previous = ce::encodeTypedValue(e.type, e.currentValue.toStdString(), options);
+                    if (previous) capacity = previous->size();
+                }
+                options.terminate = bytes->empty() || bytes->size() < capacity;
+                if (options.terminate) nextByteCount += e.type == ValueType::UnicodeString ? 2 : 1;
+            }
+            if (proc_) {
+                if (!reresolveAddress(e)) {
+                    reportActivationError("Value edit failed", "The pointer path does not resolve right now.");
+                    return false;
+                }
+                auto written = ce::writeTypedValue(*proc_, e.address, e.type, rawValue.toStdString(), options);
+                if (!written) { reportActivationError("Value edit failed", QString::fromStdString(written.error())); return false; }
+                if (!e.active) scheduleEditVerify(e.address, e.type, rawValue, e.codec, e.bigEndian, e.showAsSigned, e.dataByteOrder, e.pointerWidth);
+            }
+            if (e.type == ValueType::String || e.type == ValueType::UnicodeString || e.type == ValueType::ByteArray)
+                e.byteCount = nextByteCount;
+            e.currentValue = rawValue;
+            if (e.active) e.frozenValue = rawValue;
+            emit dataChanged(index, index);
+            return true;
+        }
+    }
+    return false;
+}
+
+void AddressListModel::scheduleEditVerify(uintptr_t addr, ce::ValueType type,
+                                          const QString& wroteStr, const ce::ValueCodec& codec,
+                                          bool bigEndian, bool isSigned, ByteOrder order, uint8_t pointerWidth) {
+    if (!proc_) return;
+    double target = 0;
+    // Parse the written text the same way the read side interprets memory (hex-aware
+    // for integers, so a "0xff" edit verifies), else no revert check (string/AOB).
+    if (!parseComparableValue(type, wroteStr, target)) return;
+    // `this` as the timer context: the callback is skipped if the model is destroyed.
+    QTimer::singleShot(250, this, [this, addr, type, wroteStr, target, codec, bigEndian, isSigned, order, pointerWidth]() {
+        if (!proc_) return;
+        double now = 0;
+        if (!readComparableValue(proc_, addr, type, now, codec, bigEndian, isSigned, order, pointerWidth)) return;
+        const double tol = (type == ce::ValueType::Float || type == ce::ValueType::Double)
+                         ? std::abs(target) * 1e-5 + 1e-6 : 0.5;
+        if (std::abs(now - target) > tol)
+            emit valueReverted(addr, wroteStr, QString::number(now, 'g', 10));
+    });
+}
+
+// ── ce::IAddressList implementation ──
+
+int AddressListModel::rowOfId(int id) const {
+    for (size_t i = 0; i < entries_.size(); ++i)
+        if (entries_[i].id == id) return (int)i;
+    return -1;
+}
+
+int AddressListModel::count() const { return (int)entries_.size(); }
+
+static AddressEntrySnapshot snapshotOf(const AddressEntry& e) {
+    AddressEntrySnapshot s;
+    s.id = e.id;
+    s.description = e.description.toStdString();
+    s.address = e.address;
+    s.type = e.type;
+    s.value = e.currentValue.toStdString();
+    s.color = e.color.toStdString();
+    s.script = e.autoAsmScript.toStdString();
+    s.hotkeyKeys = e.hotkeyKeys.toStdString();
+    s.active = e.active;
+    s.isGroup = e.isGroup;
+    s.showAsHex = e.showAsHex;
+    s.indent = e.indent;
+    s.addressExpression = e.addressExpr.toStdString();
+    s.showAsSigned = e.showAsSigned;
+    s.byteCount = e.byteCount;
+    s.dataByteOrder = e.dataByteOrder;
+    s.pointerWidth = e.pointerWidth;
+    s.freezeMode = static_cast<int>(e.freezeMode);
+    return s;
+}
+
+bool AddressListModel::setHexView(int id, bool hex) {
+    int row = rowOfId(id);
+    if (row < 0) return false;
+    setShowAsHex(row, hex);   // existing row-based method: updates + emits dataChanged
+    return true;
+}
+
+bool AddressListModel::setByteCount(int id, std::size_t count) {
+    int row = rowOfId(id);
+    if (row < 0) return false;
+    entries_[row].byteCount = std::min<std::size_t>(count, kMaxRecordBytes);   // String / Array of byte length
+    emit dataChanged(index(row, 0), index(row, columnCount() - 1));
+    return true;
+}
+
+bool AddressListModel::setSigned(int id, bool isSigned) {
+    int row = rowOfId(id);
+    if (row < 0) return false;
+    entries_[row].showAsSigned = isSigned;   // CE ShowAsSigned: re-render the value column
+    emit dataChanged(index(row, 0), index(row, columnCount() - 1));
+    return true;
+}
+
+bool AddressListModel::setIndent(int id, int indent) {
+    if (scriptBusy_ || mutationBusy_) return false;
+    int row = rowOfId(id);
+    if (row < 0 || row >= (int)entries_.size()) return false;
+    emit layoutAboutToBeChanged();   // see shiftIndentRows
+    entries_[row].indent = indent < 0 ? 0 : indent;
+    emit layoutChanged();
+    emit dataChanged(index(row, 0), index(row, columnCount() - 1));
+    return true;
+}
+
+std::optional<AddressEntrySnapshot> AddressListModel::at(int index) const {
+    if (index < 0 || index >= (int)entries_.size()) return std::nullopt;
+    return snapshotOf(entries_[index]);
+}
+
+std::optional<AddressEntrySnapshot> AddressListModel::byId(int id) const {
+    int row = rowOfId(id);
+    if (row < 0) return std::nullopt;
+    return snapshotOf(entries_[row]);
+}
+
+int AddressListModel::findIdByDescription(const std::string& desc) const {
+    QString q = QString::fromStdString(desc);
+    for (const auto& e : entries_)
+        if (e.description == q) return e.id;
+    return -1;
+}
+
+std::vector<int> AddressListModel::ids() const {
+    std::vector<int> out;
+    out.reserve(entries_.size());
+    for (const auto& e : entries_) out.push_back(e.id);
+    return out;
+}
+
+std::vector<int> AddressListModel::cleanupOrder() const {
+    std::vector<std::pair<uint64_t, int>> owners;
+    owners.reserve(entries_.size());
+    for (const auto& entry : entries_) owners.emplace_back(entry.autoAsmOrder, entry.id);
+    std::stable_sort(owners.begin(), owners.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::vector<int> result;
+    result.reserve(owners.size());
+    for (const auto& owner : owners) result.push_back(owner.second);
+    return result;
+}
+
+int AddressListModel::createEntry(uintptr_t addr, ValueType type, const std::string& description) {
+    addEntry(addr, type, QString::fromStdString(description));
+    return entries_.empty() ? -1 : entries_.back().id;
+}
+
+int AddressListModel::createGroup(const std::string& description) {
+    addGroup(QString::fromStdString(description));
+    return entries_.empty() ? -1 : entries_.back().id;
+}
+
+bool AddressListModel::deleteById(int id) {
+    int row = rowOfId(id);
+    if (row < 0) return false;
+    return removeEntry(row);
+}
+
+bool AddressListModel::disableAllWithoutExecute() {
+    if (scriptBusy_ || mutationBusy_) return false;
+    bool any = false;
+    for (size_t i = 0; i < entries_.size(); ++i) {
+        if (entries_[i].active && !entries_[i].isGroup) {
+            entries_[i].active = false;
+            entries_[i].frozenValue.clear();
+            any = true;
+        }
+    }
+    if (any)
+        emit dataChanged(index(0, 0), index((int)entries_.size() - 1, columnCount() - 1));
+    return any;
+}
+
+bool AddressListModel::setDescription(int id, const std::string& desc) {
+    int row = rowOfId(id);
+    if (row < 0) return false;
+    entries_[row].description = QString::fromStdString(desc);
+    emit dataChanged(index(row, 1), index(row, 1));
+    return true;
+}
+
+bool AddressListModel::setAddress(int id, uintptr_t addr) {
+    int row = rowOfId(id);
+    if (row < 0) return false;
+    entries_[row].address = addr;
+    entries_[row].addressExpr.clear();   // a plain address clears any pointer expr
+    emit dataChanged(index(row, 2), index(row, 2));
+    return true;
+}
+
+bool AddressListModel::setAddressExpression(int id, const std::string& expr) {
+    int row = rowOfId(id);
+    if (row < 0) return false;
+    entries_[row].addressExpr = QString::fromStdString(expr);
+    // Resolve once now so the address column is populated immediately.
+    ExpressionParser parser(proc_, nullptr);
+    if (auto v = parser.parse(expr)) entries_[row].address = *v;
+    emit dataChanged(index(row, 2), index(row, 2));
+    return true;
+}
+
+bool AddressListModel::setType(int id, ValueType t) {
+    int row = rowOfId(id);
+    if (row < 0) return false;
+    setEntryType(row, t);   // ends a freeze of the old type
+    return true;
+}
+
+bool AddressListModel::setValue(int id, const std::string& value) {
+    int row = rowOfId(id);
+    return row >= 0 && setData(index(row, 4), QString::fromStdString(value), Qt::EditRole);
+}
+
+bool AddressListModel::setActive(int id, bool active) {
+    int row = rowOfId(id);
+    if (row < 0) return false;
+    bool ok = setEntryActive(row, active);
+    row = rowOfId(id);
+    if (row >= 0) emit dataChanged(index(row, 0), index(row, columnCount() - 1));
+    return ok;
+}
+
+bool AddressListModel::setColor(int id, const std::string& color) {
+    int row = rowOfId(id);
+    if (row < 0) return false;
+    entries_[row].color = QString::fromStdString(color);
+    emit dataChanged(index(row, 1), index(row, columnCount() - 1));
+    return true;
+}
+
+bool AddressListModel::setDropdownList(int id, const QString& list) {
+    int row = rowOfId(id);
+    if (row < 0) return false;
+    entries_[row].dropdownList = normalizedDropdownList(list);
+    emit dataChanged(index(row, 1), index(row, columnCount() - 1));
+    return true;
+}
+
+QString AddressListModel::dropdownList(int row) const {
+    return (row >= 0 && row < (int)entries_.size()) ? entries_[row].dropdownList : QString();
+}
+
+bool AddressListModel::setScript(int id, const std::string& script) {
+    return updateScriptEntryById(id, {}, QString::fromStdString(script));
+}
+
+bool AddressListModel::setFreezeMode(int id, int mode) {
+    int row = rowOfId(id);
+    if (row < 0 || mode < 0 || mode > 4) return false;
+    entries_[row].freezeMode = static_cast<ce::FreezeMode>(mode);
+    return true;
+}
+
+} // namespace ce::gui
