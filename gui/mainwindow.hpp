@@ -35,6 +35,7 @@
 #include <QJsonObject>
 #include <functional>
 #include "gui/globalhotkeys.hpp"
+#include "gui/profiles.hpp"
 #include <unordered_map>
 #include <vector>
 #include <cstdint>
@@ -87,6 +88,11 @@ public:
     /// Attach to a running process by pid (no dialog). `name` is display-only.
     /// Used by the process picker and by `--pid <N>` on the command line.
     void attachToPid(pid_t pid, const QString& name);
+    /// Start one process watcher per enabled game profile (auto-attach).
+    void startProfileWatchers();
+    /// Test hooks: the attached pid, and the stored profile list.
+    pid_t currentPidForTest() const { return currentPid_; }
+    const std::vector<GameProfile>& gameProfilesForTest() const { return gameProfiles_; }
     void autoAttach(pid_t pid, const QString& name, quint64 watch);   // "Wait for process" hit
     // Ends a pending "Wait for process": hits it already queued are dropped.
     void stopProcessWatch();
@@ -155,6 +161,8 @@ private:
     void setupMenus();
     bool loadAddressEntries(const QJsonArray& entries);
     void rebaseResolvedEntries();
+    void openProfilesDialog();
+    void stopProfileWatchers();
     // Build the address list + table comment/annotations/Lua from a parsed table
     // (shared by the CE XML .CT and protected .CETRAINER load paths).
     bool loadCheatTableModel(const ce::CheatTable& table,const QJsonArray* originalJson=nullptr);
@@ -242,6 +250,9 @@ private:
     std::shared_ptr<ce::Snapshot> snapshot_;
     std::vector<QPair<qulonglong, qulonglong>> allocations_;  // (address,size) blocks we allocated.
     std::unique_ptr<ce::os::ProcessWatcher> processWatcher_;
+    std::vector<std::unique_ptr<ce::os::ProcessWatcher>> profileWatchers_;
+    std::vector<GameProfile> gameProfiles_;
+    bool profileWatchActive_ = false;
     pid_t currentPid_ = 0;
     int moduleCacheTick_ = 0;   // throttles the address-list module cache refresh
     bool pauseWhileScanning_ = false;   // SIGSTOP the target during each scan

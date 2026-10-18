@@ -34,6 +34,11 @@ First Neversnooze CE release.
 
 ## Unreleased
 
+- Game profiles (File > Game profiles...): per-game profiles with a process
+  name and a cheat table; one click watches for those processes and attaches
+  with the table loaded the moment a game starts, and pattern-resolver
+  records in that table rebase on arrival. Profiles live in the app config
+  directory as profiles.json.
 - Value provenance timeline: "Find what writes/accesses" now records every
   access event (timestamp, accessed address, full register state) in a capped
   history; a Timeline tab next to the instruction list shows the events

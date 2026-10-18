@@ -148,6 +148,9 @@ jobs:
       - name: Run GUI resilient-table smoke test (pattern rebase after table load, offscreen Qt)
         run: ./build/gui_resilient_smoke
 
+      - name: Run GUI game-profiles smoke test (watcher auto-attach + table load, offscreen Qt)
+        run: ./build/gui_profiles_smoke
+
       - name: Run GUI hex-view smoke test (changed-byte highlight, offscreen Qt)
         run: ./build/gui_hexview_smoke
 

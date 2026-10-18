@@ -38,6 +38,7 @@
 #include "gui/tracerwindow.hpp"
 #include "gui/filepatcher.hpp"
 #include "gui/patterneditor.hpp"
+#include "gui/profiles.hpp"
 #include "gui/branchmapper.hpp"
 #include "gui/elfinspector.hpp"
 #include "gui/formdesigner.hpp"
@@ -194,6 +195,7 @@ static void warnIfMemoryUnreadable(QWidget* parent, ce::ProcessHandle* p,
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     scannerThreads_ = QSettings().value("scan/threads", 0).toInt();
     scanner_ = std::make_unique<MemoryScanner>(scannerThreads_);
+    gameProfiles_ = ProfileStore{}.load();
     setupUi();
     setupMenus();
     updateScanButtons();
@@ -360,6 +362,7 @@ void MainWindow::setupMenus() {
         resultsModel_->clear(); lastResult_.reset(); undoResult_.reset(); updateScanButtons();
     });
     file->addAction("Open Process...", this, &MainWindow::onOpenProcess, QKeySequence("Ctrl+O"));
+    file->addAction("Game profiles...", this, [this]() { openProfilesDialog(); });
     file->addSeparator();
     file->addAction("Save", this, &MainWindow::onSaveTable, QKeySequence("Ctrl+S"));
     file->addAction("Save As...", this, &MainWindow::onSaveTableAs, QKeySequence("Ctrl+Shift+S"));
@@ -2976,6 +2979,7 @@ void MainWindow::attachToPid(pid_t pid, const QString& name) {
     // A target chosen now ends a pending "Wait for process": it would otherwise
     // switch to the next match whenever one starts, hours later.
     stopProcessWatch();
+    stopProfileWatchers();
     // Resolve a readable name so the header isn't "PID: 1234 - 1234" when we were
     // handed a bare pid (--pid, or a caller that didn't know the name): read the
     // process's own /proc/<pid>/comm (e.g. "sleep"), falling back to the number.
@@ -4651,6 +4655,48 @@ void MainWindow::rebaseResolvedEntries() {
     const int resolved = addressListModel_->rebaseResolvedEntries(process_.get(), &summary);
     if (resolved || !summary.isEmpty())
         statusBar()->showMessage(summary, 10000);
+}
+
+void MainWindow::openProfilesDialog() {
+    ProfilesDialog dialog(gameProfiles_, profileWatchActive_, this);
+    if (dialog.exec() != QDialog::Accepted) return;
+    gameProfiles_ = dialog.profiles();
+    ProfileStore{}.save(gameProfiles_);
+    if (dialog.watchRequested()) startProfileWatchers();
+    else stopProfileWatchers();
+}
+
+void MainWindow::startProfileWatchers() {
+    stopProfileWatchers();
+    bool any = false;
+    for (const auto& profile : gameProfiles_) {
+        if (!profile.enabled || profile.processMatch.isEmpty()) continue;
+        any = true;
+        auto watcher = std::make_unique<ce::os::ProcessWatcher>();
+        const QString tablePath = profile.tablePath;
+        const QString match = profile.processMatch;
+        watcher->start(match.toStdString(), [this, tablePath, match](pid_t pid, const std::string& name) {
+            QMetaObject::invokeMethod(this, [this, pid, name, tablePath, match]() {
+                attachToPid(pid, QString::fromStdString(name));
+                if (!tablePath.isEmpty() && QFileInfo::exists(tablePath))
+                    loadTableFromPath(tablePath);
+                startProfileWatchers();
+            }, Qt::QueuedConnection);
+        }, 1000);
+        profileWatchers_.push_back(std::move(watcher));
+    }
+    profileWatchActive_ = any;
+    if (any)
+        statusBar()->showMessage(QString("Watching for %1 profile(s).").arg(profileWatchers_.size()), 6000);
+}
+
+void MainWindow::stopProfileWatchers() {
+    for (auto& watcher : profileWatchers_) {
+        if (watcher) watcher->stop();
+        watcher.reset();
+    }
+    profileWatchers_.clear();
+    profileWatchActive_ = false;
 }
 
 void MainWindow::addRecentTable(const QString& path) {
