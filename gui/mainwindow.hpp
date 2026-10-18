@@ -94,6 +94,8 @@ public:
     /// Test hooks: the attached pid, and the stored profile list.
     pid_t currentPidForTest() const { return currentPid_; }
     const std::vector<GameProfile>& gameProfilesForTest() const { return gameProfiles_; }
+    /// Create the overlay HUD window on first use (idempotent) and return it.
+    OverlayWindow* ensureOverlayHud();
     /// Guided-tour state: what the user has done in this session so far.
     struct GuidedState {
         bool processAttached = false;
@@ -444,6 +446,7 @@ struct AddressEntry {
     QJsonObject tableFields;
     bool showAsHex = false;   // Display/edit the value in hexadecimal
     bool showAsSigned = true; // CE ShowAsSigned: integer values display signed vs unsigned
+    bool pinned = false;      // Show in the overlay HUD (session only)
     QString addressExpr;      // If set, re-evaluated each refresh (pointer records)
     ce::ValueCodec codec;     // Obfuscation codec: value is stored encode(logical) in
                               // memory; display decodes, edit/freeze encode (default none)
@@ -474,6 +477,7 @@ public:
     // Edit individual fields of an entry (address/description) with proper
     // dataChanged notification, for inline editing and the copy/edit menu.
     void setEntryAddress(int row, uintptr_t addr, const QString& expr = {});
+    void setEntryPinned(int row, bool pinned);
     int rebaseResolvedEntries(ce::ProcessHandle* proc, QString* summary = nullptr);
     void setEntryDescription(int row, const QString& desc);
     bool removeEntry(int row);

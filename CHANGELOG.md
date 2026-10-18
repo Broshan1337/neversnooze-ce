@@ -34,6 +34,10 @@ First Neversnooze CE release.
 
 ## Unreleased
 
+- Overlay HUD: address-list records can be pinned (right-click > Pin to
+  overlay) and their live values are shown in the always-on-top overlay panel,
+  refreshed on the same 500 ms tick as the status; the overlay brand label is
+  now Neversnooze CE.
 - Guided tour (Help > Guided tour): a docked checklist of the eight core
   workflows (attach, first scan, next scan, keep an address, freeze, memory
   viewer, find what writes, save the table) that ticks itself off live from

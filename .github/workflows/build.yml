@@ -154,6 +154,9 @@ jobs:
       - name: Run GUI guided-tour smoke test (steps complete from app state, offscreen Qt)
         run: ./build/gui_guided_smoke
 
+      - name: Run GUI overlay smoke test (pinned records in the HUD, offscreen Qt)
+        run: ./build/gui_overlay_smoke
+
       - name: Run GUI hex-view smoke test (changed-byte highlight, offscreen Qt)
         run: ./build/gui_hexview_smoke
 

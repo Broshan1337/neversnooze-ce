@@ -1346,23 +1346,8 @@ void MainWindow::showOverlayDialog() {
     layout->addLayout(buttons);
     dialog.resize(440, dialog.sizeHint().height());
 
-    auto ensureOverlay = [this]() {
-        if (overlayWindow_)
-            return;
-
-        overlayWindow_ = new OverlayWindow;
-        overlayWindow_->setAttribute(Qt::WA_DeleteOnClose);
-        connect(overlayWindow_, &QObject::destroyed, this, [this]() {
-            overlayWindow_ = nullptr;
-        });
-
-        auto* statusTimer = new QTimer(overlayWindow_);
-        connect(statusTimer, &QTimer::timeout, this, &MainWindow::updateOverlayStatus);
-        statusTimer->start(500);
-    };
-
-    connect(showButton, &QPushButton::clicked, this, [this, ensureOverlay, osdCheck, crosshairCheck]() {
-        ensureOverlay();
+    connect(showButton, &QPushButton::clicked, this, [this, osdCheck, crosshairCheck]() {
+        ensureOverlayHud();
         overlayWindow_->setOsdEnabled(osdCheck->isChecked());
         overlayWindow_->setCrosshairEnabled(crosshairCheck->isChecked());
         updateOverlayStatus();
@@ -1385,6 +1370,21 @@ void MainWindow::showOverlayDialog() {
     dialog.exec();
 }
 
+OverlayWindow* MainWindow::ensureOverlayHud() {
+    if (!overlayWindow_) {
+        overlayWindow_ = new OverlayWindow;
+        overlayWindow_->setAttribute(Qt::WA_DeleteOnClose);
+        connect(overlayWindow_, &QObject::destroyed, this, [this]() {
+            overlayWindow_ = nullptr;
+        });
+
+        auto* statusTimer = new QTimer(overlayWindow_);
+        connect(statusTimer, &QTimer::timeout, this, &MainWindow::updateOverlayStatus);
+        statusTimer->start(500);
+    }
+    return overlayWindow_;
+}
+
 void MainWindow::updateOverlayStatus() {
     if (!overlayWindow_)
         return;
@@ -1403,6 +1403,15 @@ void MainWindow::updateOverlayStatus() {
         .arg(processLabel_->text())
         .arg(active)
         .arg(total));
+
+    QVector<QPair<QString, QString>> pinned;
+    for (const auto& entry : addressListModel_->entries()) {
+        if (entry.isGroup || !entry.pinned) continue;
+        pinned.append({entry.description.isEmpty()
+            ? QString("0x%1").arg((qulonglong)entry.address, 0, 16)
+            : entry.description, entry.currentValue});
+    }
+    overlayWindow_->setEntries(pinned);
 }
 
 // The monospace font from the Settings dialog (display/fontFamily + fontSize),
@@ -2162,6 +2171,15 @@ void MainWindow::setupUi() {
                     if (nt == ce::ValueType::String || nt == ce::ValueType::UnicodeString ||
                         nt == ce::ValueType::ByteArray)
                         addressListModel_->setByteCount(id, (std::size_t)dlg.length());
+                });
+                const bool pinned = firstRow < (int)addressListModel_->entries().size() &&
+                                    addressListModel_->entries()[firstRow].pinned;
+                menu.addAction(pinned ? "Unpin from overlay" : "Pin to overlay",
+                               [this, first, pinned]() {
+                    const int row = first.row();
+                    if (row < 0 || row >= (int)addressListModel_->entries().size()) return;
+                    addressListModel_->setEntryPinned(row, !pinned);
+                    updateOverlayStatus();
                 });
                 menu.addSeparator();
             }
@@ -5822,6 +5840,12 @@ void AddressListModel::setEntryAddress(int row, uintptr_t addr, const QString& e
                      {Qt::DisplayRole, Qt::EditRole});
 }
 
+void AddressListModel::setEntryPinned(int row, bool pinned) {
+    if (row < 0 || row >= (int)entries_.size()) return;
+    entries_[size_t(row)].pinned = pinned;
+    emit dataChanged(index(row, 0), index(row, columnCount() - 1), {Qt::DisplayRole});
+}
+
 int AddressListModel::rebaseResolvedEntries(ce::ProcessHandle* proc, QString* summary) {
     if (!proc) return 0;
     int resolved = 0;
@@ -6180,6 +6204,7 @@ QJsonArray AddressListModel::toJson() const {
         for (auto it = e.tableFields.begin(); it != e.tableFields.end(); ++it) obj[it.key()] = it.value();
         obj["showAsHex"] = e.showAsHex;
         obj["showAsSigned"] = e.showAsSigned;
+        if (e.pinned) obj["pinned"] = true;
         obj["freezeMode"] = (int)e.freezeMode;
         if (e.codec.active())   // obfuscation codec, as its round-trippable spec string
             obj["codec"] = QString::fromStdString(e.codec.describe());
@@ -6281,6 +6306,7 @@ bool AddressListModel::fromJson(const QJsonArray& arr, bool preserveExisting) {
         e.optionsXml = obj["optionsXml"].toString();
         e.showAsHex = obj["showAsHex"].toBool();
         e.showAsSigned = obj["showAsSigned"].toBool(true);
+        e.pinned = obj["pinned"].toBool();
         if (obj.contains("freezeMode"))
             e.freezeMode = (ce::FreezeMode)obj["freezeMode"].toInt();
         if (obj.contains("codec")) {

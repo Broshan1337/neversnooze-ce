@@ -31,6 +31,11 @@ void OverlayWindow::setStatusText(const QString& text) {
     update();
 }
 
+void OverlayWindow::setEntries(const QVector<QPair<QString, QString>>& entries) {
+    entries_ = entries;
+    update();
+}
+
 void OverlayWindow::setOsdEnabled(bool enabled) {
     osdEnabled_ = enabled;
     update();
@@ -53,7 +58,7 @@ void OverlayWindow::paintEvent(QPaintEvent*) {
         painter.setFont(font);
 
         QStringList lines;
-        lines << QStringLiteral("CE Linux");
+        lines << QStringLiteral("Neversnooze CE");
         lines << statusText_;
 
         const QFontMetrics metrics(font);
@@ -71,6 +76,27 @@ void OverlayWindow::paintEvent(QPaintEvent*) {
         for (const auto& line : lines) {
             painter.drawText(panel.left() + 12, y, line);
             y += metrics.height();
+        }
+
+        if (!entries_.isEmpty()) {
+            int entriesWidth = 0;
+            for (const auto& entry : entries_)
+                entriesWidth = std::max(entriesWidth, metrics.horizontalAdvance(
+                    entry.first + "  " + entry.second));
+            QRect entriesPanel(18, panel.bottom() + 8,
+                               entriesWidth + 24, metrics.height() * entries_.size() + 18);
+            painter.setPen(QColor(17, 17, 27, 210));
+            painter.setBrush(QColor(17, 17, 27, 160));
+            painter.drawRoundedRect(entriesPanel, 6, 6);
+            int ey = entriesPanel.top() + 10 + metrics.ascent();
+            for (const auto& entry : entries_) {
+                painter.setPen(QColor(205, 214, 244));
+                painter.drawText(entriesPanel.left() + 12, ey, entry.first);
+                painter.setPen(QColor(150, 127, 238));
+                painter.drawText(entriesPanel.left() + 12 + metrics.horizontalAdvance(entry.first) +
+                                     metrics.horizontalAdvance("  "), ey, entry.second);
+                ey += metrics.height();
+            }
         }
     }
 
