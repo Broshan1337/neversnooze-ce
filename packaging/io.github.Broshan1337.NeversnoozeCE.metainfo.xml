@@ -37,13 +37,15 @@
   <releases>
     <release version="1.2.0" date="2026-10-18">
       <description>
-        <p>Eight new reverse-engineering workflows: a pattern editor with
-        bounded AOB scans and Lua/C export, pattern-resolver records that
-        rebase tables across game updates, a value provenance timeline for
-        find-what-writes, game profiles that auto-attach with a table when a
-        watched game starts, a guided tour of the core workflows, an overlay
-        HUD with pinned live values, and a memory heatmap of write activity
-        over time.</p>
+        <p>Ten new reverse-engineering workflows: symbols-first addressing
+        with a searchable symbol browser (records that survive updates by
+        name), a pattern editor with bounded AOB scans and Lua/C export,
+        pattern-resolver records that rebase tables across game updates, a
+        value provenance timeline for find-what-writes, game profiles that
+        auto-attach with a table when a watched game starts, a behavior-driven
+        hunt wizard, table verification before sharing, a guided tour of the
+        core workflows, an overlay HUD with pinned live values, and a memory
+        heatmap of write activity over time.</p>
       </description>
     </release>
     <release version="1.1.0" date="2026-10-18">

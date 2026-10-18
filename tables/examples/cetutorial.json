@@ -1,0 +1,36 @@
+{
+  "version": "1.2.0",
+  "game": "cetutorial",
+  "author": "Neversnooze CE examples",
+  "comment": "Records that survive every rebuild of the game: the first two resolve by ELF symbol name (the address expression is re-read on every refresh), the third resolves from an AOB pattern that is unique inside the game module. Open the tutorial (Help > Neversnooze CE Tutorial), load this table and use File > Verify table.",
+  "entries": [
+    {
+      "id": 1,
+      "desc": "Current tutorial step (by symbol)",
+      "addr": "0x0",
+      "addrString": "cetutorial!current_step",
+      "type": 2,
+      "value": "1"
+    },
+    {
+      "id": 2,
+      "desc": "Tutorial finished flag (by symbol)",
+      "addr": "0x0",
+      "addrString": "cetutorial!finished",
+      "type": 2,
+      "value": "0"
+    },
+    {
+      "id": 3,
+      "desc": "Game module base (by pattern)",
+      "addr": "0x0",
+      "type": 2,
+      "value": "0",
+      "resolver": {
+        "pattern": "7F 45 4C 46",
+        "offset": 0,
+        "module": "cetutorial"
+      }
+    }
+  ]
+}

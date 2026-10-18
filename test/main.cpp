@@ -1531,6 +1531,43 @@ static void test_resolver() {
     printf("  parseAobPattern exposes bytes + mask: %s\n", parseOk ? "OK" : "FAILED");
 }
 
+static void test_symbol_expressions() {
+    printf("\n── Test: Symbol expressions ──\n");
+    LinuxProcessHandle proc(getpid());
+    ce::SymbolResolver resolver;
+    resolver.loadProcess(proc);
+    const uintptr_t printfAddr = resolver.lookup("printf");
+    printf("  raw symbol lookup (printf): %s\n", printfAddr ? "OK" : "FAILED");
+
+    std::string demangled;
+    uintptr_t demangledAddr = 0;
+    for (const auto& s : resolver.symbols()) {
+        if (s.module.find("cecore_test") == std::string::npos) continue;
+        if (s.name.find("::") == std::string::npos) continue;
+        if (s.name.find('(') != std::string::npos) continue;
+        demangled = s.name;
+        demangledAddr = s.address;
+        break;
+    }
+    const bool demangledOk = !demangled.empty() && resolver.lookup(demangled) == demangledAddr;
+    printf("  demangled display-name lookup: %s (%s)\n",
+           demangledOk ? "OK" : "FAILED", demangled.c_str());
+
+    std::string libcModule;
+    for (const auto& m : proc.modules())
+        if (m.name.find("libc.so") == 0) { libcModule = m.name; break; }
+    const bool qualifiedOk = !libcModule.empty() &&
+        resolver.lookupQualified(libcModule, "printf") == printfAddr &&
+        resolver.lookupQualified("no_such_module_xyz", "printf") == 0;
+    printf("  module!name qualified lookup: %s\n", qualifiedOk ? "OK" : "FAILED");
+
+    ce::ExpressionParser parser(&proc, &resolver);
+    const bool exprOk = parser.parse(libcModule + "!printf").value_or(0) == printfAddr &&
+                        parser.parse("printf").value_or(0) == printfAddr &&
+                        parser.parse("\"" + libcModule + "!printf\"").value_or(0) == printfAddr;
+    printf("  expressions accept module!name, plain and quoted forms: %s\n", exprOk ? "OK" : "FAILED");
+}
+
 static void test_target_profile() {
     printf("\n── Test: Target capability probe ──\n");
     // Probe ourselves: a valid x86-64 native process, not Wine, not an emulator,
@@ -14288,6 +14325,7 @@ int main(int argc, char* argv[]) {
         usleep(200000); // Wait for it to start
     }
 
+    test_symbol_expressions();
     test_target_profile();
     test_snapshot_pagediff();
     test_resolver();

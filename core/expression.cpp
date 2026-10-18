@@ -39,6 +39,10 @@ std::optional<uintptr_t> ExpressionParser::resolveToken(const std::string& token
     if (token.size() >= 2 && (token.front() == '"' || token.front() == '\'') && token.back() == token.front()) {
         auto name = token.substr(1, token.size() - 2);
         if (resolver_) {
+            if (auto bang = name.find('!'); bang != std::string::npos) {
+                if (auto address = resolver_->lookupQualified(name.substr(0, bang), name.substr(bang + 1)))
+                    return address;
+            }
             if (auto address = resolver_->lookup(name)) return address;
         }
         if (proc_) return moduleBase(modules(), name);
@@ -69,6 +73,10 @@ std::optional<uintptr_t> ExpressionParser::resolveToken(const std::string& token
     if (allHex && (token.size() >= 2 || allDigit)) return number(token, 16);
 
     if (resolver_) {
+        if (auto bang = token.find('!'); bang != std::string::npos) {
+            if (auto address = resolver_->lookupQualified(token.substr(0, bang), token.substr(bang + 1)))
+                return address;
+        }
         auto addr = resolver_->lookup(token);
         if (addr) return addr;
     }

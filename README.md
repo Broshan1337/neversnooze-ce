@@ -35,6 +35,16 @@ of running the Windows build under Wine, and it opens your existing `.CT` tables
   pattern resolver, so a table re-resolves its addresses after a game update.
 - **Pattern editor:** build and test AOB patterns against live memory, with
   module scoping, match previews, uniqueness verdicts and Lua/C export.
+- **Symbols-first:** Linux games ship symbols, so records can hold
+  `game!g_SomeGlobal` instead of a raw address and re-resolve by name on every
+  refresh. The Symbol browser searches every loaded symbol and drops records
+  straight into the address list.
+- **Guided and behavior-driven:** a guided tour of the core workflows, and a
+  hunt wizard that turns "it only decreases when I take damage" into the
+  right scan sequence.
+- **Trainer-safe tables:** File > Verify table checks every record against the
+  process before you share it; `tables/examples/` shows the symbol- and
+  pattern-based record formats that survive game updates.
 - **Targets:** native Linux, Wine and Proton games, Mono/Unity (with a class
   dissector), emulators, and remote targets over ceserver or GDB/QEMU.
 - **Fast:** a first scan of 1 GB takes about 0.09 s, roughly twice as fast as

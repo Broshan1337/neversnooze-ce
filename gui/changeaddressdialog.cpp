@@ -34,8 +34,9 @@ static const struct { const char* label; ce::ValueType type; } kTypes[] = {
 
 ChangeAddressDialog::ChangeAddressDialog(const QString& address, ce::ValueType type,
                                          bool showHex, int length, QWidget* parent,
-                                         bool showSigned, ce::ProcessHandle* proc)
-    : QDialog(parent), proc_(proc) {
+                                         bool showSigned, ce::ProcessHandle* proc,
+                                         ce::SymbolResolver* resolver)
+    : QDialog(parent), proc_(proc), resolver_(resolver) {
     setWindowTitle("Change address");
 
     auto* v = new QVBoxLayout(this);
@@ -194,7 +195,7 @@ void ChangeAddressDialog::updatePreview() {
     // valid memory (CE resolves the pointer as you build it). A failed deref shows "??".
     std::string expr = ce::buildPointerExpression(
         pointerBaseEdit_->text().trimmed().toStdString(), collectOffsets());
-    ce::ExpressionParser parser(proc_, nullptr);
+    ce::ExpressionParser parser(proc_, resolver_);
     auto addr = parser.parse(expr);
     if (!addr || !*addr) {
         previewLabel_->setText(QStringLiteral("→ ?? (does not resolve)"));

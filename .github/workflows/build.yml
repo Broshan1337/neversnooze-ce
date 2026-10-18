@@ -160,6 +160,15 @@ jobs:
       - name: Run GUI heatmap smoke test (changed pages accumulate live, offscreen Qt)
         run: ./build/gui_heatmap_smoke
 
+      - name: Run GUI symbol-browser smoke test (symbol search + named records, offscreen Qt)
+        run: ./build/gui_symbolbrowser_smoke
+
+      - name: Run GUI hunt-wizard smoke test (behavior-driven scan sequence, offscreen Qt)
+        run: ./build/gui_huntwizard_smoke
+
+      - name: Run GUI verify-table smoke test (example table against cetutorial, offscreen Qt)
+        run: ./build/gui_verifytable_smoke
+
       - name: Run GUI hex-view smoke test (changed-byte highlight, offscreen Qt)
         run: ./build/gui_hexview_smoke
 

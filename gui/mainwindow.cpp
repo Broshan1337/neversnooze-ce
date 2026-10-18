@@ -38,6 +38,9 @@
 #include "gui/tracerwindow.hpp"
 #include "gui/filepatcher.hpp"
 #include "gui/patterneditor.hpp"
+#include "gui/symbolbrowser.hpp"
+#include "gui/huntwizard.hpp"
+#include "gui/verifytable.hpp"
 #include "gui/profiles.hpp"
 #include "gui/guidedpanel.hpp"
 #include "gui/heatmap.hpp"
@@ -365,6 +368,11 @@ void MainWindow::setupMenus() {
     });
     file->addAction("Open Process...", this, &MainWindow::onOpenProcess, QKeySequence("Ctrl+O"));
     file->addAction("Game profiles...", this, [this]() { openProfilesDialog(); });
+    file->addAction("Verify table...", this, [this]() {
+        auto* dlg = new VerifyTableDialog(this, this);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+    });
     file->addSeparator();
     file->addAction("Save", this, &MainWindow::onSaveTable, QKeySequence("Ctrl+S"));
     file->addAction("Save As...", this, &MainWindow::onSaveTableAs, QKeySequence("Ctrl+Shift+S"));
@@ -562,6 +570,22 @@ void MainWindow::setupMenus() {
     }, QKeySequence("Ctrl+A"));
     tools->addAction("File Patcher...", this, [this]() {
         auto* dlg = new FilePatcher(this);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+    });
+    tools->addAction("Hunt by behavior...", this, [this]() {
+        auto* dlg = new HuntWizardDialog(this, this);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+    });
+    tools->addAction("Symbol browser...", this, [this]() {
+        if (process_) (void)parseAddressExpr("0");   // lazy-load the shared symbol resolver
+        auto* dlg = new SymbolBrowserDialog(process_.get(), &luaResolver_,
+            [this](uintptr_t addr, const QString& name) {
+                addressListModel_->addEntry(addr, ce::ValueType::Int32, name, name);
+                statusBar()->showMessage(QString("Added %1 to the address list.").arg(name), 6000);
+            },
+            [this](uintptr_t addr) { openMemoryView(addr); }, this);
         dlg->setAttribute(Qt::WA_DeleteOnClose);
         dlg->show();
     });
@@ -1641,7 +1665,8 @@ void MainWindow::setupUi() {
     connect(addAddrBtn, &QPushButton::clicked, this, [this]() {
         // CE uses formAddressChange for both add and edit.
         ce::gui::ChangeAddressDialog dlg("", mapValueType(valueTypeCombo_->currentIndex()),
-                                         false, 1, this, /*showSigned=*/true, process_.get());
+                                         false, 1, this, /*showSigned=*/true, process_.get(),
+                                         &luaResolver_);
         openAddressDialog_ = &dlg;
         dlg.setWindowTitle("Add address");
         if (dlg.exec() != QDialog::Accepted) return;
@@ -2159,7 +2184,7 @@ void MainWindow::setupUi() {
                         ? e.addressExpr : QString("0x%1").arg((qulonglong)e.address, 0, 16);
                     ce::gui::ChangeAddressDialog dlg(addrStr, e.type, e.showAsHex,
                                                      (int)e.byteCount, this, e.showAsSigned,
-                                                     process_.get());
+                                                     process_.get(), &luaResolver_);
                     openAddressDialog_ = &dlg;
                     if (dlg.exec() != QDialog::Accepted) return;
                     if (addressListModel_->rowOfId(id) < 0) return;   // deleted meanwhile
@@ -2606,7 +2631,8 @@ void MainWindow::setupUi() {
             // "Change address", so a new entry gets its type, flags, length, and an
             // optional structured pointer in one dialog.
             ce::gui::ChangeAddressDialog dlg("", mapValueType(valueTypeCombo_->currentIndex()),
-                                             false, 0, this, /*showSigned=*/true, process_.get());
+                                             false, 0, this, /*showSigned=*/true, process_.get(),
+                                             &luaResolver_);
             openAddressDialog_ = &dlg;
             if (dlg.exec() != QDialog::Accepted) return;
             const QString a = dlg.address();
@@ -7430,7 +7456,7 @@ bool AddressListModel::setAddressExpression(int id, const std::string& expr) {
     if (row < 0) return false;
     entries_[row].addressExpr = QString::fromStdString(expr);
     // Resolve once now so the address column is populated immediately.
-    ExpressionParser parser(proc_, nullptr);
+    ExpressionParser parser(proc_, symbolResolver_);
     if (auto v = parser.parse(expr)) entries_[row].address = *v;
     emit dataChanged(index(row, 2), index(row, 2));
     return true;

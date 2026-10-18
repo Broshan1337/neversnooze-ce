@@ -394,6 +394,9 @@ if(Qt6_FOUND)
         gui/heatmap.cpp
         gui/patterneditor.cpp
         gui/profiles.cpp
+        gui/symbolbrowser.cpp
+        gui/huntwizard.cpp
+        gui/verifytable.cpp
         gui/stackview.cpp
         gui/threadlist.cpp
         gui/settingsdialog.cpp
@@ -496,6 +499,21 @@ if(Qt6_FOUND)
         )
         target_include_directories(gui_heatmap_smoke PRIVATE ${CMAKE_SOURCE_DIR} ${LUA_DIR})
         target_link_libraries(gui_heatmap_smoke PRIVATE cecore Qt6::Widgets)
+
+        # Offscreen smoke test: the symbol browser finds names and adds records.
+        qt_add_executable(gui_symbolbrowser_smoke test/gui_symbolbrowser_smoke.cpp ${CE_GUI_TEST_SOURCES})
+        target_include_directories(gui_symbolbrowser_smoke PRIVATE ${CMAKE_SOURCE_DIR} ${LUA_DIR})
+        target_link_libraries(gui_symbolbrowser_smoke PRIVATE cecore Qt6::Widgets Qt6::Network Qt6::DBus)
+
+        # Offscreen smoke test: the behavior hunt wizard drives real scans.
+        qt_add_executable(gui_huntwizard_smoke test/gui_huntwizard_smoke.cpp ${CE_GUI_TEST_SOURCES})
+        target_include_directories(gui_huntwizard_smoke PRIVATE ${CMAKE_SOURCE_DIR} ${LUA_DIR})
+        target_link_libraries(gui_huntwizard_smoke PRIVATE cecore Qt6::Widgets Qt6::Network Qt6::DBus)
+
+        # Offscreen smoke test: Verify table checks the example table against cetutorial.
+        qt_add_executable(gui_verifytable_smoke test/gui_verifytable_smoke.cpp ${CE_GUI_TEST_SOURCES})
+        target_include_directories(gui_verifytable_smoke PRIVATE ${CMAKE_SOURCE_DIR} ${LUA_DIR})
+        target_link_libraries(gui_verifytable_smoke PRIVATE cecore Qt6::Widgets Qt6::Network Qt6::DBus)
 
         # The AI Assistant panel with a scripted model, and its keyring client
         # against a mock Secret Service (test/secret_store_gate.py).

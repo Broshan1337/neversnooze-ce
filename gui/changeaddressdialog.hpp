@@ -17,7 +17,7 @@ class QLabel;
 class QWidget;
 class QVBoxLayout;
 
-namespace ce { class ProcessHandle; }
+namespace ce { class ProcessHandle; class SymbolResolver; }
 
 namespace ce::gui {
 
@@ -28,7 +28,8 @@ public:
     void detachFromTarget() { proc_ = nullptr; }
     ChangeAddressDialog(const QString& address, ce::ValueType type, bool showHex,
                         int length, QWidget* parent = nullptr, bool showSigned = true,
-                        ce::ProcessHandle* proc = nullptr);
+                        ce::ProcessHandle* proc = nullptr,
+                        ce::SymbolResolver* resolver = nullptr);
 
     QString address() const;
     ce::ValueType valueType() const;   // folds the Unicode box into String -> UnicodeString
@@ -61,6 +62,7 @@ private:
     void addOffsetRow(long long value);        // append one offset row (hex, signed)
     void recomposeAddress();                   // rebuild the address field from base+offsets
     std::vector<int64_t> collectOffsets() const;
+    ce::SymbolResolver* resolver_ = nullptr;
     QLineEdit* addrEdit_;
     QComboBox* typeCombo_;
     QCheckBox* hexCheck_;

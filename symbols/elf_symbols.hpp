@@ -37,8 +37,16 @@ public:
     /// Resolve an address to a symbol string like "libc.so!printf+0x12"
     std::string resolve(uintptr_t address) const;
 
-    /// Resolve a symbol name to an address. Returns 0 if not found.
+    /// Resolve a symbol name to an address. Returns 0 if not found. Matches
+    /// user labels, then raw/mangled symbol names, then demangled display
+    /// names.
     uintptr_t lookup(const std::string& name) const;
+
+    /// Resolve "module!name" to an address: the symbol whose display or raw
+    /// name is `name` within `module` (the short module name, compared
+    /// case-insensitively; an empty module accepts any, like lookup).
+    /// Returns 0 if nothing matches.
+    uintptr_t lookupQualified(const std::string& module, const std::string& name) const;
 
     /// User-defined labels. These take priority over module symbols in
     /// resolve() (like Cheat Engine's user-defined symbols).
@@ -81,6 +89,10 @@ private:
     std::unordered_map<std::string, uintptr_t> nameIndex_; // name → address
     // Raw name -> index into symbols_, for the symbols whose name was demangled.
     std::unordered_multimap<std::string, size_t> mangledIndex_;
+    // Demangled display name -> indices into symbols_, built on first use
+    // (re)built when symbols_ grew since) so name lookups never scan linearly.
+    mutable std::unordered_map<std::string, std::vector<size_t>> displayIndex_;
+    mutable size_t displayIndexed_ = 0;
     std::unordered_map<std::string, uintptr_t> userNameIndex_;
     std::map<uintptr_t, std::string> userSymbols_;         // user-defined labels
 };

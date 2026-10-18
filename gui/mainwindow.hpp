@@ -96,6 +96,12 @@ public:
     const std::vector<GameProfile>& gameProfilesForTest() const { return gameProfiles_; }
     /// Create the overlay HUD window on first use (idempotent) and return it.
     OverlayWindow* ensureOverlayHud();
+    AddressListModel* addressListModel() const { return addressListModel_; }
+    ce::ProcessHandle* processForVerify() const { return process_.get(); }
+    ce::SymbolResolver* symbolResolverForVerify() {
+        if (process_ && luaResolver_.count() == 0) luaResolver_.loadProcess(*process_);
+        return &luaResolver_;
+    }
     /// Guided-tour state: what the user has done in this session so far.
     struct GuidedState {
         bool processAttached = false;

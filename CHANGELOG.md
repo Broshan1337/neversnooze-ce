@@ -17,10 +17,25 @@ the upstream project.
 
 ## v1.2.0 - 2026-10-18
 
-The first Neversnooze CE feature release: seven new reverse-engineering
+The first Neversnooze CE feature release: ten new reverse-engineering
 workflows on top of the 1.1.0 rebrand, plus the engine work this tree
 carried over from upstream (below the feature list).
 
+- Symbols-first addressing: address expressions accept `module!name`
+  (`client.so!g_SomeGlobal`) and plain demangled symbol names everywhere the
+  expression parser runs (records, the Goto box, Lua, pointer bases), and
+  lookups now match demangled display names, not just raw symtab names. The
+  Symbol browser (Tools menu) searches every symbol of the attached process
+  and adds records that re-resolve by name on every refresh, so they survive
+  game updates with zero maintenance.
+- Hunt by behavior (Tools > Hunt by behavior...): describe the value in plain
+  words ("it only decreases when I take damage") and the wizard configures the
+  scan controls per step, advancing as your real scans run.
+- Verify table (File > Verify table...): checks every record against the
+  attached process, expression and pattern first, then a live read; a green
+  table is stamped safe to share. Ships tables/examples/cetutorial.json, an
+  example table resolving by symbol names and a pattern against the tutorial
+  game.
 
 - Memory heatmap (Tools > Memory heatmap...): repeated snapshots build a
   page-granular write-activity map; the busiest regions get a row of

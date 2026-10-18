@@ -44,6 +44,8 @@ void SymbolResolver::clear() {
     addrIndex_.clear();
     nameIndex_.clear();
     mangledIndex_.clear();
+    displayIndex_.clear();
+    displayIndexed_ = 0;
 }
 
 std::vector<const Symbol*> SymbolResolver::symbolsByRawName(const std::string& raw) const {
@@ -879,7 +881,43 @@ uintptr_t SymbolResolver::lookup(const std::string& name) const {
     auto user = userNameIndex_.find(name);
     if (user != userNameIndex_.end()) return user->second;
     auto it = nameIndex_.find(name);
-    return it != nameIndex_.end() ? it->second : 0;
+    if (it != nameIndex_.end()) return it->second;
+    if (displayIndexed_ != symbols_.size()) {
+        displayIndex_.clear();
+        for (size_t i = 0; i < symbols_.size(); ++i)
+            if (!symbols_[i].name.empty()) displayIndex_[symbols_[i].name].push_back(i);
+        displayIndexed_ = symbols_.size();
+    }
+    auto display = displayIndex_.find(name);
+    if (display != displayIndex_.end() && !display->second.empty())
+        return symbols_[display->second.front()].address;
+    return 0;
+}
+
+uintptr_t SymbolResolver::lookupQualified(const std::string& module, const std::string& name) const {
+    if (name.empty()) return 0;
+    if (module.empty()) return lookup(name);
+    auto sameModule = [&module](const Symbol& symbol) {
+        if (symbol.module.size() != module.size()) return false;
+        return std::equal(module.begin(), module.end(), symbol.module.begin(),
+                          [](unsigned char left, unsigned char right) {
+                              return std::tolower(left) == std::tolower(right);
+                          });
+    };
+    if (displayIndexed_ != symbols_.size()) {
+        displayIndex_.clear();
+        for (size_t i = 0; i < symbols_.size(); ++i)
+            if (!symbols_[i].name.empty()) displayIndex_[symbols_[i].name].push_back(i);
+        displayIndexed_ = symbols_.size();
+    }
+    const auto display = displayIndex_.find(name);
+    if (display != displayIndex_.end())
+        for (size_t index : display->second)
+            if (sameModule(symbols_[index])) return symbols_[index].address;
+    auto [first, last] = mangledIndex_.equal_range(name);
+    for (auto it = first; it != last; ++it)
+        if (sameModule(symbols_[it->second])) return symbols_[it->second].address;
+    return 0;
 }
 
 } // namespace ce
