@@ -145,6 +145,9 @@ jobs:
       - name: Run GUI pattern-editor smoke test (bounded AOB scan, offscreen Qt)
         run: ./build/gui_patterneditor_smoke
 
+      - name: Run GUI resilient-table smoke test (pattern rebase after table load, offscreen Qt)
+        run: ./build/gui_resilient_smoke
+
       - name: Run GUI hex-view smoke test (changed-byte highlight, offscreen Qt)
         run: ./build/gui_hexview_smoke
 

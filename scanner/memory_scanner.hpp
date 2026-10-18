@@ -309,4 +309,12 @@ std::vector<uintptr_t> scanPatternRange(ProcessHandle& proc, const std::string& 
 bool parseAobPattern(const std::string& pattern,
                      std::vector<uint8_t>& bytes, std::vector<uint8_t>& mask);
 
+/// Resolve a record address from an AOB pattern that must be unique in
+/// `module` (empty = all readable regions): address = match + offset.
+/// Returns false and sets `error` (when given) on an invalid pattern, no
+/// match, an ambiguous match or a module that is not loaded.
+bool resolvePatternAddress(ProcessHandle& proc, const std::string& pattern,
+                           const std::string& module, int64_t offset,
+                           uintptr_t& address, std::string* error = nullptr);
+
 } // namespace ce

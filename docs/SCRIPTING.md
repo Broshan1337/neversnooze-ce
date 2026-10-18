@@ -543,6 +543,7 @@ Static helpers that read and disassemble the target without running its code.
 | Function | Returns |
 |---|---|
 | `createSignature(address[, maxBytes])` | `pattern, unique` — an AOB signature, wildcarded and grown until unique within its module (search it with `AOBScanModule`; not checked process-wide) |
+| `resolvePattern(pattern[, module[, offset]])` | `address`, or `nil, error` — the sole match for the AOB pattern in the module (no module = all readable regions) plus the offset; refuses ambiguous patterns |
 | `findReferences(address)` | `{ {address, target, type, text}, ... }` — static xrefs (calls, jumps, lea/mov rip-rel) |
 | `enumerateFunctions([module])` | `{ {address, references}, ... }` — candidate function entry points |
 | `buildCallGraph([module])` | `{ {caller, callee, callSite}, ... }` — static call edges |

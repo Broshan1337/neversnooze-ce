@@ -3036,6 +3036,7 @@ void MainWindow::attachToPid(pid_t pid, const QString& name) {
             QMessageBox::warning(this, "Target already being traced",
                 QString::fromStdString(prof.notes.front()));
     }
+    rebaseResolvedEntries();
 }
 
 void MainWindow::onOpenProcess() {
@@ -4237,6 +4238,11 @@ ce::CheatTable MainWindow::buildCheatTable() const {
             e.unparsedOffsets.push_back(text.toString().toStdString());
         e.extraHotkeysXml = obj["extraHotkeys"].toString().toStdString();
         e.extraXml = obj["extraXml"].toString().toStdString();
+        if (auto resolver = obj["resolver"].toObject(); resolver.contains("pattern")) {
+            e.resolverPattern = resolver["pattern"].toString().toStdString();
+            e.resolverOffset = (int64_t)resolver["offset"].toDouble();
+            e.resolverModule = resolver["module"].toString().toStdString();
+        }
         const int parentRow=obj["parent"].toInt(-1);
         e.parentId=parentRow>=0 && parentRow<json.size()
             ? json[parentRow].toObject().value("id").toInt(parentRow) : -1;
@@ -4565,6 +4571,13 @@ static QJsonArray cheatEntriesToJson(const ce::CheatTable& table) {
         }
         if (!e.extraHotkeysXml.empty()) obj["extraHotkeys"] = QString::fromStdString(e.extraHotkeysXml);
         if (!e.extraXml.empty()) obj["extraXml"] = QString::fromStdString(e.extraXml);
+        if (!e.resolverPattern.empty()) {
+            QJsonObject resolver;
+            resolver["pattern"] = QString::fromStdString(e.resolverPattern);
+            resolver["offset"] = double(e.resolverOffset);
+            resolver["module"] = QString::fromStdString(e.resolverModule);
+            obj["resolver"] = resolver;
+        }
         obj["parent"] = e.parentId;
         arr.append(obj);
     }
@@ -4628,7 +4641,16 @@ bool MainWindow::loadCheatTableModel(const ce::CheatTable& table,const QJsonArra
     for (auto& viewer : memoryViewers_)
         if (viewer) viewer->replaceAnnotations(disasmAnnotations_, table.disassemblerComments);
     disasmAnnotations_ = table.disassemblerComments;
+    rebaseResolvedEntries();
     return true;
+}
+
+void MainWindow::rebaseResolvedEntries() {
+    if (!process_) return;
+    QString summary;
+    const int resolved = addressListModel_->rebaseResolvedEntries(process_.get(), &summary);
+    if (resolved || !summary.isEmpty())
+        statusBar()->showMessage(summary, 10000);
 }
 
 void MainWindow::addRecentTable(const QString& path) {
@@ -5723,6 +5745,38 @@ void AddressListModel::setEntryAddress(int row, uintptr_t addr, const QString& e
                      {Qt::DisplayRole, Qt::EditRole});
 }
 
+int AddressListModel::rebaseResolvedEntries(ce::ProcessHandle* proc, QString* summary) {
+    if (!proc) return 0;
+    int resolved = 0;
+    QStringList failures;
+    for (int row = 0; row < (int)entries_.size(); ++row) {
+        const auto& e = entries_[row];
+        const auto resolver = e.tableFields.value("resolver").toObject();
+        const QString pattern = resolver.value("pattern").toString();
+        if (pattern.isEmpty() || e.isGroup) continue;
+        uintptr_t address = 0;
+        std::string error;
+        if (ce::resolvePatternAddress(*proc, pattern.toStdString(),
+                                      resolver.value("module").toString().toStdString(),
+                                      (int64_t)resolver.value("offset").toDouble(),
+                                      address, &error)) {
+            setEntryAddress(row, address);
+            ++resolved;
+        } else {
+            failures << QString("%1 (%2)").arg(pattern, QString::fromStdString(error));
+        }
+    }
+    if (summary) {
+        if (resolved && failures.isEmpty())
+            *summary = QString("Rebased %1 pattern-based records.").arg(resolved);
+        else if (resolved)
+            *summary = QString("Rebased %1 records; failed: %2.").arg(resolved).arg(failures.join("; "));
+        else if (!failures.isEmpty())
+            *summary = QString("Pattern records could not rebase: %1.").arg(failures.join("; "));
+    }
+    return resolved;
+}
+
 void AddressListModel::setEntryDescription(int row, const QString& desc) {
     if (row < 0 || row >= (int)entries_.size()) return;
     entries_[row].description = desc;
@@ -6131,7 +6185,7 @@ bool AddressListModel::fromJson(const QJsonArray& arr, bool preserveExisting) {
         e.hotkeyStep = obj["hotkeyStep"].toString("1");
         e.luaScript = obj["lua"].toString();
         for (const char* key : {"customType", "async", "dropdownAttributes", "unparsedAddress", "unparsedOffsets",
-                                "extraHotkeys", "extraXml"})
+                                "extraHotkeys", "extraXml", "resolver"})
             if (obj.contains(key)) e.tableFields[key] = obj[key];
         e.indent = std::max(0, obj.contains("indent")
             ? obj["indent"].toInt()

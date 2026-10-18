@@ -5272,6 +5272,26 @@ static int l_AOBScanUnique(lua_State* L) {
     return 1;
 }
 
+// resolvePattern(pattern [, module [, offset]]) -> the address of the sole match
+// for the pattern in the module (empty module = all readable regions) plus the
+// offset, or nil with a second return value naming the failure.
+static int l_resolvePattern(lua_State* L) {
+    auto* p = getProc(L);
+    if (!p) { lua_pushnil(L); return 1; }
+    const char* pattern = luaL_checkstring(L, 1);
+    const char* module = lua_isstring(L, 2) ? lua_tostring(L, 2) : "";
+    const lua_Integer offset = luaL_optinteger(L, 3, 0);
+    uintptr_t address = 0;
+    std::string error;
+    if (ce::resolvePatternAddress(*p, pattern, module ? module : "", offset, address, &error)) {
+        lua_pushinteger(L, (lua_Integer)address);
+        return 1;
+    }
+    lua_pushnil(L);
+    lua_pushstring(L, error.c_str());
+    return 2;
+}
+
 // AOBScanModuleUnique(modulename, aobstring) -> the sole match within the module, or nil.
 static int l_AOBScanModuleUnique(lua_State* L) {
     auto* p = getProc(L);
@@ -6260,6 +6280,7 @@ void registerExtendedBindings(lua_State* L) {
     lua_register(L, "AOBScan", l_AOBScan);
     lua_register(L, "AOBScanModule", l_AOBScanModule);
     lua_register(L, "AOBScanUnique", l_AOBScanUnique);
+    lua_register(L, "resolvePattern", l_resolvePattern);
     lua_register(L, "AOBScanModuleUnique", l_AOBScanModuleUnique);
     lua_register(L, "getUniqueAOB", l_getUniqueAOB);
     lua_register(L, "AOBScanEx", l_AOBScanEx);

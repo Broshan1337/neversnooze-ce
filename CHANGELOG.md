@@ -34,6 +34,16 @@ First Neversnooze CE release.
 
 ## Unreleased
 
+- Pattern editor (Tools menu): bounded AOB scan of all readable regions or one
+  module, match preview and module attribution, uniqueness verdict, and copies
+  the pattern as a Lua `AOBScan` call or as C bytes + mask.
+- Resilient tables: a record can carry a pattern resolver (`<NeversnoozeResolver>`
+  in .CT, `"resolver"` in JSON tables) with an AOB pattern, module scope and
+  offset; tables rebase their records when a process is attached or the table
+  is loaded onto one, so a table survives game updates. The pattern must be
+  unique in its scope; ambiguity and misses are reported, never guessed. Lua:
+  `resolvePattern(pattern [, module [, offset]])`.
+
 - Snapshots and memory analysis: the Snapshot menu runs off the UI thread with
   a 1 GiB budget (and says when it cut the snapshot short); a diff compares
   regions by overlap, so a grown heap is still diffed, and keeps a count past

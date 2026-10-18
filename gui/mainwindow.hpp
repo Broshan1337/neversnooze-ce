@@ -154,6 +154,7 @@ private:
     void moveSelectedEntry(int row, int delta);
     void setupMenus();
     bool loadAddressEntries(const QJsonArray& entries);
+    void rebaseResolvedEntries();
     // Build the address list + table comment/annotations/Lua from a parsed table
     // (shared by the CE XML .CT and protected .CETRAINER load paths).
     bool loadCheatTableModel(const ce::CheatTable& table,const QJsonArray* originalJson=nullptr);
@@ -446,6 +447,7 @@ public:
     // Edit individual fields of an entry (address/description) with proper
     // dataChanged notification, for inline editing and the copy/edit menu.
     void setEntryAddress(int row, uintptr_t addr, const QString& expr = {});
+    int rebaseResolvedEntries(ce::ProcessHandle* proc, QString* summary = nullptr);
     void setEntryDescription(int row, const QString& desc);
     bool removeEntry(int row);
     bool removeEntries(QList<int> rows);

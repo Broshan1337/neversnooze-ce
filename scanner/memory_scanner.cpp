@@ -3454,4 +3454,36 @@ std::vector<uintptr_t> scanPatternRange(ProcessHandle& proc, const std::string& 
     return hits;
 }
 
+bool resolvePatternAddress(ProcessHandle& proc, const std::string& pattern,
+                           const std::string& module, int64_t offset,
+                           uintptr_t& address, std::string* error) {
+    uintptr_t start = 0, stop = UINTPTR_MAX;
+    if (!module.empty()) {
+        bool found = false;
+        for (const auto& m : proc.modules()) {
+            if (m.name == module) {
+                start = m.base;
+                stop = m.base + m.size - 1;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            if (error) *error = "module not found: " + module;
+            return false;
+        }
+    }
+    std::vector<uintptr_t> hits = scanPatternRange(proc, pattern, start, stop, 2, error);
+    if (hits.empty()) {
+        if (error && error->empty()) *error = "pattern not found";
+        return false;
+    }
+    if (hits.size() > 1) {
+        if (error) *error = "pattern is ambiguous (more than one match)";
+        return false;
+    }
+    address = uintptr_t(int64_t(hits.front()) + offset);
+    return true;
+}
+
 } // namespace ce

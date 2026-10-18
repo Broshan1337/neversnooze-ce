@@ -58,6 +58,12 @@ struct CheatEntry {
     // no usable address then: offsets is empty and addressString says why.
     std::string unparsedAddress;
     std::vector<std::string> unparsedOffsets;
+    // Resilient record: re-resolve the base address from an AOB pattern unique
+    // in `resolverModule` (empty = all readable regions) plus `resolverOffset`,
+    // so a table survives game updates that move code and data around.
+    std::string resolverPattern;
+    int64_t resolverOffset = 0;
+    std::string resolverModule;
     // Record elements we do not model (CodePage, BitStart, DropDownListLink, ...),
     // kept verbatim so a load and save does not drop them.
     std::string extraXml;

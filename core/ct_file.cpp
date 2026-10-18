@@ -815,6 +815,14 @@ bool writeTableXml(const CheatTable& table,std::ostream& f) {
         if (e.freezeMode != FreezeMode::Normal)
             f << "      <freezeMode>" << (int)e.freezeMode << "</freezeMode>\n";
 
+        if (!e.resolverPattern.empty()) {
+            f << "      <NeversnoozeResolver Pattern=\"" << xmlEscape(e.resolverPattern) << "\""
+              << " Offset=\"" << e.resolverOffset << "\"";
+            if (!e.resolverModule.empty())
+                f << " Module=\"" << xmlEscape(e.resolverModule) << "\"";
+            f << "/>\n";
+        }
+
         if (!e.autoAsmScript.empty()) {
             f << "      <AssemblerScript" << (e.asyncScript ? " Async=\"1\"" : "") << ">"
               << xmlEscape(e.autoAsmScript) << "</AssemblerScript>\n";
@@ -1103,7 +1111,7 @@ static const std::set<std::string, std::less<>> kRecordElements = {
     "GroupHeader", "Collapsed", "CheatEntries", "VariableType", "CustomType", "Length", "ByteLength",
     "Unicode", "Address", "Offsets", "Hotkeys", "AssemblerScript", "LuaScript", "Value", "Activated",
     "freezeMode", "LinuxDataByteOrder", "LinuxPointerWidth", "IncreaseHotkey", "SetValueHotkey",
-    "SetValueHotkeyValue", "DecreaseHotkey", "HotkeyStep"};
+    "SetValueHotkeyValue", "DecreaseHotkey", "HotkeyStep", "NeversnoozeResolver"};
 
 // The direct child elements of a record (its own part, from "<CheatEntry>") that
 // kRecordElements does not name, joined for writing back as they were.
@@ -1313,6 +1321,23 @@ static void parseCheatEntriesBlock(const std::string& xml, size_t begin, size_t 
             }
         }
         e.extraXml = unknownRecordElements(ownXml);
+        if (auto nr = ownXml.find("<NeversnoozeResolver"); nr != std::string::npos) {
+            auto ne = ownXml.find('>', nr);
+            if (ne != std::string::npos) {
+                const std::string element = ownXml.substr(nr, ne - nr);
+                auto attr = [&element](const char* name) -> std::string {
+                    std::string needle = std::string(name) + "=\"";
+                    auto p = element.find(needle);
+                    if (p == std::string::npos) return {};
+                    p += needle.size();
+                    auto q = element.find('"', p);
+                    return q == std::string::npos ? std::string{} : xmlUnescape(element.substr(p, q - p));
+                };
+                e.resolverPattern = attr("Pattern");
+                if (auto off = attr("Offset"); !off.empty()) e.resolverOffset = strtoll(off.c_str(), nullptr, 10);
+                e.resolverModule = attr("Module");
+            }
+        }
         // Hotkeys: CE uses a nested <Hotkeys><Hotkey><Action>Set Value</Action><Keys>
         // <Key>vk</Key>...</Keys><Value>..</Value></Hotkey>...</Hotkeys>; older builds of
         // this port wrote numeric actions, and before that a flat "<Hotkeys>Ctrl+H
@@ -1953,6 +1978,11 @@ bool writeTableJson(const CheatTable& table,std::ostream& f) {
         if (!e.dropdownAttributes.empty()) f << ",\"dropdownAttributes\":\"" << jsonEscape(e.dropdownAttributes) << "\"";
         if (!e.extraHotkeysXml.empty()) f << ",\"extraHotkeys\":\"" << jsonEscape(e.extraHotkeysXml) << "\"";
         if (!e.extraXml.empty()) f << ",\"extraXml\":\"" << jsonEscape(e.extraXml) << "\"";
+        if (!e.resolverPattern.empty()) {
+            f << ",\"resolver\":{\"pattern\":\"" << jsonEscape(e.resolverPattern)
+              << "\",\"offset\":" << e.resolverOffset
+              << ",\"module\":\"" << jsonEscape(e.resolverModule) << "\"}";
+        }
         if (e.active) f << ",\"active\":true";
         if (e.showAsHex) f << ",\"showAsHex\":true";
         if (!e.showAsSigned) f << ",\"showAsSigned\":false";
@@ -2105,6 +2135,11 @@ static bool readTableJson(const JsonValue& root,CheatTable& table) {
         }
         e.extraHotkeysXml = jsonStringField(item, "extraHotkeys");
         e.extraXml = jsonStringField(item, "extraXml");
+        if (auto* resolver = getField(item, "resolver")) {
+            e.resolverPattern = jsonStringField(*resolver, "pattern");
+            e.resolverOffset = jsonIntField(*resolver, "offset", 0);
+            e.resolverModule = jsonStringField(*resolver, "module");
+        }
         e.dropdownAttributes = jsonStringField(item, "dropdownAttributes");
         e.color = jsonStringField(item, "color");
         e.dropdownList = jsonStringField(item, "dropdown");

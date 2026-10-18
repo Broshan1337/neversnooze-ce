@@ -31,7 +31,10 @@ of running the Windows build under Wine, and it opens your existing `.CT` tables
   arrows, symbols and DWARF lines; Cheat Engine compatible scripts with
   injection templates.
 - **Tables and Lua:** `.CT`, `.CETRAINER` and JSON tables, a broad Cheat Engine
-  compatible Lua API, and generated standalone trainers.
+  compatible Lua API, and generated standalone trainers. Records can carry a
+  pattern resolver, so a table re-resolves its addresses after a game update.
+- **Pattern editor:** build and test AOB patterns against live memory, with
+  module scoping, match previews, uniqueness verdicts and Lua/C export.
 - **Targets:** native Linux, Wine and Proton games, Mono/Unity (with a class
   dissector), emulators, and remote targets over ceserver or GDB/QEMU.
 - **Fast:** a first scan of 1 GB takes about 0.09 s, roughly twice as fast as

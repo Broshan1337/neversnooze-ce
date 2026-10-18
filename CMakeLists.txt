@@ -466,6 +466,11 @@ if(Qt6_FOUND)
         target_include_directories(gui_lifecycle_smoke PRIVATE ${CMAKE_SOURCE_DIR} ${LUA_DIR})
         target_link_libraries(gui_lifecycle_smoke PRIVATE cecore Qt6::Widgets Qt6::Network Qt6::DBus)
 
+        # Offscreen smoke test: a pattern-resolver record rebases after a table load.
+        qt_add_executable(gui_resilient_smoke test/gui_resilient_smoke.cpp ${CE_GUI_TEST_SOURCES})
+        target_include_directories(gui_resilient_smoke PRIVATE ${CMAKE_SOURCE_DIR} ${LUA_DIR})
+        target_link_libraries(gui_resilient_smoke PRIVATE cecore Qt6::Widgets Qt6::Network Qt6::DBus)
+
         # The AI Assistant panel with a scripted model, and its keyring client
         # against a mock Secret Service (test/secret_store_gate.py).
         qt_add_executable(gui_agent_smoke test/gui_agent_smoke.cpp gui/agent_panel.cpp gui/secret_store.cpp)

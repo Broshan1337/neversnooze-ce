@@ -1,5 +1,6 @@
 #include "test_target.hpp"
 #include "platform/linux/linux_process.hpp"
+#include "scanner/memory_scanner.hpp"
 #include "platform/linux/ptrace_wrapper.hpp"
 #include "platform/linux/ceserver_client.hpp"
 #include "platform/linux/ceserver_server.hpp"
@@ -1364,6 +1365,138 @@ static void test_parser_fuzz() {
     } else {
         printf("  ELF module parser: (skipped: /proc/self/exe unreadable)\n");
     }
+}
+static volatile uint32_t g_resolverSeed = 0xBEEF5A17u;
+
+static void test_resolver() {
+    printf("\n── Test: Pattern resolver ──\n");
+    // A resolver runs against the attached target; scanning our own process would
+    // find the scanner's own in-RAM result buffers, so the pattern lives in forked
+    // children (computed there, so the parent only ever holds the ASCII text).
+    auto spawnPatternChild = [](int copyCount, uintptr_t* reported) {
+        int fds[2];
+        if (pipe(fds) != 0) { *reported = 0; return pid_t(-1); }
+        const pid_t pid = fork();
+        if (pid == 0) {
+            close(fds[0]);
+            prctl(PR_SET_PDEATHSIG, SIGKILL);
+            const auto buffer = std::make_unique<uint8_t[]>(16);
+            uint32_t lcg = g_resolverSeed;
+            for (int i = 0; i < 16; ++i) {
+                lcg = lcg * 1664525u + 1013904223u;
+                buffer[i] = uint8_t(lcg >> 24);
+            }
+            for (int c = 1; c < copyCount; ++c) {
+                auto* copy = new uint8_t[16];
+                memcpy(copy, buffer.get(), 16);
+                (void)copy;
+            }
+            const uintptr_t addr = reinterpret_cast<uintptr_t>(buffer.get());
+            if (write(fds[1], &addr, sizeof addr) != sizeof addr) _exit(1);
+            for (;;) pause();
+        }
+        close(fds[1]);
+        if (read(fds[0], reported, sizeof *reported) != (ssize_t)sizeof *reported) *reported = 0;
+        close(fds[0]);
+        return pid;
+    };
+    std::string patternText;
+    {
+        uint32_t lcg = g_resolverSeed;
+        for (int i = 0; i < 16; ++i) {
+            lcg = lcg * 1664525u + 1013904223u;
+            char byte[4];
+            snprintf(byte, sizeof(byte), "%02X", uint8_t(lcg >> 24));
+            patternText += std::string(byte) + " ";
+        }
+        while (!patternText.empty() && patternText.back() == ' ') patternText.pop_back();
+    }
+
+    uintptr_t expected = 0;
+    const pid_t uniqueChild = spawnPatternChild(1, &expected);
+    ce::os::LinuxProcessHandle proc(uniqueChild);
+    uintptr_t address = 0;
+    std::string error;
+    bool uniqueOk = uniqueChild > 0 && expected != 0 &&
+                    ce::resolvePatternAddress(proc, patternText, "", 0, address, &error) &&
+                    address == expected;
+    if (!uniqueOk) {
+        printf("  (resolve error: %s, address 0x%lx, expected 0x%lx)\n",
+               error.c_str(), (unsigned long)address, (unsigned long)expected);
+        for (auto hit : ce::scanPatternRange(proc, patternText, 0, UINTPTR_MAX, 8))
+            printf("  (hit 0x%lx)\n", (unsigned long)hit);
+    }
+    printf("  unique pattern resolves to its own address: %s\n", uniqueOk ? "OK" : "FAILED");
+
+    uintptr_t offsetAddress = 0;
+    bool offsetOk = ce::resolvePatternAddress(proc, patternText, "", 8, offsetAddress, &error) &&
+                    offsetAddress == expected + 8;
+    printf("  offset shifts the resolved address: %s\n", offsetOk ? "OK" : "FAILED");
+
+    bool moduleOk = !ce::resolvePatternAddress(proc, patternText, "no_such_module_xyz", 0, address, &error) &&
+                    error.find("module not found") != std::string::npos;
+    printf("  a missing module is reported: %s\n", moduleOk ? "OK" : "FAILED");
+
+    uintptr_t ambiguousAddress = 0;
+    const pid_t ambiguousChild = spawnPatternChild(2, &ambiguousAddress);
+    bool ambiguousOk = false;
+    if (ambiguousChild > 0 && ambiguousAddress != 0) {
+        ce::os::LinuxProcessHandle dup(ambiguousChild);
+        ambiguousOk = !ce::resolvePatternAddress(dup, patternText, "", 0, address, &error) &&
+                      error.find("ambiguous") != std::string::npos;
+        kill(ambiguousChild, SIGKILL);
+        waitpid(ambiguousChild, nullptr, 0);
+    }
+    printf("  an ambiguous pattern is refused: %s\n", ambiguousOk ? "OK" : "FAILED");
+
+    ce::CheatTable table;
+    ce::CheatEntry entry;
+    entry.id = 1;
+    entry.description = "Gold";
+    entry.type = ce::ValueType::Int32;
+    entry.address = 0;
+    entry.resolverPattern = patternText;
+    entry.resolverOffset = 8;
+    table.entries.push_back(entry);
+
+    bool jsonOk = false, rebasedOk = false;
+    auto tmp = std::filesystem::temp_directory_path() / "ns_resolver_test.json";
+    if (table.saveJson(tmp.string())) {
+        ce::CheatTable loaded;
+        if (loaded.loadJson(tmp.string())) {
+            const auto& back = loaded.entries.at(0);
+            jsonOk = back.resolverPattern == patternText && back.resolverOffset == 8;
+            rebasedOk = ce::resolvePatternAddress(proc, back.resolverPattern,
+                                                  back.resolverModule, back.resolverOffset,
+                                                  loaded.entries[0].address, &error) &&
+                        loaded.entries[0].address == expected + 8;
+        }
+    }
+    std::filesystem::remove(tmp);
+    printf("  JSON table keeps the resolver and rebases: %s\n",
+           (jsonOk && rebasedOk) ? "OK" : "FAILED");
+
+    bool ctOk = false;
+    auto tmpCt = std::filesystem::temp_directory_path() / "ns_resolver_test.CT";
+    if (table.save(tmpCt.string())) {
+        ce::CheatTable loaded;
+        if (loaded.load(tmpCt.string())) {
+            const auto& back = loaded.entries.at(0);
+            ctOk = back.resolverPattern == patternText && back.resolverOffset == 8;
+        }
+    }
+    std::filesystem::remove(tmpCt);
+    printf("  CT table keeps the resolver on load+save: %s\n", ctOk ? "OK" : "FAILED");
+
+    if (uniqueChild > 0) {
+        kill(uniqueChild, SIGKILL);
+        waitpid(uniqueChild, nullptr, 0);
+    }
+
+    std::vector<uint8_t> bytes, mask;
+    bool parseOk = ce::parseAobPattern("48 8B ?? 4? 05", bytes, mask) &&
+                   bytes.size() == 5 && mask[2] == 0x00 && mask[3] == 0xF0;
+    printf("  parseAobPattern exposes bytes + mask: %s\n", parseOk ? "OK" : "FAILED");
 }
 
 static void test_target_profile() {
@@ -14115,6 +14248,7 @@ int main(int argc, char* argv[]) {
     }
 
     test_target_profile();
+    test_resolver();
     test_dolphin_guest_ram();
     test_yuzu_guest_ram();
     test_rpcs3_mirror_dedup();
